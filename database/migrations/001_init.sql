@@ -1,0 +1,22 @@
+BEGIN;
+
+CREATE TABLE IF NOT EXISTS countries (
+  country_code VARCHAR(5) PRIMARY KEY,
+  country_name VARCHAR(100) NOT NULL,
+  is_active BOOLEAN NOT NULL DEFAULT FALSE,
+  risk_level VARCHAR(20) NOT NULL DEFAULT 'medium',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS rates (
+  country_code VARCHAR(5) PRIMARY KEY REFERENCES countries(country_code) ON DELETE CASCADE,
+  telnyx_cost_per_min NUMERIC(10,6) NOT NULL DEFAULT 0,
+  sell_rate_per_min NUMERIC(10,6) NOT NULL DEFAULT 0,
+  margin_per_min NUMERIC(10,6) NOT NULL DEFAULT 0,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+COMMIT;
