@@ -50,13 +50,12 @@ async function requestOtp(req, res) {
     const otp = await createOtp(phone, expiresMin);
 
     // ⚠️ MVP: SMS integration না হওয়া পর্যন্ত otp.code response এ দেখাবো
-    return res.json({
-      ok: true,
-      message: "OTP created",
-      expires_at: otp.expires_at,
-      dev_otp: otp.code,
-      user: { id: user.id, phone: user.phone_e164 }, // dev help
-    });
+   return res.json({
+  ok: true,
+  message: "OTP sent successfully",
+  expires_at: otp.expires_at,
+  user: { id: user.id, phone: user.phone_e164 },
+});
   } catch (err) {
     return sendServerError(res, err, "requestOtp");
   }
