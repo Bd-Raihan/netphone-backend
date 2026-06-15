@@ -13,7 +13,7 @@ const {
   verifyOtp,
 } = require("./auth.service");
 const { requestOtpSchema, verifyOtpSchema } = require("./auth.validation");
-
+const { sendOtpSms } = require("../calls/twilio.service");
 // ✅ helper: error response (dev/prod)
 function sendServerError(res, err, where = "UNKNOWN") {
   // ✅ Terminal এ আসল error দেখাবে
@@ -49,12 +49,17 @@ async function requestOtp(req, res) {
     // ✅ create OTP
     const otp = await createOtp(phone, expiresMin);
 
-    // ⚠️ MVP: SMS integration না হওয়া পর্যন্ত otp.code response এ দেখাবো
-   return res.json({
-  ok: true,
-  message: "OTP sent successfully",
-  expires_at: otp.expires_at,
-  user: { id: user.id, phone: user.phone_e164 },
+    // ✅ Production: OTP SMS sent by Twilio, OTP code response এ দেওয়া হবে না
+    const smsResult = await sendOtpSms({ to: phone, code: otp.code, expiresMin });
+    if (!smsResult.ok) {
+      return res.status(500).json({ ok: false, message: "Failed to send OTP" });
+    }
+
+    return res.json({
+      ok: true,
+      message: "OTP sent successfully",
+      expires_at: otp.expires_at,
+      user: { id: user.id, phone: user.phone_e164 },
 });
   } catch (err) {
     return sendServerError(res, err, "requestOtp");
