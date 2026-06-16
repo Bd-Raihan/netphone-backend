@@ -4,26 +4,44 @@ const {
   authRequired,
 } = require("../auth/middlewares/auth.jwt");
 
-const controller =
-  require("./crypto.controller");
+const controller = require("./crypto.controller");
 
-const router =
-  express.Router();
-
-
-/// ===================================
-/// CREATE CRYPTO PAYMENT
-/// ===================================
-router.post(
-  "/create",
+const router = express.Router();
+router.get(
+  "/config",
   authRequired,
-  controller.createCryptoPayment
+  controller.getCryptoConfig
+);
+router.post(
+  "/recharge-request",
+  authRequired,
+  controller.createRechargeRequest
 );
 
+router.get(
+  "/my-requests",
+  authRequired,
+  controller.getMyRechargeRequests
+);
 
-/// ===================================
-/// CRYPTO WEBHOOK
-/// ===================================
+router.get(
+  "/admin/requests",
+  authRequired,
+  controller.getAdminRechargeRequests
+);
+
+router.post(
+  "/admin/requests/:id/approve",
+  authRequired,
+  controller.approveRechargeRequest
+);
+
+router.post(
+  "/admin/requests/:id/reject",
+  authRequired,
+  controller.rejectRechargeRequest
+);
+
 router.post(
   "/webhook",
   controller.cryptoWebhook
