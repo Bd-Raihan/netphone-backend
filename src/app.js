@@ -1,10 +1,5 @@
 /**
  * app.js
- * -------------
- * এই ফাইলের কাজ:
- * - Express app তৈরি করা
- * - Middleware (security, logging) সেট করা
- * - সব route এখানে connect হবে
  **/
 const express = require("express"); // Express framework
 const cors = require("cors"); // CORS middleware
@@ -20,7 +15,6 @@ const walletRoutes = require("./modules/wallet/wallet.routes"); // Wallet relate
 const callsRoutes = require("./modules/calls/calls.routes"); // Call related routes
 const paymentRoutes = require("./modules/payment/payment.routes");
 const cryptoRoutes = require("./modules/crypto/crypto.routes");
-
 const adminCryptoRoutes = require("./modules/admin/admin.crypto.routes"); // Admin crypto management routes
 // Express app তৈরি
 const app = express();

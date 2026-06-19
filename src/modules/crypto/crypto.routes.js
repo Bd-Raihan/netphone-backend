@@ -18,8 +18,18 @@ router.post(
   controller.createRechargeRequest
 );
 
+// User recharge request route
+// এই route দিয়ে user নিজের recharge request দেখতে পারবে
 router.get(
   "/my-requests",
+  authRequired,
+  controller.getMyRechargeRequests
+);
+
+// User recharge history route
+// এই route দিয়ে user নিজের crypto recharge history দেখতে পারবে
+router.get(
+  "/recharge-history",
   authRequired,
   controller.getMyRechargeRequests
 );
