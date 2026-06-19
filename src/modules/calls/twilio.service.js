@@ -44,7 +44,10 @@ async function makeCall({ to, sessionId }) {
     const call = await client.calls.create({
       to,
       from: process.env.TWILIO_PHONE_NUMBER,
-      url: "https://demo.twilio.com/docs/voice.xml",
+      url: `${process.env.PUBLIC_BASE_URL}/api/calls/twiml`,
+      statusCallback: `${process.env.PUBLIC_BASE_URL}/api/calls/twilio-status`,
+      statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
+      statusCallbackMethod: "POST",
     });
 
     await db.query(

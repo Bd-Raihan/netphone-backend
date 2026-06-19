@@ -13,12 +13,9 @@ async function startCall(req, res) {
   try {
     console.log("📞 START CALL BODY =>", req.body);
     console.log("📞 START CALL USER =>", req.user);
-
     // ✅ auth.jwt.js থেকে আসে
     const userId = req.user.id;
-
     const { to_phone_e164, meta } = req.body || {};
-
     // validation
     if (!to_phone_e164) {
       return res.status(400).json({
@@ -26,39 +23,39 @@ async function startCall(req, res) {
         message: "to_phone_e164 required",
       });
     }
-
     // service call
     const result = await startCallSession({
       userId,
       toPhoneE164: to_phone_e164,
       meta: meta || null,
     });
-
-    const twilioResult =
-      await makeCall({
-      to: to_phone_e164,
-      sessionId: result.session.id,
-      });
-
-    // business fail
-    if (!result.ok) {
+      if (!result.ok) {
       return res.status(400).json({
         ok: false,
         reason: result.reason,
       });
     }
-
+    // session ok হলে তারপর provider call হবে
+    const twilioResult = await makeCall({
+      to: to_phone_e164,
+        sessionId: result.session.id,
+      });
+    if (!twilioResult.ok) {
+      return res.status(502).json({
+        ok: false,
+        reason: "provider_call_failed",
+        provider_error: twilioResult.error,
+      });
+    }
     // success
     return res.json({
       ok: true,
       session: result.session,
       twilio: twilioResult,
     });
-
   } catch (e) {
     // ✅ IMPORTANT DEBUG
     console.error("❌ CALL START ERROR:", e);
-
     return res.status(500).json({
       ok: false,
       message: e.message,
@@ -119,20 +116,25 @@ async function endCall(req, res) {
 }
 
 // ✅ TEST CALL (Twilio Voice API)
+// ✅ TEST CALL disabled for production safety
 async function testCall(req, res) {
-  try {
-    const result = await makeCall({
-      to: "+96598598703",
-    });
-
-    return res.json(result);
-  } catch (e) {
-    return res.status(500).json({
-      ok: false,
-      error: e.message,
-    });
-  }
+  return res.status(403).json({
+    ok: false,
+    message: "Test call disabled in production",
+  });
 }
+
+
+function twimlResponse(req, res) {
+  res.type("text/xml");
+  return res.send(`
+  <Response>
+    <Say voice="alice">Connecting your NetPhone call.</Say>
+    <Pause length="1"/>
+  </Response>
+  `.trim());
+  }
+
 
 // ✅ TWILIO STATUS CALLBACK
 async function twilioStatusCallback(req, res) {
@@ -156,4 +158,5 @@ module.exports = {
   endCall,
   testCall,
   twilioStatusCallback,
+  twimlResponse,
 };
