@@ -11,6 +11,7 @@ const {
   testCall,
   twilioStatusCallback,
   twimlResponse,
+  getCallStatus,
 } = require("./calls.controller");
 // middlewares
 const { authRequired } = require("../auth/middlewares/auth.jwt");
@@ -24,6 +25,9 @@ router.get("/twiml", twimlResponse);
 
 // Protected: user must be logged-in
 router.post("/start", authRequired, startCall);
+
+router.get("/:id/status", authRequired, getCallStatus);
+
 // ✅ END CALL
 router.post("/:id/end", authRequired, endCall);
 // ✅ TWILIO STATUS CALLBACK

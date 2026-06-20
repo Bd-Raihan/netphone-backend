@@ -9,6 +9,9 @@ const {
 // ✅ Twilio Voice API
 const { makeCall } = require("./twilio.service");
 
+const db = require("../../config/db");
+
+
 // ✅ START CALL
 async function startCall(req, res) {
   try {
@@ -30,6 +33,7 @@ async function startCall(req, res) {
       toPhoneE164: to_phone_e164,
       meta: meta || null,
     });
+    console.log("❌ START CALL FAILED =>", result);
       if (!result.ok) {
       return res.status(400).json({
         ok: false,
@@ -196,6 +200,33 @@ async function twilioStatusCallback(req, res) {
   }
 }
 
+// ✅ GET CALL STATUS
+async function getCallStatus(req, res) {
+  try {
+    const userId = req.user.id;
+    const sessionId = Number(req.params.id);
+
+    const { rows } = await db.query(
+      `
+      SELECT 
+        id, status, provider_status, answered_at, ended_at,
+        duration_sec, charged_minutes, charged_amount_cents
+      FROM call_sessions
+      WHERE id = $1 AND user_id = $2
+      LIMIT 1
+      `,
+      [sessionId, userId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ ok: false, message: "Call not found" });
+    }
+
+    return res.json({ ok: true, call: rows[0] });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: e.message });
+  }
+}
 
 module.exports = {
   startCall,
@@ -203,4 +234,5 @@ module.exports = {
   testCall,
   twilioStatusCallback,
   twimlResponse,
+  getCallStatus,
 };

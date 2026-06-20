@@ -21,6 +21,8 @@ const app = express();
 // Global Middlewares
 // JSON body পড়ার জন্য
 app.use(express.json());
+
+app.use(express.urlencoded({ extended: false }));
 /// SECURITY HEADERS
 /// Hacker থেকে basic protection দিবে
 app.use(helmet());
