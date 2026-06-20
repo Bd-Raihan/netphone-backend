@@ -3,6 +3,7 @@
 const {
   startCallSession,
   endCallAndCharge,
+  billCompletedCallBySid,
 } = require("./calls.service");
 
 // ✅ Twilio Voice API
@@ -137,17 +138,60 @@ function twimlResponse(req, res) {
 
 
 // ✅ TWILIO STATUS CALLBACK
+// ✅ TWILIO STATUS CALLBACK - Call Billing Engine V2
 async function twilioStatusCallback(req, res) {
   try {
-
     console.log("📞 TWILIO CALLBACK =>", req.body);
 
+    const callSid = req.body.CallSid;
+    const callStatus = req.body.CallStatus;
+    const callDuration = Number(req.body.CallDuration || 0);
+
+    if (!callSid) {
+      return res.status(200).send("OK");
+    }
+
+    // answered event
+    if (callStatus === "in-progress") {
+      await require("../../config/db").query(
+        `
+        UPDATE call_sessions
+        SET answered_at = COALESCE(answered_at, NOW()),
+            provider_status = $2,
+            status_callback_payload = $3
+        WHERE twilio_call_sid = $1
+        `,
+        [callSid, callStatus, req.body]
+      );
+
+      return res.status(200).send("OK");
+    }
+
+    // completed event → billing হবে
+    if (callStatus === "completed") {
+      await billCompletedCallBySid({
+        callSid,
+        durationSec: callDuration,
+        rawPayload: req.body,
+      });
+
+      return res.status(200).send("OK");
+    }
+
+    // initiated / ringing / busy / failed / no-answer
+    await require("../../config/db").query(
+      `
+      UPDATE call_sessions
+      SET provider_status = $2,
+          status_callback_payload = $3
+      WHERE twilio_call_sid = $1
+      `,
+      [callSid, callStatus, req.body]
+    );
+
     return res.status(200).send("OK");
-
   } catch (e) {
-
     console.error("❌ TWILIO CALLBACK ERROR:", e);
-
     return res.status(500).send("ERROR");
   }
 }

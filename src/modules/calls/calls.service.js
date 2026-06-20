@@ -156,7 +156,150 @@ WHERE id=$1
 }
 
 
+// ✅ Call Billing V2: Twilio completed callback থেকে charge করবে
+async function billCompletedCallBySid({ callSid, durationSec, rawPayload }) {
+  const client = await db.pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const s = await client.query(
+      `
+      SELECT *
+      FROM call_sessions
+      WHERE twilio_call_sid = $1
+      FOR UPDATE
+      `,
+      [callSid]
+    );
+
+    const session = s.rows[0];
+
+    if (!session) {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "session_not_found" };
+    }
+
+    // Already charged হলে আবার charge করবে না
+    if (session.status === "charged" || Number(session.charged_amount_cents || 0) > 0) {
+      await client.query("ROLLBACK");
+      return { ok: true, reason: "already_charged" };
+    }
+
+    const safeDurationSec = Math.max(0, Number(durationSec || 0));
+
+    // duration 0 হলে charge করবে না
+    if (safeDurationSec <= 0) {
+      await client.query(
+        `
+        UPDATE call_sessions
+        SET status = 'completed',
+            provider_status = 'completed',
+            ended_at = NOW(),
+            duration_sec = 0,
+            billing_source = 'twilio_callback',
+            status_callback_payload = $2
+        WHERE id = $1
+        `,
+        [session.id, rawPayload || {}]
+      );
+
+      await client.query("COMMIT");
+      return { ok: true, reason: "no_charge_zero_duration" };
+    }
+
+    // Telecom billing: প্রতি শুরু হওয়া মিনিট charge
+    const chargedMinutes = Math.max(1, Math.ceil(safeDurationSec / 60));
+    const amountCents = chargedMinutes * Number(session.price_per_min_cents);
+
+    await client.query("COMMIT");
+
+    const debit = await walletService.applyWalletTx({
+      userId: session.user_id,
+      currency: session.currency,
+      amountCents: -amountCents,
+      txType: "call_charge",
+      meta: {
+        session_id: session.id,
+        to_phone_e164: session.to_phone_e164,
+        duration_sec: safeDurationSec,
+        charged_minutes: chargedMinutes,
+        call_sid: callSid,
+      },
+      idempotencyKey: `call_charge:${session.id}`,
+    });
+
+    if (!debit.ok) {
+      await db.query(
+        `
+        UPDATE call_sessions
+        SET status = 'failed',
+            provider_status = 'completed',
+            ended_at = NOW(),
+            duration_sec = $2,
+            charged_minutes = $3,
+            charged_amount_cents = $4,
+            billing_source = 'twilio_callback',
+            status_callback_payload = $5
+        WHERE id = $1
+        `,
+        [session.id, safeDurationSec, chargedMinutes, amountCents, rawPayload || {}]
+      );
+
+      return { ok: false, reason: debit.reason || "wallet_debit_failed" };
+    }
+
+    const providerCost = 0;
+    const profit = amountCents - providerCost;
+
+    await db.query(
+      `
+      UPDATE call_sessions
+      SET status = 'charged',
+          provider_status = 'completed',
+          ended_at = NOW(),
+          duration_sec = $2,
+          charged_minutes = $3,
+          charged_amount_cents = $4,
+          tx_id = $5,
+          provider_cost_cents = $6,
+          profit_cents = $7,
+          billing_source = 'twilio_callback',
+          status_callback_payload = $8
+      WHERE id = $1
+      `,
+      [
+        session.id,
+        safeDurationSec,
+        chargedMinutes,
+        amountCents,
+        debit.tx?.id || null,
+        providerCost,
+        profit,
+        rawPayload || {},
+      ]
+    );
+
+    return {
+      ok: true,
+      charged_amount_cents: amountCents,
+      charged_minutes: chargedMinutes,
+      wallet: debit.wallet,
+      tx: debit.tx,
+    };
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+
 module.exports = {
   startCallSession,
   endCallAndCharge,
+  billCompletedCallBySid,
 };
