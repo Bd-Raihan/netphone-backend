@@ -41,23 +41,11 @@ async function startCall(req, res) {
         reason: result.reason,
       });
     }
-    // session ok হলে তারপর provider call হবে
-    const twilioResult = await makeCall({
-      to: to_phone_e164,
-        sessionId: result.session.id,
-      });
-    if (!twilioResult.ok) {
-      return res.status(502).json({
-        ok: false,
-        reason: "provider_call_failed",
-        provider_error: twilioResult.error,
-      });
-    }
+   
     // success
-    return res.json({
+  return res.json({
       ok: true,
       session: result.session,
-      twilio: twilioResult,
     });
   } catch (e) {
     // ✅ IMPORTANT DEBUG
@@ -167,8 +155,10 @@ async function getVoiceToken(req, res) {
 
 
 // ✅ TWIML RESPONSE
-function twimlResponse(req, res) {
+async function twimlResponse(req, res) {
   const to = req.body.To || req.query.To || req.body.to || req.query.to;
+  const sessionId = Number(req.body.SessionId || req.query.SessionId || 0);
+  const callSid = req.body.CallSid;
 
   res.type("text/xml");
 
@@ -178,6 +168,19 @@ function twimlResponse(req, res) {
   <Say voice="alice">Missing destination number.</Say>
 </Response>
     `.trim());
+  }
+
+  if (sessionId > 0 && callSid) {
+    await db.query(
+      `
+      UPDATE call_sessions
+      SET twilio_call_sid = $2,
+          provider = 'twilio',
+          provider_status = 'initiated'
+      WHERE id = $1
+      `,
+      [sessionId, callSid]
+    );
   }
 
   return res.send(`
