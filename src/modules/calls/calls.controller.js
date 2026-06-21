@@ -10,6 +10,7 @@ const {
 const { makeCall } = require("./twilio.service");
 
 const db = require("../../config/db");
+const twilio = require ("twilio");
 
 
 // ✅ START CALL
@@ -130,15 +131,63 @@ async function testCall(req, res) {
 }
 
 
-function twimlResponse(req, res) {
-  res.type("text/xml");
-  return res.send(`
-  <Response>
-    <Say voice="alice">Connecting your NetPhone call.</Say>
-    <Pause length="1"/>
-  </Response>
-  `.trim());
+// ✅ TWILIO VOICE SDK TOKEN
+async function getVoiceToken(req, res) {
+  try {
+    const userId = req.user.id;
+    const identity = `user_${userId}`;
+
+    const AccessToken = twilio.jwt.AccessToken;
+    const VoiceGrant = AccessToken.VoiceGrant;
+
+    const token = new AccessToken(
+      process.env.TWILIO_ACCOUNT_SID,
+      process.env.TWILIO_API_KEY_SID,
+      process.env.TWILIO_API_KEY_SECRET,
+      { identity }
+    );
+
+    const voiceGrant = new VoiceGrant({
+      outgoingApplicationSid: process.env.TWILIO_TWIML_APP_SID,
+      incomingAllow: false,
+    });
+
+    token.addGrant(voiceGrant);
+
+    return res.json({
+      ok: true,
+      identity,
+      token: token.toJwt(),
+    });
+  } catch (e) {
+    console.error("❌ VOICE TOKEN ERROR:", e);
+    return res.status(500).json({ ok: false, message: e.message });
   }
+}
+
+
+// ✅ TWIML RESPONSE
+function twimlResponse(req, res) {
+  const to = req.body.To || req.query.To || req.body.to || req.query.to;
+
+  res.type("text/xml");
+
+  if (!to) {
+    return res.send(`
+<Response>
+  <Say voice="alice">Missing destination number.</Say>
+</Response>
+    `.trim());
+  }
+
+  return res.send(`
+<Response>
+  <Dial callerId="${process.env.TWILIO_PHONE_NUMBER}">
+    <Number>${to}</Number>
+  </Dial>
+</Response>
+  `.trim());
+}
 
 
 // ✅ TWILIO STATUS CALLBACK
@@ -233,6 +282,7 @@ module.exports = {
   endCall,
   testCall,
   twilioStatusCallback,
+  getVoiceToken,
   twimlResponse,
   getCallStatus,
 };

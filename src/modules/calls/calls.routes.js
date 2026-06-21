@@ -10,6 +10,7 @@ const {
   endCall,
   testCall,
   twilioStatusCallback,
+  getVoiceToken,
   twimlResponse,
   getCallStatus,
 } = require("./calls.controller");
@@ -21,11 +22,16 @@ const router = express.Router();
 // ✅ TEST CALL
 router.get("/test", testCall);
 
+// Twilio voice instruction XML
 router.get("/twiml", twimlResponse);
 
 // Protected: user must be logged-in
 router.post("/start", authRequired, startCall);
 
+// Protected: user must be logged-in
+router.get("/token", authRequired, getVoiceToken);
+
+// ✅ Get call status by session id
 router.get("/:id/status", authRequired, getCallStatus);
 
 // ✅ END CALL
