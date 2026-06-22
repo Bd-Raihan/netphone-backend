@@ -162,11 +162,7 @@ async function getVoiceToken(req, res) {
 
     token.addGrant(voiceGrant);
 
-    return res.json({
-      ok: true,
-      identity,
-      token: token.toJwt(),
-    });
+    return res.type("text/plain").send(token.toJwt());
   } catch (e) {
     console.error("❌ VOICE TOKEN ERROR:", e);
     return res.status(500).json({ ok: false, message: e.message });
