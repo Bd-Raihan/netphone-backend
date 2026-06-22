@@ -31,6 +31,9 @@ router.post("/start", authRequired, startCall);
 // Protected: user must be logged-in
 router.get("/token", authRequired, getVoiceToken);
 
+// Protected: user must be logged-in
+router.get("/sdk-token", getVoiceToken);
+
 // ✅ Get call status by session id
 router.get("/:id/status", authRequired, getCallStatus);
 

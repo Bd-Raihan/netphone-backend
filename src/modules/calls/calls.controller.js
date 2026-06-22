@@ -20,6 +20,7 @@ async function startCall(req, res) {
     console.log("📞 START CALL USER =>", req.user);
     // ✅ auth.jwt.js থেকে আসে
     const userId = req.user.id;
+
     const { to_phone_e164, meta } = req.body || {};
     // validation
     if (!to_phone_e164) {
@@ -122,7 +123,26 @@ async function testCall(req, res) {
 // ✅ TWILIO VOICE SDK TOKEN
 async function getVoiceToken(req, res) {
   try {
-    const userId = req.user.id;
+    let userId = req.user?.id;
+
+  if (!userId && req.query.SessionId) {
+    const sessionId = Number(req.query.SessionId);
+
+    const { rows } = await db.query(
+      `SELECT user_id FROM call_sessions WHERE id = $1 LIMIT 1`,
+      [sessionId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ ok: false, message: "session not found" });
+    }
+
+      userId = rows[0].user_id;
+    }
+
+    if (!userId) {
+      return res.status(401).json({ ok: false, message: "missing user" });
+    }
     const identity = `user_${userId}`;
 
     const AccessToken = twilio.jwt.AccessToken;
