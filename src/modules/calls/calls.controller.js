@@ -182,7 +182,7 @@ async function twimlResponse(req, res) {
   const twiml = new VoiceResponse();
 
   // Twilio সাধারণত POST/GET এর মাধ্যমে To অথবা custom parameters পাঠায়
-  const toPhoneNumber = req.body.To || req.query.to; 
+  const toPhoneNumber = req.body.To || req.body.to || req.query.to;
   
   if (toPhoneNumber) {
     const dial = twiml.dial({
