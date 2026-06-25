@@ -178,40 +178,25 @@ async function getVoiceToken(req, res) {
 
 // ✅ TWIML RESPONSE
 async function twimlResponse(req, res) {
-  const to = req.body.To || req.query.To || req.body.to || req.query.to;
-  const sessionId = Number(req.body.SessionId || req.query.SessionId || 0);
-  const callSid = req.body.CallSid;
+  const VoiceResponse = twilio.twiml.VoiceResponse;
+  const twiml = new VoiceResponse();
+
+  // Twilio সাধারণত POST/GET এর মাধ্যমে To অথবা custom parameters পাঠায়
+  const toPhoneNumber = req.body.To || req.query.to; 
+  
+  if (toPhoneNumber) {
+    const dial = twiml.dial({
+      callerId: process.env.TWILIO_PHONE_NUMBER // আপনার ভেরিফাইড টুইলিও নাম্বার
+    });
+    
+    // আসল মোবাইল নাম্বারে ডায়াল করুন
+    dial.number(toPhoneNumber); 
+  } else {
+    twiml.say("Error: Invalid phone number.");
+  }
 
   res.type("text/xml");
-
-  if (!to) {
-    return res.send(`
-<Response>
-  <Say voice="alice">Missing destination number.</Say>
-</Response>
-    `.trim());
-  }
-
-  if (sessionId > 0 && callSid) {
-    await db.query(
-      `
-      UPDATE call_sessions
-      SET twilio_call_sid = $2,
-          provider = 'twilio',
-          provider_status = 'initiated'
-      WHERE id = $1
-      `,
-      [sessionId, callSid]
-    );
-  }
-
-  return res.send(`
-<Response>
-  <Dial callerId="${process.env.TWILIO_PHONE_NUMBER}">
-    <Number>${to}</Number>
-  </Dial>
-</Response>
-  `.trim());
+  return res.send(twiml.toString());
 }
 
 
