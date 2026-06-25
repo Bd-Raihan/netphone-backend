@@ -50,7 +50,7 @@ async function startCall(req, res) {
     });
   } catch (e) {
     // ✅ IMPORTANT DEBUG
-    console.error("❌ CALL START ERROR:", e);
+    console.log("✅ START CALL RESULT =>", result);
     return res.status(500).json({
       ok: false,
       message: e.message,
@@ -184,6 +184,22 @@ async function twimlResponse(req, res) {
   // Twilio সাধারণত POST/GET এর মাধ্যমে To অথবা custom parameters পাঠায়
   const toPhoneNumber = req.body.To || req.body.to || req.query.to;
   
+const sessionId = Number(req.body.SessionId || req.query.SessionId || 0);
+const callSid = req.body.CallSid;
+
+if (sessionId > 0 && callSid) {
+  await db.query(
+    `
+    UPDATE call_sessions
+    SET twilio_call_sid = $2,
+        provider = 'twilio',
+        provider_status = 'initiated'
+    WHERE id = $1
+    `,
+    [sessionId, callSid]
+  );
+}
+
   if (toPhoneNumber) {
     const dial = twiml.dial({
       callerId: process.env.TWILIO_PHONE_NUMBER // আপনার ভেরিফাইড টুইলিও নাম্বার
