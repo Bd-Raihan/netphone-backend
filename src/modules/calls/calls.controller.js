@@ -29,13 +29,13 @@ async function startCall(req, res) {
         message: "to_phone_e164 required",
       });
     }
-    // service call
+    // startCallSession
     const result = await startCallSession({
       userId,
       toPhoneE164: to_phone_e164,
       meta: meta || null,
     });
-    console.log("❌ START CALL FAILED =>", result);
+     console.log("✅ START CALL RESULT =>", result);
       if (!result.ok) {
       return res.status(400).json({
         ok: false,
@@ -50,7 +50,7 @@ async function startCall(req, res) {
     });
   } catch (e) {
     // ✅ IMPORTANT DEBUG
-    console.log("✅ START CALL RESULT =>", result);
+   console.error("❌ CALL START ERROR:", e);
     return res.status(500).json({
       ok: false,
       message: e.message,
@@ -182,7 +182,8 @@ async function twimlResponse(req, res) {
   const twiml = new VoiceResponse();
 
   // Twilio সাধারণত POST/GET এর মাধ্যমে To অথবা custom parameters পাঠায়
-  const toPhoneNumber = req.body.To || req.body.to || req.query.to;
+  const toPhoneNumber =
+  req.body.to || req.query.to;
   
 const sessionId = Number(req.body.SessionId || req.query.SessionId || 0);
 const callSid = req.body.CallSid;
