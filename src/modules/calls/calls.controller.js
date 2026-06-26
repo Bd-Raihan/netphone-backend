@@ -42,12 +42,31 @@ async function startCall(req, res) {
         reason: result.reason,
       });
     }
+   const twilioResult = await makeCall({
+  to: to_phone_e164,
+  sessionId: result.session.id,
+});
+
+console.log("☎️ TWILIO MAKE CALL RESULT =>", twilioResult);
+
+if (!twilioResult.ok) {
+  return res.status(500).json({
+    ok: false,
+    message: "Twilio call failed",
+    error: twilioResult.error,
+  });
+}
+
+return res.json({
+  ok: true,
+  session: {
+    ...result.session,
+    twilio_call_sid: twilioResult.sid,
+    provider_status: twilioResult.status,
+  },
+});
    
-    // success
-  return res.json({
-      ok: true,
-      session: result.session,
-    });
+ 
   } catch (e) {
     // ✅ IMPORTANT DEBUG
    console.error("❌ CALL START ERROR:", e);
