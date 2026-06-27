@@ -14,62 +14,43 @@ const twilio = require ("twilio");
 
 
 // ✅ START CALL
+// ✅ START CALL
 async function startCall(req, res) {
   try {
     console.log("📞 START CALL BODY =>", req.body);
     console.log("📞 START CALL USER =>", req.user);
-    // ✅ auth.jwt.js থেকে আসে
-    const userId = req.user.id;
 
+    const userId = req.user.id;
     const { to_phone_e164, meta } = req.body || {};
-    // validation
+
     if (!to_phone_e164) {
       return res.status(400).json({
         ok: false,
         message: "to_phone_e164 required",
       });
     }
-    // startCallSession
+
     const result = await startCallSession({
       userId,
       toPhoneE164: to_phone_e164,
       meta: meta || null,
     });
-     console.log("✅ START CALL RESULT =>", result);
-      if (!result.ok) {
+
+    console.log("✅ START CALL RESULT =>", result);
+
+    if (!result.ok) {
       return res.status(400).json({
         ok: false,
         reason: result.reason,
       });
     }
-   const twilioResult = await makeCall({
-  to: to_phone_e164,
-  sessionId: result.session.id,
-});
 
-console.log("☎️ TWILIO MAKE CALL RESULT =>", twilioResult);
-
-if (!twilioResult.ok) {
-  return res.status(500).json({
-    ok: false,
-    message: "Twilio call failed",
-    error: twilioResult.error,
-  });
-}
-
-return res.json({
-  ok: true,
-  session: {
-    ...result.session,
-    twilio_call_sid: twilioResult.sid,
-    provider_status: twilioResult.status,
-  },
-});
-   
- 
+    return res.json({
+      ok: true,
+      session: result.session,
+    });
   } catch (e) {
-    // ✅ IMPORTANT DEBUG
-   console.error("❌ CALL START ERROR:", e);
+    console.error("❌ CALL START ERROR:", e);
     return res.status(500).json({
       ok: false,
       message: e.message,
@@ -200,35 +181,38 @@ async function twimlResponse(req, res) {
   const VoiceResponse = twilio.twiml.VoiceResponse;
   const twiml = new VoiceResponse();
 
-  // Twilio সাধারণত POST/GET এর মাধ্যমে To অথবা custom parameters পাঠায়
+  console.log("📞 TWIML BODY =>", req.body);
+
   const toPhoneNumber =
-  req.body.to || req.query.to;
-  
-const sessionId = Number(req.body.SessionId || req.query.SessionId || 0);
-const callSid = req.body.CallSid;
+    req.body.To || req.body.to || req.query.To || req.query.to;
 
-if (sessionId > 0 && callSid) {
-  await db.query(
-    `
-    UPDATE call_sessions
-    SET twilio_call_sid = $2,
-        provider = 'twilio',
-        provider_status = 'initiated'
-    WHERE id = $1
-    `,
-    [sessionId, callSid]
+  const sessionId = Number(
+    req.body.SessionId || req.body.sessionId || req.query.SessionId || 0
   );
-}
 
-  if (toPhoneNumber) {
-    const dial = twiml.dial({
-      callerId: process.env.TWILIO_PHONE_NUMBER // আপনার ভেরিফাইড টুইলিও নাম্বার
-    });
-    
-    // আসল মোবাইল নাম্বারে ডায়াল করুন
-    dial.number(toPhoneNumber); 
+  const callSid = req.body.CallSid;
+
+  if (sessionId > 0 && callSid) {
+    await db.query(
+      `
+      UPDATE call_sessions
+      SET twilio_call_sid = $2,
+          provider = 'twilio',
+          provider_status = 'initiated'
+      WHERE id = $1
+      `,
+      [sessionId, callSid]
+    );
+  }
+
+  if (!toPhoneNumber) {
+    twiml.say("Invalid phone number.");
   } else {
-    twiml.say("Error: Invalid phone number.");
+    const dial = twiml.dial({
+      callerId: process.env.TWILIO_PHONE_NUMBER,
+    });
+
+    dial.number(toPhoneNumber);
   }
 
   res.type("text/xml");
