@@ -212,7 +212,15 @@ async function twimlResponse(req, res) {
       callerId: process.env.TWILIO_PHONE_NUMBER,
     });
 
-    dial.number(toPhoneNumber);
+    dial.number(
+  {
+    statusCallback: `${process.env.PUBLIC_BASE_URL}/api/calls/twilio-status?SessionId=${sessionId}`,
+    statusCallbackMethod: "POST",
+    statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
+  },
+  toPhoneNumber
+);
+
   }
 
   res.type("text/xml");
@@ -220,8 +228,9 @@ async function twimlResponse(req, res) {
 }
 
 
-// ✅ TWILIO STATUS CALLBACK
+
 // ✅ TWILIO STATUS CALLBACK - Call Billing Engine V2
+// ✅ TWILIO STATUS CALLBACK
 async function twilioStatusCallback(req, res) {
   try {
     console.log("📞 TWILIO CALLBACK =>", req.body);
@@ -229,28 +238,30 @@ async function twilioStatusCallback(req, res) {
     const callSid = req.body.CallSid;
     const callStatus = req.body.CallStatus;
     const callDuration = Number(req.body.CallDuration || 0);
+    const sessionId = Number(req.query.SessionId || req.body.SessionId || 0);
 
-    if (!callSid) {
+    if (!callSid && !sessionId) {
       return res.status(200).send("OK");
     }
 
-    // answered event
-    if (callStatus === "in-progress") {
+    // ✅ Receiver answered / call connected
+    if (callStatus === "in-progress" || callStatus === "answered") {
       await require("../../config/db").query(
         `
         UPDATE call_sessions
         SET answered_at = COALESCE(answered_at, NOW()),
-            provider_status = $2,
+            provider_status = 'in-progress',
             status_callback_payload = $3
         WHERE twilio_call_sid = $1
+           OR id = $2
         `,
-        [callSid, callStatus, req.body]
+        [callSid, sessionId, req.body]
       );
 
       return res.status(200).send("OK");
     }
 
-    // completed event → billing হবে
+    // ✅ Call completed → billing
     if (callStatus === "completed") {
       await billCompletedCallBySid({
         callSid,
@@ -261,15 +272,16 @@ async function twilioStatusCallback(req, res) {
       return res.status(200).send("OK");
     }
 
-    // initiated / ringing / busy / failed / no-answer
+    // ✅ initiated / ringing / busy / failed / no-answer
     await require("../../config/db").query(
       `
       UPDATE call_sessions
-      SET provider_status = $2,
-          status_callback_payload = $3
+      SET provider_status = $3,
+          status_callback_payload = $4
       WHERE twilio_call_sid = $1
+         OR id = $2
       `,
-      [callSid, callStatus, req.body]
+      [callSid, sessionId, callStatus, req.body]
     );
 
     return res.status(200).send("OK");
