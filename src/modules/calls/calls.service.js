@@ -215,7 +215,7 @@ async function endCallAndCharge({ userId, sessionId }) {
   return { ok: true, reason: "billing_by_twilio_callback_only" };
 }
 
-async function billCompletedCallBySid({ callSid, durationSec, rawPayload }) {
+async function billCompletedCallBySid({ callSid, sessionId, rawPayload }) {
   const client = await db.pool.connect();
 
   try {
@@ -226,12 +226,16 @@ async function billCompletedCallBySid({ callSid, durationSec, rawPayload }) {
       SELECT *
       FROM call_sessions
       WHERE twilio_call_sid = $1
+         OR id = $2
+      ORDER BY id DESC
+      LIMIT 1
       FOR UPDATE
       `,
-      [callSid]
+      [callSid || null, Number(sessionId || 0)]
     );
 
     const session = s.rows[0];
+
     if (!session) {
       await client.query("ROLLBACK");
       return { ok: false, reason: "session_not_found" };
@@ -242,7 +246,40 @@ async function billCompletedCallBySid({ callSid, durationSec, rawPayload }) {
       return { ok: true, reason: "already_charged" };
     }
 
-    const safeDurationSec = Math.max(0, Number(durationSec || 0));
+    if (!session.answered_at) {
+      await client.query(
+        `
+        UPDATE call_sessions
+        SET status = 'completed',
+            provider_status = 'completed',
+            ended_at = NOW(),
+            duration_sec = 0,
+            charged_minutes = 0,
+            charged_amount_cents = 0,
+            billing_source = 'answered_at_missing_no_charge',
+            status_callback_payload = $2
+        WHERE id = $1
+        `,
+        [session.id, rawPayload || {}]
+      );
+
+      await client.query("COMMIT");
+      return { ok: true, reason: "no_charge_not_answered" };
+    }
+
+    const d = await client.query(
+      `
+      SELECT GREATEST(
+        0,
+        FLOOR(EXTRACT(EPOCH FROM (NOW() - answered_at)))
+      )::int AS duration_sec
+      FROM call_sessions
+      WHERE id = $1
+      `,
+      [session.id]
+    );
+
+    const safeDurationSec = Number(d.rows[0]?.duration_sec || 0);
 
     if (safeDurationSec <= 0) {
       await client.query(
@@ -252,7 +289,9 @@ async function billCompletedCallBySid({ callSid, durationSec, rawPayload }) {
             provider_status = 'completed',
             ended_at = NOW(),
             duration_sec = 0,
-            billing_source = 'twilio_callback',
+            charged_minutes = 0,
+            charged_amount_cents = 0,
+            billing_source = 'zero_answered_duration',
             status_callback_payload = $2
         WHERE id = $1
         `,
@@ -264,7 +303,6 @@ async function billCompletedCallBySid({ callSid, durationSec, rawPayload }) {
     }
 
     const chargedMinutes = ceilMinutes(safeDurationSec);
-
     const sellRate = Number(session.sell_rate_usd_per_min || session.price_per_min_cents / 100);
     const providerRate = Number(session.provider_rate_usd_per_min || 0);
 
@@ -308,7 +346,7 @@ async function billCompletedCallBySid({ callSid, durationSec, rawPayload }) {
             duration_sec = $2,
             charged_minutes = $3,
             charged_amount_cents = $4,
-            billing_source = 'twilio_callback',
+            billing_source = 'wallet_debit_failed',
             status_callback_payload = $5
         WHERE id = $1
         `,
@@ -333,7 +371,7 @@ async function billCompletedCallBySid({ callSid, durationSec, rawPayload }) {
           provider_cost_usd = $8,
           charged_amount_usd = $9,
           profit_usd = $10,
-          billing_source = 'twilio_callback',
+          billing_source = 'answered_at_backend_duration',
           status_callback_payload = $11
       WHERE id = $1
       `,
@@ -354,6 +392,7 @@ async function billCompletedCallBySid({ callSid, durationSec, rawPayload }) {
 
     return {
       ok: true,
+      duration_sec: safeDurationSec,
       charged_amount_cents: amountCents,
       charged_minutes: chargedMinutes,
       wallet: debit.wallet,

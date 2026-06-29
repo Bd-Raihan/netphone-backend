@@ -265,9 +265,9 @@ async function twilioStatusCallback(req, res) {
     if (callStatus === "completed") {
       await billCompletedCallBySid({
         callSid,
-        durationSec: callDuration,
+        sessionId,
         rawPayload: req.body,
-      });
+    });
 
       return res.status(200).send("OK");
     }
