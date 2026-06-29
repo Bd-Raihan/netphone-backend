@@ -319,7 +319,7 @@ async function billCompletedCallBySid({ callSid, sessionId, rawPayload }) {
     const debit = await walletService.applyWalletTx({
       userId: session.user_id,
       currency: "USD",
-      amountCents: -amountCents,
+      amountCents: amountCents,
       txType: "call_charge",
       meta: {
         session_id: session.id,

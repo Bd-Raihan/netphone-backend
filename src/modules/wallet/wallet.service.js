@@ -86,17 +86,25 @@ async function applyWalletTx({
 
     let newBalance;
 
-if (
-  finalTxType === "admin_credit"
-) {
-  // টাকা যোগ হবে
-  newBalance =
-      Number(wallet.balance_cents) + Number(amountCents);
-} else {
-  // টাকা কাটবে
-  newBalance =
-      Number(wallet.balance_cents) - Number(amountCents);
-}
+    switch (finalTxType) {
+
+    case "admin_credit":
+    case "recharge":
+    case "refund":
+      newBalance =
+          Number(wallet.balance_cents) + Number(amountCents);
+      break;
+
+    case "admin_debit":
+    case "call_charge":
+    case "withdraw":
+      newBalance =
+          Number(wallet.balance_cents) - Number(amountCents);
+      break;
+
+    default:
+      throw new Error("unknown_transaction_type");
+  }
 
     // ✅ insufficient balance rule (negative allow না)
     if (newBalance < 0) {
