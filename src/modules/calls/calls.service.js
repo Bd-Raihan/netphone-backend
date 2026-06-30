@@ -267,19 +267,13 @@ async function billCompletedCallBySid({ callSid, sessionId, rawPayload }) {
       return { ok: true, reason: "no_charge_not_answered" };
     }
 
-    const d = await client.query(
-      `
-      SELECT GREATEST(
-        0,
-        FLOOR(EXTRACT(EPOCH FROM (NOW() - answered_at)))
-      )::int AS duration_sec
-      FROM call_sessions
-      WHERE id = $1
-      `,
-      [session.id]
+    const durationSec = Number(
+    rawPayload?.CallDuration ??
+    rawPayload?.Duration ??
+    0
     );
 
-    const safeDurationSec = Number(d.rows[0]?.duration_sec || 0);
+const safeDurationSec = Math.max(0, Math.floor(durationSec));
 
     if (safeDurationSec <= 0) {
       await client.query(
