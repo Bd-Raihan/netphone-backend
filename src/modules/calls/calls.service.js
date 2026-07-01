@@ -211,10 +211,12 @@ async function startCallSession({ userId, toPhoneE164, meta = null }) {
   return { ok: true, session: rows[0] };
 }
 
+// ✅ END CALL AND CHARGE
 async function endCallAndCharge({ userId, sessionId }) {
   return { ok: true, reason: "billing_by_twilio_callback_only" };
 }
 
+// ✅ BILL COMPLETED CALL BY SID
 async function billCompletedCallBySid({ callSid, sessionId, rawPayload }) {
   const client = await db.pool.connect();
 
@@ -236,16 +238,19 @@ async function billCompletedCallBySid({ callSid, sessionId, rawPayload }) {
 
     const session = s.rows[0];
 
+    // If the session is not found, rollback and return an error
     if (!session) {
       await client.query("ROLLBACK");
       return { ok: false, reason: "session_not_found" };
     }
 
+    // If the session is already charged, rollback and return an error
     if (session.status === "charged" || Number(session.charged_amount_cents || 0) > 0) {
       await client.query("COMMIT");
       return { ok: true, reason: "already_charged" };
     }
 
+    // If the session was never answered, mark it as completed with no charge
     if (!session.answered_at) {
       await client.query(
         `
@@ -273,8 +278,10 @@ async function billCompletedCallBySid({ callSid, sessionId, rawPayload }) {
     0
     );
 
-const safeDurationSec = Math.max(0, Math.floor(durationSec));
+    // If the duration is zero or negative, mark it as completed with no charge
+    const safeDurationSec = Math.max(0, Math.floor(durationSec));
 
+    // If the duration is zero or negative, mark it as completed with no charge
     if (safeDurationSec <= 0) {
       await client.query(
         `
@@ -296,20 +303,35 @@ const safeDurationSec = Math.max(0, Math.floor(durationSec));
       return { ok: true, reason: "no_charge_zero_duration" };
     }
 
+    // Calculate the charged minutes and amounts
     const chargedMinutes = ceilMinutes(safeDurationSec);
-    const sellRate = Number(session.sell_rate_usd_per_min || session.price_per_min_cents / 100);
+
+    // Calculate the price per minute in cents
+    const pricePerMinCents = Number(
+      session.price_per_min_cents ||
+      Math.ceil(Number(session.sell_rate_usd_per_min || 0) * 100)
+    );
+
+    // Calculate the total amount in cents
+    const amountCents = chargedMinutes * pricePerMinCents;
+
+    // Calculate the provider cost and profit
+    const sellRate = pricePerMinCents / 100;
     const providerRate = Number(session.provider_rate_usd_per_min || 0);
 
-    const chargedUsd = round5(chargedMinutes * sellRate);
+    // Calculate the charged amount in USD, provider cost in USD, and profit in USD
+    const chargedUsd = round5(amountCents / 100);
     const providerCostUsd = round5(chargedMinutes * providerRate);
     const profitUsd = round5(chargedUsd - providerCostUsd);
 
-    const amountCents = Math.max(1, toUsdCents(chargedUsd));
+    // Calculate the provider cost in cents and profit in cents
     const providerCostCents = Math.max(0, toUsdCents(providerCostUsd));
     const profitCents = amountCents - providerCostCents;
-
+    
+    // Update the call session with the calculated values
     await client.query("COMMIT");
 
+    // Apply the wallet transaction for the call charge
     const debit = await walletService.applyWalletTx({
       userId: session.user_id,
       currency: "USD",
@@ -330,6 +352,7 @@ const safeDurationSec = Math.max(0, Math.floor(durationSec));
       idempotencyKey: `call_charge:${session.id}`,
     });
 
+    // If the debit failed, mark the call session as failed and return the reason
     if (!debit.ok) {
       await db.query(
         `
@@ -350,6 +373,7 @@ const safeDurationSec = Math.max(0, Math.floor(durationSec));
       return { ok: false, reason: debit.reason || "wallet_debit_failed" };
     }
 
+    // Update the call session with the final charged values and transaction ID
     await db.query(
       `
       UPDATE call_sessions
@@ -365,7 +389,7 @@ const safeDurationSec = Math.max(0, Math.floor(durationSec));
           provider_cost_usd = $8,
           charged_amount_usd = $9,
           profit_usd = $10,
-          billing_source = 'answered_at_backend_duration',
+          billing_source = 'twilio_child_phone_leg_duration',
           status_callback_payload = $11
       WHERE id = $1
       `,
@@ -400,6 +424,7 @@ const safeDurationSec = Math.max(0, Math.floor(durationSec));
   }
 }
 
+// ✅ TWILIO CALLBACK
 module.exports = {
   startCallSession,
   endCallAndCharge,

@@ -261,16 +261,37 @@ async function twilioStatusCallback(req, res) {
       return res.status(200).send("OK");
     }
 
-    // ✅ Call completed → billing
+   
+    // ✅ Call completed → billing only real phone leg
     if (callStatus === "completed") {
-      await billCompletedCallBySid({
-        callSid,
-        sessionId,
-        rawPayload: req.body,
-    });
+    const direction = String(req.body.Direction || "").toLowerCase();
+    const to = String(req.body.To || req.body.Called || "");
+
+    // Parent/client leg bill হবে না
+    // শুধু real phone number leg bill হবে
+    if (direction !== "outbound-dial" || !to.startsWith("+")) {
+      await db.query(
+       `
+        UPDATE call_sessions
+        SET provider_status = $3,
+          status_callback_payload = $4
+        WHERE twilio_call_sid = $1
+         OR id = $2
+        `,
+        [callSid, sessionId, callStatus, req.body]
+      );
 
       return res.status(200).send("OK");
     }
+
+  await billCompletedCallBySid({
+    callSid,
+    sessionId,
+    rawPayload: req.body,
+  });
+
+  return res.status(200).send("OK");
+}
 
     // ✅ initiated / ringing / busy / failed / no-answer
     await require("../../config/db").query(
@@ -285,7 +306,9 @@ async function twilioStatusCallback(req, res) {
     );
 
     return res.status(200).send("OK");
-  } catch (e) {
+  } 
+  
+  catch (e) {
     console.error("❌ TWILIO CALLBACK ERROR:", e);
     return res.status(500).send("ERROR");
   }
