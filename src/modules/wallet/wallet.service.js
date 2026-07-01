@@ -91,6 +91,8 @@ async function applyWalletTx({
     case "admin_credit":
     case "recharge":
     case "refund":
+    case "transfer_received":
+    case "transfer_in":
       newBalance =
           Number(wallet.balance_cents) + Number(amountCents);
       break;
@@ -98,6 +100,8 @@ async function applyWalletTx({
     case "admin_debit":
     case "call_charge":
     case "withdraw":
+    case "transfer_send":
+    case "transfer_out":
       newBalance =
           Number(wallet.balance_cents) - Number(amountCents);
       break;
