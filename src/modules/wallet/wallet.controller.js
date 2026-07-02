@@ -70,9 +70,10 @@ async function tx(req, res) {
 
     const { rows } = await db.query(q, [userId, limit]);
 
-    return res.json({
-      ok: true,
-      items: rows,
+   return res.json({
+    ok: true,
+    items: rows,
+    transactions: rows,
     });
 
   } catch (e) {
