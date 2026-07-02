@@ -100,7 +100,7 @@ async function applyWalletTx({
     case "admin_debit":
     case "call_charge":
     case "withdraw":
-    case "transfer_send":
+    case "transfer_sent":
     case "transfer_out":
       newBalance =
           Number(wallet.balance_cents) - Number(amountCents);
@@ -115,6 +115,7 @@ async function applyWalletTx({
       await client.query("ROLLBACK");
       return { ok: false, reason: "insufficient_balance" };
     }
+
 
     // meta jsonb safe
     const metaJson = meta ? JSON.stringify(meta) : null;
