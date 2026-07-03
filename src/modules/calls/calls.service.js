@@ -1,4 +1,5 @@
 const db = require("../../config/db");
+const { parsePhoneNumberFromString } = require("libphonenumber-js");
 const walletService = require("../wallet/wallet.service");
 
 // ===============================
@@ -64,104 +65,100 @@ async function fetchTwilioNumberRate(toPhoneE164) {
   };
 }
 
-async function findRateByToPhone(toPhoneE164) {
-  const phone = cleanPhone(toPhoneE164);
 
-  // 1) Manual override থাকলে আগে DB rate ব্যবহার করবে
-  const manual = await db.query(
-    `
-    SELECT *
-    FROM call_rates
-    WHERE is_active = true
-      AND manual_override = true
-      AND $1 LIKE prefix || '%'
-    ORDER BY LENGTH(prefix) DESC
-    LIMIT 1
-    `,
-    [phone]
-  );
+function getSmartPrefix(toPhoneE164) {
+  const parsed = parsePhoneNumberFromString(toPhoneE164);
+  if (!parsed || !parsed.isValid()) return null;
 
-  if (manual.rows[0]) return manual.rows[0];
+  const countryCallingCode = parsed.countryCallingCode;
+  const national = parsed.nationalNumber || "";
 
-  // 2) Twilio live pricing
-  const live = await fetchTwilioNumberRate(toPhoneE164);
-
-  if (live) {
-    const sellRate = makeSellRate(live.providerRateUsdPerMin);
-    const legacyCents = Math.max(1, Math.ceil(sellRate * 100));
-
-    // prefix হিসেবে full number max 16 digit রাখা হলো,
-    // এতে সব দেশ dynamic হবে; পরে Admin Manager দিয়ে override করা যাবে।
-    const prefix = phone.slice(0, 16);
-
-    const upsert = await db.query(
-      `
-      INSERT INTO call_rates
-        (
-          country_code,
-          country_name,
-          prefix,
-          currency,
-          price_per_min_cents,
-          provider,
-          provider_rate_usd_per_min,
-          sell_rate_usd_per_min,
-          markup_percent,
-          min_profit_usd_per_min,
-          manual_override,
-          rate_source,
-          last_synced_at,
-          is_active,
-          updated_at
-        )
-      VALUES
-        ($1,$2,$3,'USD',$4,'twilio',$5,$6,$7,$8,false,'twilio_live',NOW(),true,NOW())
-      ON CONFLICT (prefix)
-      DO UPDATE SET
-        country_code = EXCLUDED.country_code,
-        country_name = EXCLUDED.country_name,
-        currency = 'USD',
-        price_per_min_cents = EXCLUDED.price_per_min_cents,
-        provider = 'twilio',
-        provider_rate_usd_per_min = EXCLUDED.provider_rate_usd_per_min,
-        sell_rate_usd_per_min = EXCLUDED.sell_rate_usd_per_min,
-        markup_percent = EXCLUDED.markup_percent,
-        min_profit_usd_per_min = EXCLUDED.min_profit_usd_per_min,
-        rate_source = 'twilio_live',
-        last_synced_at = NOW(),
-        updated_at = NOW()
-      WHERE call_rates.manual_override = false
-      RETURNING *
-      `,
-      [
-        live.countryCode,
-        live.countryName,
-        prefix,
-        legacyCents,
-        live.providerRateUsdPerMin,
-        sellRate,
-        MARKUP_PERCENT,
-        MIN_PROFIT_USD_PER_MIN,
-      ]
-    );
-
-    return upsert.rows[0];
+  // USA/Canada/NANP: country code same +1, তাই area-code সহ prefix
+  if (countryCallingCode === "1" && national.length >= 3) {
+    return `1${national.slice(0, 3)}`;
   }
 
-  // 3) fallback DB prefix rate
-  const fallback = await db.query(
+  return countryCallingCode;
+}
+
+
+async function findRateByToPhone(toPhoneE164) {
+  const phone = cleanPhone(toPhoneE164);
+  const smartPrefix = getSmartPrefix(toPhoneE164);
+
+  if (!smartPrefix) return null;
+
+  // 1) DB manual/backend rate first
+  const dbRate = await db.query(
     `
     SELECT *
     FROM call_rates
     WHERE is_active = true
       AND $1 LIKE prefix || '%'
+      AND LENGTH(prefix) <= 4
     ORDER BY LENGTH(prefix) DESC
     LIMIT 1
     `,
     [phone]
   );
 
-  return fallback.rows[0] || null;
+  if (dbRate.rows[0]) return dbRate.rows[0];
+
+  // 2) Twilio live pricing only if DB rate not found
+  const live = await fetchTwilioNumberRate(toPhoneE164);
+  if (!live) return null;
+
+  const sellRate = makeSellRate(live.providerRateUsdPerMin);
+  const pricePerMinCents = Math.max(1, Math.ceil(sellRate * 100));
+
+  const upsert = await db.query(
+    `
+    INSERT INTO call_rates
+      (
+        country_code,
+        country_name,
+        prefix,
+        currency,
+        price_per_min_cents,
+        provider,
+        provider_rate_usd_per_min,
+        sell_rate_usd_per_min,
+        markup_percent,
+        min_profit_usd_per_min,
+        manual_override,
+        rate_source,
+        last_synced_at,
+        is_active,
+        updated_at
+      )
+    VALUES
+      ($1,$2,$3,'USD',$4,'twilio',$5,$6,$7,$8,false,'twilio_live',NOW(),true,NOW())
+    ON CONFLICT (prefix)
+    DO UPDATE SET
+      country_code = EXCLUDED.country_code,
+      country_name = EXCLUDED.country_name,
+      price_per_min_cents = EXCLUDED.price_per_min_cents,
+      provider_rate_usd_per_min = EXCLUDED.provider_rate_usd_per_min,
+      sell_rate_usd_per_min = EXCLUDED.sell_rate_usd_per_min,
+      rate_source = 'twilio_live',
+      last_synced_at = NOW(),
+      updated_at = NOW()
+    WHERE call_rates.manual_override = false
+    RETURNING *
+    `,
+    [
+      live.countryCode,
+      live.countryName,
+      smartPrefix,
+      pricePerMinCents,
+      live.providerRateUsdPerMin,
+      sellRate,
+      MARKUP_PERCENT,
+      MIN_PROFIT_USD_PER_MIN,
+    ]
+  );
+
+  return upsert.rows[0];
 }
 
 async function startCallSession({ userId, toPhoneE164, meta = null }) {
