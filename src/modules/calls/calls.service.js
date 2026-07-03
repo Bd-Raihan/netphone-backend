@@ -65,6 +65,9 @@ async function fetchTwilioNumberRate(toPhoneE164) {
   };
 }
 
+function cleanPhone(phone) {
+  return String(phone || "").replace(/[^\d]/g, "");
+}
 
 function getSmartPrefix(toPhoneE164) {
   const parsed = parsePhoneNumberFromString(toPhoneE164);
