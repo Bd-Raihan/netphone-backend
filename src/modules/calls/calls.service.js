@@ -65,9 +65,7 @@ async function fetchTwilioNumberRate(toPhoneE164) {
   };
 }
 
-function cleanPhone(phone) {
-  return String(phone || "").replace(/[^\d]/g, "");
-}
+
 
 function getSmartPrefix(toPhoneE164) {
   const parsed = parsePhoneNumberFromString(toPhoneE164);
@@ -84,21 +82,16 @@ function getSmartPrefix(toPhoneE164) {
   return countryCallingCode;
 }
 
-
 async function findRateByToPhone(toPhoneE164) {
   const phone = cleanPhone(toPhoneE164);
-  const smartPrefix = getSmartPrefix(toPhoneE164);
 
-  if (!smartPrefix) return null;
-
-  // 1) DB manual/backend rate first
+  // 1) DB rate first - invalid/short number হলেও prefix rate খুঁজবে
   const dbRate = await db.query(
     `
     SELECT *
     FROM call_rates
     WHERE is_active = true
       AND $1 LIKE prefix || '%'
-      AND LENGTH(prefix) <= 4
     ORDER BY LENGTH(prefix) DESC
     LIMIT 1
     `,
@@ -107,7 +100,10 @@ async function findRateByToPhone(toPhoneE164) {
 
   if (dbRate.rows[0]) return dbRate.rows[0];
 
-  // 2) Twilio live pricing only if DB rate not found
+  // 2) DB না পেলে live pricing
+  const smartPrefix = getSmartPrefix(toPhoneE164);
+  if (!smartPrefix) return null;
+
   const live = await fetchTwilioNumberRate(toPhoneE164);
   if (!live) return null;
 
@@ -118,21 +114,12 @@ async function findRateByToPhone(toPhoneE164) {
     `
     INSERT INTO call_rates
       (
-        country_code,
-        country_name,
-        prefix,
-        currency,
-        price_per_min_cents,
-        provider,
-        provider_rate_usd_per_min,
-        sell_rate_usd_per_min,
-        markup_percent,
-        min_profit_usd_per_min,
-        manual_override,
-        rate_source,
-        last_synced_at,
-        is_active,
-        updated_at
+        country_code, country_name, prefix, currency,
+        price_per_min_cents, provider,
+        provider_rate_usd_per_min, sell_rate_usd_per_min,
+        markup_percent, min_profit_usd_per_min,
+        manual_override, rate_source,
+        last_synced_at, is_active, updated_at
       )
     VALUES
       ($1,$2,$3,'USD',$4,'twilio',$5,$6,$7,$8,false,'twilio_live',NOW(),true,NOW())
