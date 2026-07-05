@@ -7,8 +7,8 @@ const walletService = require("../wallet/wallet.service");
 // Twilio live rate + profit rule
 // ===============================
 
-const MARKUP_PERCENT = Number(process.env.CALL_MARKUP_PERCENT || 25);
-const MIN_PROFIT_USD_PER_MIN = Number(process.env.CALL_MIN_PROFIT_USD_PER_MIN || 0.002);
+const MARKUP_PERCENT = Number(process.env.CALL_MARKUP_PERCENT || 30);
+const MIN_PROFIT_USD_PER_MIN = Number(process.env.CALL_MIN_PROFIT_USD_PER_MIN || 0.003);
 
 function cleanPhone(phone) {
   return String(phone || "").replace("+", "").replace(/\D/g, "");
