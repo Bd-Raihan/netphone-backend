@@ -73,5 +73,6 @@ function requireAdmin(req, res, next) {
 }
 
 module.exports = {
-  authRequired,requireAdmin,
+  authRequired,
+  requireAdmin,
 };
