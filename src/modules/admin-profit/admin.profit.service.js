@@ -71,7 +71,7 @@ async function getUserCountryWiseProfit() {
       cr.country_name,
       cr.country_code,
       u.phone_e164 AS registered_phone,
-      COALESCE(u.name, 'Unknown') AS user_name,
+      COALESCE(u.phone_e164, 'Unknown') AS user_name,
       COUNT(cs.id)::int AS total_calls,
       COALESCE(SUM(cs.charged_minutes), 0)::int AS total_minutes,
       COALESCE(SUM(cs.charged_amount_usd), 0)::numeric(12,5) AS total_user_paid,
@@ -85,7 +85,7 @@ async function getUserCountryWiseProfit() {
     LEFT JOIN call_rates cr ON cr.id = cs.rate_id
     LEFT JOIN users u ON u.id = cs.user_id
     WHERE cs.status = 'charged'
-    GROUP BY cr.country_name, cr.country_code, u.phone_e164, u.name
+    GROUP BY cr.country_name, cr.country_code, u.phone_e164
     ORDER BY total_profit DESC
   `);
 
