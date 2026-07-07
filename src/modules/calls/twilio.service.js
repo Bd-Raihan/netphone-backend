@@ -7,30 +7,56 @@ const client = twilio(
 );
 
 // ✅ OTP SMS Send
-async function sendOtpSms({ to, code, expiresMin }) {
+async function sendOtpSms({ to }) {
   try {
-    const messageBody = `Your NetPhone OTP is ${code}. It will expire in ${expiresMin} minutes. Do not share this code.`;
+    const serviceSid = process.env.TWILIO_VERIFY_SERVICE_SID;
 
-    const payload = {
-      to,
-      body: messageBody,
-    };
-
-    if (process.env.TWILIO_MESSAGING_SERVICE_SID) {
-      payload.messagingServiceSid = process.env.TWILIO_MESSAGING_SERVICE_SID;
-    } else {
-      payload.from = process.env.TWILIO_PHONE_NUMBER;
+    if (!serviceSid) {
+      throw new Error("TWILIO_VERIFY_SERVICE_SID missing");
     }
 
-    const msg = await client.messages.create(payload);
+    const verification = await client.verify.v2
+      .services(serviceSid)
+      .verifications.create({
+        to,
+        channel: "sms",
+      });
 
     return {
       ok: true,
-      sid: msg.sid,
-      status: msg.status,
+      sid: verification.sid,
+      status: verification.status,
     };
   } catch (err) {
-    console.error("Twilio SMS Error:", err);
+    console.error("Twilio Verify Send Error:", err);
+    return {
+      ok: false,
+      error: err.message,
+    };
+  }
+}
+
+async function checkOtpVerify({ to, code }) {
+  try {
+    const serviceSid = process.env.TWILIO_VERIFY_SERVICE_SID;
+
+    if (!serviceSid) {
+      throw new Error("TWILIO_VERIFY_SERVICE_SID missing");
+    }
+
+    const result = await client.verify.v2
+      .services(serviceSid)
+      .verificationChecks.create({
+        to,
+        code,
+      });
+
+    return {
+      ok: result.status === "approved",
+      status: result.status,
+    };
+  } catch (err) {
+    console.error("Twilio Verify Check Error:", err);
     return {
       ok: false,
       error: err.message,
@@ -72,7 +98,9 @@ async function makeCall({ to, sessionId }) {
   }
 }
 
+
 module.exports = {
   makeCall,
   sendOtpSms,
+  checkOtpVerify,
 };

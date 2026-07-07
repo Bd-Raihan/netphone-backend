@@ -13,7 +13,7 @@ const {
   verifyOtp,
 } = require("./auth.service");
 const { requestOtpSchema, verifyOtpSchema } = require("./auth.validation");
-const { sendOtpSms } = require("../calls/twilio.service");
+const { sendOtpSms, checkOtpVerify } = require("../calls/twilio.service");
 // ✅ helper: error response (dev/prod)
 function sendServerError(res, err, where = "UNKNOWN") {
   // ✅ Terminal এ আসল error দেখাবে
@@ -50,7 +50,7 @@ async function requestOtp(req, res) {
     const otp = await createOtp(phone, expiresMin);
 
     // ✅ Production: OTP SMS sent by Twilio, OTP code response এ দেওয়া হবে না
-    const smsResult = await sendOtpSms({ to: phone, code: otp.code, expiresMin });
+    const smsResult = await sendOtpSms({ to: phone });
     if (!smsResult.ok) {
       return res.status(500).json({ ok: false, message: "Failed to send OTP" });
     }
@@ -58,7 +58,7 @@ async function requestOtp(req, res) {
     return res.json({
       ok: true,
       message: "OTP sent successfully",
-      expires_at: otp.expires_at,
+     
       user: { id: user.id, phone: user.phone_e164 },
 });
   } catch (err) {
@@ -78,10 +78,14 @@ async function verifyOtpAndLogin(req, res) {
 
     const { phone_e164, code } = parsed.data;
 
-    const result = await verifyOtp(phone_e164, code);
-    if (!result.ok) {
-      return res.status(401).json({ ok: false, reason: result.reason });
-    }
+   const result = await checkOtpVerify({ to: phone_e164, code });
+
+if (!result.ok) {
+  return res.status(401).json({
+    ok: false,
+    reason: "invalid_or_expired",
+  });
+}
 
     let user = await findUserByPhone(phone_e164);
     if (!user) user = await createUserWithWallet(phone_e164);
