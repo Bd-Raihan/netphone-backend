@@ -19,6 +19,7 @@ const adminCryptoRoutes = require("./modules/admin/admin.crypto.routes"); // Adm
 const adminProfitRoutes = require("./modules/admin-profit/admin.profit.routes");
 const appPagesRoutes = require("./modules/app-pages/app.pages.routes");
 const ratesRoutes = require("./modules/rates/rates.routes");
+const adminContentRoutes = require("./modules/admin-content/admin.content.routes");
 // Express app তৈরি
 const app = express();
 // Global Middlewares
@@ -58,6 +59,7 @@ app.use("/api/admin/crypto", adminCryptoRoutes);
 app.use("/api/admin/profit", adminProfitRoutes);
 app.use("/api/app-pages", appPagesRoutes); 
 app.use("/api/rates", ratesRoutes); 
+app.use("/api/admin/content", adminContentRoutes);
 // 404 handler (সব route fail হলে)
 app.use(notFound);
 // final error handler
