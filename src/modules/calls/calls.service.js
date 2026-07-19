@@ -1,170 +1,443 @@
 const db = require("../../config/db");
-const { parsePhoneNumberFromString } = require("libphonenumber-js");
 const walletService = require("../wallet/wallet.service");
+const providerRouter = require("./provider-router.service");
 
-// ===============================
-// Call Rate Engine V3
-// Twilio live rate + profit rule
-// ===============================
-
-const MARKUP_PERCENT = Number(process.env.CALL_MARKUP_PERCENT || 30);
-const MIN_PROFIT_USD_PER_MIN = Number(process.env.CALL_MIN_PROFIT_USD_PER_MIN || 0.003);
-
-function cleanPhone(phone) {
-  return String(phone || "").replace("+", "").replace(/\D/g, "");
+/**
+ * Monetary database snapshots-এর জন্য সর্বোচ্চ 7 decimal রাখা হয়।
+ */
+function round7(value) {
+  return Number(Number(value || 0).toFixed(7));
 }
 
-function round5(n) {
-  return Number(Number(n || 0).toFixed(5));
-}
-
-function makeSellRate(providerRate, markupPercent = MARKUP_PERCENT, minProfit = MIN_PROFIT_USD_PER_MIN) {
-  const byPercent = providerRate * (1 + markupPercent / 100);
-  const byMinProfit = providerRate + minProfit;
-  return round5(Math.max(byPercent, byMinProfit));
-}
-
+/**
+ * Existing wallet engine cent-based হওয়ায় এক মিনিটের sell rate
+ * USD cents-এ convert করে।
+ *
+ * উদাহরণ:
+ * 0.0125 USD -> 1 cent
+ * 0.0270 USD -> 3 cents
+ */
 function toUsdCents(usd) {
-  return Math.round(Number(usd || 0) * 100);
+  return Math.max(
+    0,
+    Math.ceil(Number(usd || 0) * 100)
+  );
 }
 
+/**
+ * Current billing policy:
+ * Answered call-এর duration প্রতি শুরু হওয়া minute অনুযায়ী charge হবে।
+ */
 function ceilMinutes(seconds) {
-  if (Number(seconds || 0) <= 0) return 0;
-  return Math.max(1, Math.ceil(Number(seconds) / 60));
+  const safeSeconds = Number(seconds || 0);
+
+  if (!Number.isFinite(safeSeconds) || safeSeconds <= 0) {
+    return 0;
+  }
+
+  return Math.max(1, Math.ceil(safeSeconds / 60));
 }
 
-async function fetchTwilioNumberRate(toPhoneE164) {
-  const accountSid = process.env.TWILIO_ACCOUNT_SID;
-  const authToken = process.env.TWILIO_AUTH_TOKEN;
+/**
+ * Router result-কে existing calls.service-compatible rate shape-এ
+ * normalize করে।
+ */
+function normalizeRouterRate(routerResult) {
+  if (!routerResult?.ok) {
+    return null;
+  }
 
-  if (!accountSid || !authToken) return null;
+  const pricing = routerResult.pricing || {};
+  const provider = routerResult.provider || {};
+  const providerRate = routerResult.provider_rate || {};
+  const route = routerResult.route || {};
+  const routeProvider = routerResult.route_provider || {};
+  const providerPlan = routerResult.provider_plan || {};
+  const callRate = routerResult.call_rate || null;
 
-  const url = `https://pricing.twilio.com/v2/Voice/Numbers/${encodeURIComponent(toPhoneE164)}`;
-  const auth = Buffer.from(`${accountSid}:${authToken}`).toString("base64");
+  const rawProviderRate = Number(
+    pricing.raw_provider_rate_usd_per_min ??
+      providerRate.raw_rate_usd_per_min ??
+      callRate?.provider_rate_usd_per_min ??
+      0
+  );
 
-  const res = await fetch(url, {
-    method: "GET",
-    headers: { Authorization: `Basic ${auth}` },
-  });
+  const discountedProviderRate = Number(
+    pricing.discounted_provider_rate_usd_per_min ??
+      callRate?.discounted_provider_rate_usd_per_min ??
+      rawProviderRate
+  );
 
-  if (!res.ok) return null;
+  const platformFee = Number(
+    pricing.platform_fee_usd_per_min ??
+      callRate?.platform_fee_usd_per_min ??
+      0
+  );
 
-  const data = await res.json();
-  const prices = data.outboundCallPrices || data.outbound_call_prices || [];
-  const first = prices[0];
+  const totalProviderCost = Number(
+    pricing.total_provider_cost_usd_per_min ??
+      discountedProviderRate + platformFee
+  );
 
-  if (!first) return null;
+  const sellRate = Number(
+    pricing.sell_rate_usd_per_min ??
+      callRate?.sell_rate_usd_per_min ??
+      Number(callRate?.price_per_min_cents || 0) / 100
+  );
 
-  const currentPrice = Number(first.currentPrice ?? first.current_price ?? first.basePrice ?? first.base_price);
-  if (!Number.isFinite(currentPrice) || currentPrice <= 0) return null;
+  if (
+    !Number.isFinite(sellRate) ||
+    sellRate <= 0
+  ) {
+    return null;
+  }
+
+  if (
+    Number.isFinite(totalProviderCost) &&
+    totalProviderCost > 0 &&
+    sellRate <= totalProviderCost
+  ) {
+    return null;
+  }
 
   return {
-    countryCode: data.isoCountry || data.iso_country || "XX",
-    countryName: data.country || "International",
-    providerRateUsdPerMin: round5(currentPrice),
+    id: callRate?.id || null,
+
+    country_code:
+      providerRate.country_code ||
+      callRate?.country_code ||
+      routerResult.destination_policy?.country_code ||
+      route.country_code ||
+      null,
+
+    country_name:
+      providerRate.country_name ||
+      callRate?.country_name ||
+      null,
+
+    destination_name:
+      providerRate.destination_name ||
+      routerResult.destination_policy?.destination_name ||
+      null,
+
+    prefix:
+      providerRate.prefix ||
+      callRate?.prefix ||
+      route.prefix ||
+      null,
+
+    currency:
+      callRate?.currency || "USD",
+
+    provider:
+      provider.code ||
+      callRate?.provider ||
+      "telnyx",
+
+    provider_id:
+      provider.id ||
+      callRate?.provider_id ||
+      null,
+
+    provider_plan_id:
+      providerPlan.id ||
+      callRate?.provider_plan_id ||
+      null,
+
+    provider_plan_code:
+      providerPlan.code || null,
+
+    provider_discount_percent: Number(
+      pricing.discount_percent ??
+        providerPlan.discount_percent ??
+        0
+    ),
+
+    provider_rate_id:
+      providerRate.provider_rate_id ||
+      callRate?.provider_rate_id ||
+      null,
+
+    route_id:
+      route.id ||
+      callRate?.route_id ||
+      null,
+
+    route_provider_id:
+      routeProvider.route_provider_id ||
+      null,
+
+    raw_provider_rate_usd_per_min:
+      round7(rawProviderRate),
+
+    discounted_provider_rate_usd_per_min:
+      round7(discountedProviderRate),
+
+    platform_fee_usd_per_min:
+      round7(platformFee),
+
+    total_provider_cost_usd_per_min:
+      round7(totalProviderCost),
+
+    provider_rate_usd_per_min:
+      round7(rawProviderRate),
+
+    sell_rate_usd_per_min:
+      round7(sellRate),
+
+    markup_percent: Number(
+      pricing.markup_percent ??
+        callRate?.markup_percent ??
+        25
+    ),
+
+    min_profit_usd_per_min: Number(
+      pricing.min_profit_usd_per_min ??
+        callRate?.min_profit_usd_per_min ??
+        0.002
+    ),
+
+    max_provider_rate_usd_per_min:
+      routerResult.max_provider_rate_usd_per_min ??
+      callRate?.max_provider_rate_usd_per_min ??
+      null,
+
+    price_per_min_cents: Math.max(
+      1,
+      Number(
+        callRate?.price_per_min_cents ||
+          toUsdCents(sellRate)
+      )
+    ),
+
+    rate_source:
+      routerResult.source ||
+      callRate?.rate_source ||
+      "multi_provider_router",
+
+    route_attempts:
+      routerResult.rejected_providers || [],
+
+    router_fallback_reason:
+      routerResult.router_fallback_reason || null,
+
+    call_rate: callRate,
+    router_result: routerResult,
   };
 }
 
+/**
+ * Backward-compatible exported rate lookup.
+ *
+ * এখন এটি সরাসরি call_rates query না করে Provider Router ব্যবহার করে।
+ */
+async function findRateByToPhone(toPhoneE164) {
+  const routerResult =
+    await providerRouter.resolveDestination(toPhoneE164);
 
+  if (!routerResult.ok) {
+    console.warn(
+      "⚠️ CALL ROUTER REJECTED DESTINATION:",
+      {
+        toPhoneE164,
+        reason: routerResult.reason,
+        disabledReason:
+          routerResult.disabled_reason || null,
+      }
+    );
 
-function getSmartPrefix(toPhoneE164) {
-  const parsed = parsePhoneNumberFromString(toPhoneE164);
-  if (!parsed || !parsed.isValid()) return null;
-
-  const countryCallingCode = parsed.countryCallingCode;
-  const national = parsed.nationalNumber || "";
-
-  // USA/Canada/NANP: country code same +1, তাই area-code সহ prefix
-  if (countryCallingCode === "1" && national.length >= 3) {
-    return `1${national.slice(0, 3)}`;
+    return null;
   }
 
-  return countryCallingCode;
+  const rate = normalizeRouterRate(routerResult);
+
+  if (!rate) {
+    console.error(
+      "❌ ROUTER RETURNED INVALID PRICING:",
+      {
+        toPhoneE164,
+        source: routerResult.source,
+        provider: routerResult.provider?.code,
+      }
+    );
+
+    return null;
+  }
+
+  return rate;
 }
 
-async function findRateByToPhone(toPhoneE164) {
-  const phone = cleanPhone(toPhoneE164);
+/**
+ * Call শুরু করার আগে:
+ *
+ * 1. Destination validate
+ * 2. Disabled policy check
+ * 3. Route/provider/rate resolve
+ * 4. Loss-protection check
+ * 5. Wallet balance check
+ * 6. Immutable routing/pricing snapshot save
+ */
+async function startCallSession({
+  userId,
+  toPhoneE164,
+  meta = null,
+}) {
+  const routerResult =
+    await providerRouter.resolveDestination(toPhoneE164);
 
-  // 1) DB rate first - invalid/short number হলেও prefix rate খুঁজবে
-  const dbRate = await db.query(
-    `
-    SELECT *
-    FROM call_rates
-    WHERE is_active = true
-      AND $1 LIKE prefix || '%'
-    ORDER BY LENGTH(prefix) DESC
-    LIMIT 1
-    `,
-    [phone]
+  if (!routerResult.ok) {
+    return {
+      ok: false,
+      reason:
+        routerResult.reason ||
+        "route_resolution_failed",
+      message:
+        routerResult.disabled_reason ||
+        routerResult.reason ||
+        "No safe call route is available",
+      routing: routerResult,
+    };
+  }
+
+  const rate = normalizeRouterRate(routerResult);
+
+  if (!rate) {
+    return {
+      ok: false,
+      reason: "invalid_router_pricing",
+      message:
+        "The selected route does not have safe pricing",
+    };
+  }
+
+  const providerCode = String(
+    rate.provider || ""
+  )
+    .trim()
+    .toLowerCase();
+
+  if (!providerCode) {
+    return {
+      ok: false,
+      reason: "provider_not_selected",
+      message: "No voice provider was selected",
+    };
+  }
+
+  const sellRate = Number(
+    rate.sell_rate_usd_per_min
   );
 
-  if (dbRate.rows[0]) return dbRate.rows[0];
-
-  // 2) DB না পেলে live pricing
-  const smartPrefix = getSmartPrefix(toPhoneE164);
-  if (!smartPrefix) return null;
-
-  const live = await fetchTwilioNumberRate(toPhoneE164);
-  if (!live) return null;
-
-  const sellRate = makeSellRate(live.providerRateUsdPerMin);
-  const pricePerMinCents = Math.max(1, Math.ceil(sellRate * 100));
-
-  const upsert = await db.query(
-    `
-    INSERT INTO call_rates
-      (
-        country_code, country_name, prefix, currency,
-        price_per_min_cents, provider,
-        provider_rate_usd_per_min, sell_rate_usd_per_min,
-        markup_percent, min_profit_usd_per_min,
-        manual_override, rate_source,
-        last_synced_at, is_active, updated_at
-      )
-    VALUES
-      ($1,$2,$3,'USD',$4,'twilio',$5,$6,$7,$8,false,'twilio_live',NOW(),true,NOW())
-    ON CONFLICT (prefix)
-    DO UPDATE SET
-      country_code = EXCLUDED.country_code,
-      country_name = EXCLUDED.country_name,
-      price_per_min_cents = EXCLUDED.price_per_min_cents,
-      provider_rate_usd_per_min = EXCLUDED.provider_rate_usd_per_min,
-      sell_rate_usd_per_min = EXCLUDED.sell_rate_usd_per_min,
-      rate_source = 'twilio_live',
-      last_synced_at = NOW(),
-      updated_at = NOW()
-    WHERE call_rates.manual_override = false
-    RETURNING *
-    `,
-    [
-      live.countryCode,
-      live.countryName,
-      smartPrefix,
-      pricePerMinCents,
-      live.providerRateUsdPerMin,
-      sellRate,
-      MARKUP_PERCENT,
-      MIN_PROFIT_USD_PER_MIN,
-    ]
+  const totalProviderCost = Number(
+    rate.total_provider_cost_usd_per_min
   );
 
-  return upsert.rows[0];
-}
+  if (
+    !Number.isFinite(sellRate) ||
+    sellRate <= 0
+  ) {
+    return {
+      ok: false,
+      reason: "invalid_sell_rate",
+    };
+  }
 
-async function startCallSession({ userId, toPhoneE164, meta = null }) {
-  const rate = await findRateByToPhone(toPhoneE164);
-  if (!rate) return { ok: false, reason: "rate_not_found" };
+  if (
+    Number.isFinite(totalProviderCost) &&
+    totalProviderCost > 0 &&
+    sellRate <= totalProviderCost
+  ) {
+    return {
+      ok: false,
+      reason: "sell_rate_not_above_cost",
+    };
+  }
 
   await walletService.ensureWallet(userId);
-  const wallet = await walletService.getWalletByUserId(userId);
-  if (!wallet) return { ok: false, reason: "wallet_not_found" };
 
-  const sellRate = Number(rate.sell_rate_usd_per_min || rate.price_per_min_cents / 100);
-  const oneMinuteCostCents = Math.max(1, toUsdCents(sellRate));
+  const wallet =
+    await walletService.getWalletByUserId(userId);
 
-  if (Number(wallet.balance_cents) < oneMinuteCostCents) {
-    return { ok: false, reason: "insufficient_balance_for_call" };
+  if (!wallet) {
+    return {
+      ok: false,
+      reason: "wallet_not_found",
+    };
   }
+
+  const oneMinuteCostCents = Math.max(
+    1,
+    toUsdCents(sellRate)
+  );
+
+  if (
+    Number(wallet.balance_cents || 0) <
+    oneMinuteCostCents
+  ) {
+    return {
+      ok: false,
+      reason: "insufficient_balance_for_call",
+      required_balance_cents:
+        oneMinuteCostCents,
+      available_balance_cents: Number(
+        wallet.balance_cents || 0
+      ),
+    };
+  }
+
+  const sessionMeta = {
+    ...(meta || {}),
+
+    router_source:
+      rate.rate_source,
+
+    selected_provider:
+      providerCode,
+
+    selected_route_id:
+      rate.route_id,
+
+    selected_route_provider_id:
+      rate.route_provider_id,
+
+    provider_plan_code:
+      rate.provider_plan_code,
+
+    matched_prefix:
+      rate.prefix,
+
+    router_fallback_reason:
+      rate.router_fallback_reason,
+
+    pricing_snapshot: {
+      raw_provider_rate_usd_per_min:
+        rate.raw_provider_rate_usd_per_min,
+
+      provider_discount_percent:
+        rate.provider_discount_percent,
+
+      discounted_provider_rate_usd_per_min:
+        rate.discounted_provider_rate_usd_per_min,
+
+      platform_fee_usd_per_min:
+        rate.platform_fee_usd_per_min,
+
+      total_provider_cost_usd_per_min:
+        rate.total_provider_cost_usd_per_min,
+
+      sell_rate_usd_per_min:
+        rate.sell_rate_usd_per_min,
+
+      markup_percent:
+        rate.markup_percent,
+
+      min_profit_usd_per_min:
+        rate.min_profit_usd_per_min,
+
+      max_provider_rate_usd_per_min:
+        rate.max_provider_rate_usd_per_min,
+    },
+  };
 
   const { rows } = await db.query(
     `
@@ -172,212 +445,465 @@ async function startCallSession({ userId, toPhoneE164, meta = null }) {
       (
         user_id,
         to_phone_e164,
+
         rate_id,
         currency,
         price_per_min_cents,
+
+        provider,
+        provider_id,
+        provider_plan_id,
+        provider_rate_id,
+
+        route_id,
+        route_provider_id,
+
+        provider_plan_code,
+        provider_discount_percent,
+
         provider_rate_usd_per_min,
+        provider_platform_fee_usd_per_min,
+        discounted_provider_rate_usd_per_min,
+        total_provider_cost_usd_per_min,
+
         sell_rate_usd_per_min,
+        pricing_markup_percent,
+        pricing_min_profit_usd_per_min,
+
+        route_attempts,
+
         status,
         meta
       )
     VALUES
-      ($1,$2,$3,'USD',$4,$5,$6,'started',$7)
+      (
+        $1,
+        $2,
+
+        $3,
+        'USD',
+        $4,
+
+        $5,
+        $6,
+        $7,
+        $8,
+
+        $9,
+        $10,
+
+        $11,
+        $12,
+
+        $13,
+        $14,
+        $15,
+        $16,
+
+        $17,
+        $18,
+        $19,
+
+        $20::jsonb,
+
+        'started',
+        $21::jsonb
+      )
     RETURNING *
     `,
     [
       userId,
       toPhoneE164,
+
       rate.id,
       oneMinuteCostCents,
-      Number(rate.provider_rate_usd_per_min || 0),
+
+      providerCode,
+      rate.provider_id,
+      rate.provider_plan_id,
+      rate.provider_rate_id,
+
+      rate.route_id,
+      rate.route_provider_id,
+
+      rate.provider_plan_code,
+      rate.provider_discount_percent,
+
+      rate.raw_provider_rate_usd_per_min,
+      rate.platform_fee_usd_per_min,
+      rate.discounted_provider_rate_usd_per_min,
+      rate.total_provider_cost_usd_per_min,
+
       sellRate,
-      meta,
+      rate.markup_percent,
+      rate.min_profit_usd_per_min,
+
+      JSON.stringify(
+        rate.route_attempts || []
+      ),
+
+      JSON.stringify(sessionMeta),
     ]
   );
 
-  return { ok: true, session: rows[0] };
+  return {
+    ok: true,
+    session: rows[0],
+
+    routing: {
+      source: rate.rate_source,
+
+      provider: {
+        id: rate.provider_id,
+        code: providerCode,
+      },
+
+      provider_plan: {
+        id: rate.provider_plan_id,
+        code: rate.provider_plan_code,
+      },
+
+      route: {
+        id: rate.route_id,
+        route_provider_id:
+          rate.route_provider_id,
+      },
+
+      matched_prefix: rate.prefix,
+
+      sell_rate_usd_per_min:
+        sellRate,
+
+      total_provider_cost_usd_per_min:
+        rate.total_provider_cost_usd_per_min,
+    },
+  };
 }
 
-// ✅ END CALL AND CHARGE
-async function endCallAndCharge({ userId, sessionId }) {
-  return { ok: true, reason: "billing_by_twilio_callback_only" };
+/**
+ * User end request এখন provider webhook billing-এর ওপর নির্ভরশীল।
+ */
+async function endCallAndCharge({
+  userId,
+  sessionId,
+}) {
+  return {
+    ok: true,
+    reason:
+      "billing_by_provider_webhook_only",
+  };
 }
 
-// ✅ BILL COMPLETED CALL BY SID
-async function billCompletedCallBySid({ callSid, sessionId, rawPayload }) {
+/**
+ * Provider webhook/CDR-এর final duration দিয়ে completed call bill করে।
+ */
+async function billCompletedCallByProvider({
+  callSid,
+  sessionId,
+  rawPayload,
+}) {
   const client = await db.pool.connect();
 
   try {
     await client.query("BEGIN");
 
-    const s = await client.query(
+    const sessionResult = await client.query(
       `
       SELECT *
       FROM call_sessions
-      WHERE twilio_call_sid = $1
-         OR id = $2
+      WHERE
+        provider_call_id = $1
+        OR id = $2
       ORDER BY id DESC
       LIMIT 1
       FOR UPDATE
       `,
-      [callSid || null, Number(sessionId || 0)]
+      [
+        callSid || null,
+        Number(sessionId || 0),
+      ]
     );
 
-    const session = s.rows[0];
+    const session =
+      sessionResult.rows[0];
 
-    // If the session is not found, rollback and return an error
     if (!session) {
       await client.query("ROLLBACK");
-      return { ok: false, reason: "session_not_found" };
+
+      return {
+        ok: false,
+        reason: "session_not_found",
+      };
     }
 
-    // If the session is already charged, rollback and return an error
-    if (session.status === "charged" || Number(session.charged_amount_cents || 0) > 0) {
+    if (
+      session.status === "charged" ||
+      Number(
+        session.charged_amount_cents || 0
+      ) > 0
+    ) {
       await client.query("COMMIT");
-      return { ok: true, reason: "already_charged" };
+
+      return {
+        ok: true,
+        reason: "already_charged",
+      };
     }
 
-    // If the session was never answered, mark it as completed with no charge
     if (!session.answered_at) {
       await client.query(
         `
         UPDATE call_sessions
-        SET status = 'completed',
-            provider_status = 'completed',
-            ended_at = NOW(),
-            duration_sec = 0,
-            charged_minutes = 0,
-            charged_amount_cents = 0,
-            billing_source = 'answered_at_missing_no_charge',
-            status_callback_payload = $2
+        SET
+          status = 'completed',
+          provider_status = 'completed',
+          ended_at = COALESCE(ended_at, NOW()),
+          duration_sec = 0,
+          charged_minutes = 0,
+          charged_amount_cents = 0,
+          billing_source =
+            'answered_at_missing_no_charge',
+          status_callback_payload = $2
         WHERE id = $1
         `,
-        [session.id, rawPayload || {}]
+        [
+          session.id,
+          rawPayload || {},
+        ]
       );
 
       await client.query("COMMIT");
-      return { ok: true, reason: "no_charge_not_answered" };
+
+      return {
+        ok: true,
+        reason:
+          "no_charge_not_answered",
+      };
     }
 
     const durationSec = Number(
-    rawPayload?.CallDuration ??
-    rawPayload?.Duration ??
-    0
+      rawPayload?.CallDuration ??
+        rawPayload?.Duration ??
+        rawPayload?.duration_sec ??
+        rawPayload?.billable_duration_sec ??
+        0
     );
 
-    // If the duration is zero or negative, mark it as completed with no charge
-    const safeDurationSec = Math.max(0, Math.floor(durationSec));
+    const safeDurationSec = Math.max(
+      0,
+      Math.floor(
+        Number.isFinite(durationSec)
+          ? durationSec
+          : 0
+      )
+    );
 
-    // If the duration is zero or negative, mark it as completed with no charge
     if (safeDurationSec <= 0) {
       await client.query(
         `
         UPDATE call_sessions
-        SET status = 'completed',
-            provider_status = 'completed',
-            ended_at = NOW(),
-            duration_sec = 0,
-            charged_minutes = 0,
-            charged_amount_cents = 0,
-            billing_source = 'zero_answered_duration',
-            status_callback_payload = $2
+        SET
+          status = 'completed',
+          provider_status = 'completed',
+          ended_at = COALESCE(ended_at, NOW()),
+          duration_sec = 0,
+          charged_minutes = 0,
+          charged_amount_cents = 0,
+          billing_source =
+            'zero_answered_duration',
+          status_callback_payload = $2
         WHERE id = $1
         `,
-        [session.id, rawPayload || {}]
+        [
+          session.id,
+          rawPayload || {},
+        ]
       );
 
       await client.query("COMMIT");
-      return { ok: true, reason: "no_charge_zero_duration" };
+
+      return {
+        ok: true,
+        reason:
+          "no_charge_zero_duration",
+      };
     }
 
-    // Calculate the charged minutes and amounts
-    const chargedMinutes = ceilMinutes(safeDurationSec);
+    const chargedMinutes =
+      ceilMinutes(safeDurationSec);
 
-    // Calculate the price per minute in cents
-    const pricePerMinCents = Number(
-      session.price_per_min_cents ||
-      Math.ceil(Number(session.sell_rate_usd_per_min || 0) * 100)
+    const pricePerMinCents = Math.max(
+      1,
+      Number(
+        session.price_per_min_cents ||
+          toUsdCents(
+            session.sell_rate_usd_per_min
+          )
+      )
     );
 
-    // Calculate the total amount in cents
-    const amountCents = chargedMinutes * pricePerMinCents;
+    const amountCents =
+      chargedMinutes * pricePerMinCents;
 
-    // Calculate the provider cost and profit
-    const sellRate = pricePerMinCents / 100;
-    const providerRate = Number(session.provider_rate_usd_per_min || 0);
+    const sellRate =
+      pricePerMinCents / 100;
 
-    // Calculate the charged amount in USD, provider cost in USD, and profit in USD
-    const chargedUsd = round5(amountCents / 100);
-    const providerCostUsd = round5(chargedMinutes * providerRate);
-    const profitUsd = round5(chargedUsd - providerCostUsd);
+    /*
+     * Multi-provider session হলে actual cost:
+     * discounted termination rate + platform fee.
+     *
+     * Historical session হলে পুরোনো provider_rate field fallback।
+     */
+    const providerCostRate = Number(
+      session.total_provider_cost_usd_per_min ||
+        session.provider_rate_usd_per_min ||
+        0
+    );
 
-    // Calculate the provider cost in cents and profit in cents
-    const providerCostCents = Math.max(0, toUsdCents(providerCostUsd));
-    const profitCents = amountCents - providerCostCents;
-    
-    // Update the call session with the calculated values
+    const chargedUsd = round7(
+      amountCents / 100
+    );
+
+    const providerCostUsd = round7(
+      chargedMinutes * providerCostRate
+    );
+
+    const profitUsd = round7(
+      chargedUsd - providerCostUsd
+    );
+
+    const providerCostCents = Math.max(
+      0,
+      Math.round(providerCostUsd * 100)
+    );
+
+    const profitCents =
+      amountCents - providerCostCents;
+
+    /*
+     * Session lock transaction এখানে শেষ করা হয়।
+     * Wallet service নিজস্ব transaction/idempotency ব্যবহার করে।
+     */
     await client.query("COMMIT");
 
-    // Apply the wallet transaction for the call charge
-    const debit = await walletService.applyWalletTx({
-      userId: session.user_id,
-      currency: "USD",
-      amountCents: amountCents,
-      txType: "call_charge",
-      meta: {
-        session_id: session.id,
-        to_phone_e164: session.to_phone_e164,
-        duration_sec: safeDurationSec,
-        charged_minutes: chargedMinutes,
-        sell_rate_usd_per_min: sellRate,
-        provider_rate_usd_per_min: providerRate,
-        charged_usd: chargedUsd,
-        provider_cost_usd: providerCostUsd,
-        profit_usd: profitUsd,
-        call_sid: callSid,
-      },
-      idempotencyKey: `call_charge:${session.id}`,
-    });
+    const debit =
+      await walletService.applyWalletTx({
+        userId: session.user_id,
+        currency: "USD",
+        amountCents,
+        txType: "call_charge",
 
-    // If the debit failed, mark the call session as failed and return the reason
+        meta: {
+          session_id: session.id,
+          to_phone_e164:
+            session.to_phone_e164,
+
+          provider:
+            session.provider,
+
+          provider_id:
+            session.provider_id,
+
+          provider_plan_id:
+            session.provider_plan_id,
+
+          provider_rate_id:
+            session.provider_rate_id,
+
+          route_id:
+            session.route_id,
+
+          route_provider_id:
+            session.route_provider_id,
+
+          duration_sec:
+            safeDurationSec,
+
+          charged_minutes:
+            chargedMinutes,
+
+          sell_rate_usd_per_min:
+            sellRate,
+
+          provider_cost_rate_usd_per_min:
+            providerCostRate,
+
+          charged_usd:
+            chargedUsd,
+
+          provider_cost_usd:
+            providerCostUsd,
+
+          profit_usd:
+            profitUsd,
+
+          provider_call_id:
+            callSid,
+        },
+
+        idempotencyKey:
+          `call_charge:${session.id}`,
+      });
+
     if (!debit.ok) {
       await db.query(
         `
         UPDATE call_sessions
-        SET status = 'failed',
-            provider_status = 'completed',
-            ended_at = NOW(),
-            duration_sec = $2,
-            charged_minutes = $3,
-            charged_amount_cents = $4,
-            billing_source = 'wallet_debit_failed',
-            status_callback_payload = $5
-        WHERE id = $1
-        `,
-        [session.id, safeDurationSec, chargedMinutes, amountCents, rawPayload || {}]
-      );
-
-      return { ok: false, reason: debit.reason || "wallet_debit_failed" };
-    }
-
-    // Update the call session with the final charged values and transaction ID
-    await db.query(
-      `
-      UPDATE call_sessions
-      SET status = 'charged',
+        SET
+          status = 'failed',
           provider_status = 'completed',
-          ended_at = NOW(),
+          ended_at =
+            COALESCE(ended_at, NOW()),
           duration_sec = $2,
           charged_minutes = $3,
           charged_amount_cents = $4,
-          tx_id = $5,
-          provider_cost_cents = $6,
-          profit_cents = $7,
-          provider_cost_usd = $8,
-          charged_amount_usd = $9,
-          profit_usd = $10,
-          billing_source = 'twilio_child_phone_leg_duration',
-          status_callback_payload = $11
+          billing_source =
+            'wallet_debit_failed',
+          status_callback_payload = $5
+        WHERE id = $1
+        `,
+        [
+          session.id,
+          safeDurationSec,
+          chargedMinutes,
+          amountCents,
+          rawPayload || {},
+        ]
+      );
+
+      return {
+        ok: false,
+        reason:
+          debit.reason ||
+          "wallet_debit_failed",
+      };
+    }
+
+    await db.query(
+      `
+      UPDATE call_sessions
+      SET
+        status = 'charged',
+        provider_status = 'completed',
+        ended_at =
+          COALESCE(ended_at, NOW()),
+        duration_sec = $2,
+        charged_minutes = $3,
+        charged_amount_cents = $4,
+        tx_id = $5,
+
+        provider_cost_cents = $6,
+        profit_cents = $7,
+
+        provider_cost_usd = $8,
+        charged_amount_usd = $9,
+        profit_usd = $10,
+
+        billing_source =
+          'provider_webhook_duration',
+
+        status_callback_payload = $11
+
       WHERE id = $1
       `,
       [
@@ -386,35 +912,61 @@ async function billCompletedCallBySid({ callSid, sessionId, rawPayload }) {
         chargedMinutes,
         amountCents,
         debit.tx?.id || null,
+
         providerCostCents,
         profitCents,
+
         providerCostUsd,
         chargedUsd,
         profitUsd,
+
         rawPayload || {},
       ]
     );
 
     return {
       ok: true,
-      duration_sec: safeDurationSec,
-      charged_amount_cents: amountCents,
-      charged_minutes: chargedMinutes,
-      wallet: debit.wallet,
-      tx: debit.tx,
+
+      provider:
+        session.provider,
+
+      duration_sec:
+        safeDurationSec,
+
+      charged_minutes:
+        chargedMinutes,
+
+      charged_amount_cents:
+        amountCents,
+
+      provider_cost_usd:
+        providerCostUsd,
+
+      profit_usd:
+        profitUsd,
+
+      wallet:
+        debit.wallet,
+
+      tx:
+        debit.tx,
     };
-  } catch (e) {
-    try { await client.query("ROLLBACK"); } catch {}
-    throw e;
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      // Original error preserve করা হচ্ছে।
+    }
+
+    throw error;
   } finally {
     client.release();
   }
 }
 
-// ✅ TWILIO CALLBACK
 module.exports = {
   startCallSession,
   endCallAndCharge,
-  billCompletedCallBySid,
+  billCompletedCallByProvider,
   findRateByToPhone,
 };

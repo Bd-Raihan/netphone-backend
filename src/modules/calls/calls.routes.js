@@ -1,49 +1,69 @@
+/**
+ * calls.routes.js
+ * ---------------------------------------
+ * NetPhone Calling Routes
+ * Provider: Telnyx
+ */
 
-// ✅ calls.routes.js
 const express = require("express");
-
-
-
-// controllers
-const {
-  startCall,
-  endCall,
-  testCall,
-  twilioStatusCallback,
-  getVoiceToken,
-  twimlResponse,
-  getCallStatus,
-} = require("./calls.controller");
-// middlewares
-const { authRequired } = require("../auth/middlewares/auth.jwt");
-// ✅ PROTECTED ROUTES
 const router = express.Router();
 
-// ✅ TEST CALL
+// Controllers
+const {
+  startCall,
+  startTelnyxOutboundCall,
+  endCall,
+  testCall,
+  telnyxStatusCallback,
+  getCallStatus,
+} = require("./calls.controller");
+
+// Middleware
+const { authRequired } = require("../auth/middlewares/auth.jwt");
+
+/*--------------------------------------------------
+ | TEST
+ *-------------------------------------------------*/
+
+// Production-এ disabled
 router.get("/test", testCall);
 
-// Twilio voice instruction XML
-router.get("/twiml", twimlResponse);
+/*--------------------------------------------------
+ | USER CALL API
+ *-------------------------------------------------*/
 
-// Protected: user must be logged-in
+// Call session তৈরি
 router.post("/start", authRequired, startCall);
 
-// Protected: user must be logged-in
-router.get("/token", authRequired, getVoiceToken);
+// Telnyx outbound test call
+router.post(
+  "/telnyx/start",
+  authRequired,
+  startTelnyxOutboundCall
+);
 
-// Protected: user must be logged-in
-router.get("/sdk-token", getVoiceToken);
+// Call status
+router.get(
+  "/:id/status",
+  authRequired,
+  getCallStatus
+);
 
-// ✅ Get call status by session id
-router.get("/:id/status", authRequired, getCallStatus);
+// End call
+router.post(
+  "/:id/end",
+  authRequired,
+  endCall
+);
 
-// ✅ END CALL
-router.post("/:id/end", authRequired, endCall);
-// ✅ TWILIO STATUS CALLBACK
-router.post("/twilio-status", twilioStatusCallback);
+/*--------------------------------------------------
+ | TELNYX WEBHOOK
+ *-------------------------------------------------*/
 
-// Twilio voice instruction XML
-router.post("/twiml", twimlResponse);
+// Public webhook
+router.post(
+  "/telnyx-events",
+  telnyxStatusCallback
+);
 
-// ✅ PUBLIC ROUTES
 module.exports = router;

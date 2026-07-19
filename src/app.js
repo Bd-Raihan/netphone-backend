@@ -20,6 +20,17 @@ const adminProfitRoutes = require("./modules/admin-profit/admin.profit.routes");
 const appPagesRoutes = require("./modules/app-pages/app.pages.routes");
 const ratesRoutes = require("./modules/rates/rates.routes");
 const adminContentRoutes = require("./modules/admin-content/admin.content.routes");
+/**
+ * Admin Provider Rate Import routes
+ *
+ * কাজ:
+ * - Server storage-এর provider CSV file list
+ * - CSV dry-run validation
+ * - Provider rate import ও rate-card activation
+ */
+const adminRateImportRoutes = require(
+  "./modules/admin-rate-import/admin-rate-import.routes"
+);
 // Express app তৈরি
 const app = express();
 // Global Middlewares
@@ -60,6 +71,7 @@ app.use("/api/admin/profit", adminProfitRoutes);
 app.use("/api/app-pages", appPagesRoutes); 
 app.use("/api/rates", ratesRoutes); 
 app.use("/api/admin/content", adminContentRoutes);
+app.use("/api/admin/rate-import", adminRateImportRoutes);
 // 404 handler (সব route fail হলে)
 app.use(notFound);
 // final error handler

@@ -9,11 +9,19 @@ const jwt = require("jsonwebtoken");
 const {
   findUserByPhone,
   createUserWithWallet,
-  createOtp,
-  verifyOtp,
 } = require("./auth.service");
 const { requestOtpSchema, verifyOtpSchema } = require("./auth.validation");
-const { sendOtpSms, checkOtpVerify } = require("../calls/twilio.service");
+/**
+ * Provider-neutral OTP adapter।
+ *
+ * বর্তমানে Twilio Verify;
+ * ভবিষ্যতে Telnyx Verify হবে।
+ */
+const {
+  sendOtpSms,
+  checkOtpVerify,
+} = require("./otp-provider.service");
+
 // ✅ helper: error response (dev/prod)
 function sendServerError(res, err, where = "UNKNOWN") {
   // ✅ Terminal এ আসল error দেখাবে
@@ -40,14 +48,9 @@ async function requestOtp(req, res) {
     }
 
     const phone = parsed.data.phone_e164;
-    const expiresMin = Number(process.env.OTP_EXPIRES_MIN || 5);
-
     // ✅ user ensure
     let user = await findUserByPhone(phone);
     if (!user) user = await createUserWithWallet(phone);
-
-    // ✅ create OTP
-    const otp = await createOtp(phone, expiresMin);
 
     // ✅ Production: OTP SMS sent by Twilio, OTP code response এ দেওয়া হবে না
     const smsResult = await sendOtpSms({ to: phone });
@@ -58,7 +61,7 @@ async function requestOtp(req, res) {
     return res.json({
       ok: true,
       message: "OTP sent successfully",
-     
+
       user: { id: user.id, phone: user.phone_e164 },
 });
   } catch (err) {

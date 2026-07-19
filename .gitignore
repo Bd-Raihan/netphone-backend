@@ -2,3 +2,15 @@ node_modules/
 .env
 logs/
 *.log
+
+
+
+# Local secrets
+.env
+
+# Provider rate decks are uploaded separately to the server
+storage/provider-rate-decks/**/*.csv
+
+# Local database backups
+*.backup
+database/backups/
