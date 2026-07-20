@@ -5,13 +5,14 @@
  *
  * Provider: Telnyx
  *
- * দায়িত্ব:
- * 1. Call session তৈরি করা
- * 2. Telnyx test outbound call শুরু করা
- * 3. Telnyx webhook event গ্রহণ করা
- * 4. Call status database-এ সংরক্ষণ করা
- * 5. User-এর call status return করা
- * 6. Call session end করা
+ * Responsibilities:
+ * 1. Resolve route, rate and wallet eligibility
+ * 2. Create immutable call session
+ * 3. Start real Telnyx outbound call
+ * 4. Receive Telnyx webhook events
+ * 5. Store provider call status
+ * 6. Return authenticated call status
+ * 7. End active Telnyx call
  */
 
 const {
@@ -27,10 +28,7 @@ const {
 const db = require("../../config/db");
 
 /**
- * Telnyx client_state decode করে।
- *
- * Telnyx-এ client_state সাধারণত Base64-encoded string হিসেবে
- * webhook payload-এ ফেরত আসে।
+ * Decode Telnyx Base64 client_state.
  */
 function decodeTelnyxClientState(encodedClientState) {
   if (!encodedClientState) {
@@ -55,14 +53,73 @@ function decodeTelnyxClientState(encodedClientState) {
 }
 
 /**
- * Flutter app-এর জন্য call session তৈরি করে।
+ * Mark a created session as failed.
+ */
+async function markSessionFailed({
+  sessionId,
+  errorKey,
+  errorMessage,
+}) {
+  if (!sessionId) {
+    return;
+  }
+
+  await db.query(
+    `
+      UPDATE call_sessions
+      SET
+        status = 'failed',
+        provider = 'telnyx',
+        provider_status = 'failed',
+        meta = COALESCE(meta, '{}'::jsonb) ||
+               jsonb_build_object(
+                 $2::text,
+                 $3::text
+               )
+      WHERE id = $1
+    `,
+    [
+      sessionId,
+      errorKey,
+      errorMessage || "Unknown Telnyx call error",
+    ]
+  );
+}
+
+/**
+ * Read the current call session after Telnyx service updates it.
+ */
+async function getFreshCallSession({
+  sessionId,
+  userId,
+}) {
+  const { rows } = await db.query(
+    `
+      SELECT *
+      FROM call_sessions
+      WHERE id = $1
+        AND user_id = $2
+      LIMIT 1
+    `,
+    [sessionId, userId]
+  );
+
+  return rows[0] || null;
+}
+
+/**
+ * Production Flutter call-start endpoint.
  *
- * গুরুত্বপূর্ণ:
- * এই endpoint এখন শুধু database session তৈরি করে।
- * Telnyx Android WebRTC SDK যুক্ত হওয়ার পরে mobile audio call
- * এই session-এর সঙ্গে connect করা হবে।
+ * Flow:
+ * 1. Resolve route/rate/provider
+ * 2. Validate wallet
+ * 3. Create call_sessions record
+ * 4. Send real call request to Telnyx
+ * 5. Return fresh session with provider_call_id
  */
 async function startCall(req, res) {
+  let sessionId = null;
+
   try {
     console.log("📞 START CALL BODY =>", req.body);
     console.log("📞 START CALL USER =>", req.user);
@@ -87,59 +144,193 @@ async function startCall(req, res) {
       });
     }
 
-    const result = await startCallSession({
+    const destination = to_phone_e164.trim();
+
+    /*
+     * Create routed/priced session first.
+     */
+    const sessionResult = await startCallSession({
       userId,
-      toPhoneE164: to_phone_e164.trim(),
-      meta: meta || null,
+      toPhoneE164: destination,
+      meta: {
+        ...(meta || {}),
+        provider: "telnyx",
+        initiation_type: "production_server_api",
+      },
     });
 
-    console.log("✅ START CALL SESSION RESULT =>", result);
+    console.log(
+      "✅ START CALL SESSION RESULT =>",
+      sessionResult
+    );
 
-    if (!result.ok) {
+    if (!sessionResult.ok) {
       return res.status(400).json({
         ok: false,
-        reason: result.reason,
+        reason: sessionResult.reason,
         message:
-          result.message ||
-          result.reason ||
+          sessionResult.message ||
+          sessionResult.reason ||
           "Unable to start call session",
+        routing: sessionResult.routing || null,
       });
     }
 
+    sessionId = Number(sessionResult.session?.id);
+
+    if (
+      !Number.isInteger(sessionId) ||
+      sessionId <= 0
+    ) {
+      return res.status(500).json({
+        ok: false,
+        reason: "invalid_session_id",
+        message:
+          "Call session was created without a valid id",
+      });
+    }
+
+    /*
+     * The Flutter application uses /api/calls/start.
+     * Therefore this endpoint must also dispatch the actual
+     * Telnyx call—not merely create the database session.
+     */
+    const callResult = await makeCall({
+      to: destination,
+      sessionId,
+    });
+
+    console.log("📞 TELNYX MAKE CALL RESULT =>", {
+      ok: callResult?.ok === true,
+      callControlId:
+        callResult?.callControlId || null,
+      callLegId:
+        callResult?.callLegId || null,
+      callSessionId:
+        callResult?.callSessionId || null,
+      status:
+        callResult?.status || null,
+      error:
+        callResult?.error || null,
+      details:
+        callResult?.details || null,
+    });
+
+    if (
+      !callResult?.ok ||
+      !callResult.callControlId
+    ) {
+      const providerError =
+        callResult?.error ||
+        "Telnyx did not return call_control_id";
+
+      await markSessionFailed({
+        sessionId,
+        errorKey: "telnyx_error",
+        errorMessage: providerError,
+      });
+
+      return res.status(502).json({
+        ok: false,
+        reason: "provider_call_failed",
+        message: providerError,
+        session_id: sessionId,
+        provider: "telnyx",
+        provider_details:
+          callResult?.details || null,
+      });
+    }
+
+    /*
+     * makeCall() updates provider_call_id/provider_status.
+     * Return a fresh row instead of the stale original session.
+     */
+    const refreshedSession =
+      await getFreshCallSession({
+        sessionId,
+        userId,
+      });
+
     return res.status(201).json({
       ok: true,
-      session: result.session,
+      session:
+        refreshedSession ||
+        sessionResult.session,
+      provider: {
+        name: "telnyx",
+        call_control_id:
+          callResult.callControlId,
+        call_leg_id:
+          callResult.callLegId,
+        call_session_id:
+          callResult.callSessionId,
+        status:
+          callResult.status,
+      },
+      routing:
+        sessionResult.routing || null,
     });
   } catch (error) {
-    console.error("❌ CALL SESSION START ERROR:", error);
+    console.error("❌ CALL START ERROR:", {
+      message:
+        error.message,
+      statusCode:
+        error.statusCode || null,
+      telnyxResponse:
+        error.telnyxResponse || null,
+      stack:
+        error.stack,
+    });
+
+    if (sessionId) {
+      try {
+        await markSessionFailed({
+          sessionId,
+          errorKey: "telnyx_controller_error",
+          errorMessage: error.message,
+        });
+      } catch (databaseError) {
+        console.error(
+          "❌ FAILED TO SAVE CALL START ERROR:",
+          databaseError
+        );
+      }
+    }
 
     return res.status(500).json({
       ok: false,
-      message: error.message,
+      reason: "call_start_exception",
+      message:
+        error.message ||
+        "Call start failed",
     });
   }
 }
 
 /**
- * Temporary Backend Telnyx outbound-call test.
+ * Temporary server-originated Telnyx outbound-call test.
  *
- * সতর্কতা:
- * এটি Telnyx থেকে destination number-এ একটি server-originated
- * PSTN call তৈরি করবে। Flutter phone-এর live microphone/audio
- * এতে নিজে থেকে যুক্ত হবে না।
- *
- * Flutter two-way audio-এর জন্য পরবর্তী ধাপে Telnyx Android
- * WebRTC SDK integration প্রয়োজন।
+ * This endpoint creates a PSTN call from Telnyx.
+ * It does not connect Flutter microphone/audio.
+ * Flutter live two-way audio requires Telnyx WebRTC SDK.
  */
 async function startTelnyxOutboundCall(req, res) {
   let sessionId = null;
 
   try {
-    console.log("📞 TELNYX START BODY =>", req.body);
-    console.log("📞 TELNYX START USER =>", req.user);
+    console.log(
+      "📞 TELNYX START BODY =>",
+      req.body
+    );
+
+    console.log(
+      "📞 TELNYX START USER =>",
+      req.user
+    );
 
     const userId = req.user?.id;
-    const { to_phone_e164, meta } = req.body || {};
+    const { to_phone_e164, meta } =
+      req.body || {};
 
     if (!userId) {
       return res.status(401).json({
@@ -158,94 +349,149 @@ async function startTelnyxOutboundCall(req, res) {
       });
     }
 
-    const sessionResult = await startCallSession({
-      userId,
-      toPhoneE164: to_phone_e164.trim(),
-      meta: {
-        ...(meta || {}),
-        provider: "telnyx",
-        initiation_type: "server_api_test",
-      },
-    });
+    const destination =
+      to_phone_e164.trim();
+
+    const sessionResult =
+      await startCallSession({
+        userId,
+        toPhoneE164: destination,
+        meta: {
+          ...(meta || {}),
+          provider: "telnyx",
+          initiation_type:
+            "server_api_test",
+        },
+      });
 
     if (!sessionResult.ok) {
       return res.status(400).json({
         ok: false,
-        reason: sessionResult.reason,
+        reason:
+          sessionResult.reason,
         message:
           sessionResult.message ||
           sessionResult.reason ||
           "Unable to create call session",
+        routing:
+          sessionResult.routing || null,
       });
     }
 
-    sessionId = Number(sessionResult.session.id);
+    sessionId =
+      Number(sessionResult.session?.id);
+
+    if (
+      !Number.isInteger(sessionId) ||
+      sessionId <= 0
+    ) {
+      return res.status(500).json({
+        ok: false,
+        reason: "invalid_session_id",
+        message:
+          "Call session was created without a valid id",
+      });
+    }
 
     const callResult = await makeCall({
-      to: to_phone_e164.trim(),
+      to: destination,
       sessionId,
     });
 
-    if (!callResult.ok) {
-      await db.query(
-        `
-        UPDATE call_sessions
-        SET status = 'failed',
-            provider = 'telnyx',
-            provider_status = 'failed',
-            meta = COALESCE(meta, '{}'::jsonb) ||
-                   jsonb_build_object(
-                     'telnyx_error',
-                     $2::text
-                   )
-        WHERE id = $1
-        `,
-        [
-          sessionId,
-          callResult.error || "Telnyx call failed",
-        ]
-      );
+    console.log(
+      "📞 TELNYX TEST CALL RESULT =>",
+      {
+        ok:
+          callResult?.ok === true,
+        callControlId:
+          callResult?.callControlId ||
+          null,
+        callLegId:
+          callResult?.callLegId ||
+          null,
+        callSessionId:
+          callResult?.callSessionId ||
+          null,
+        status:
+          callResult?.status || null,
+        error:
+          callResult?.error || null,
+      }
+    );
+
+    if (
+      !callResult?.ok ||
+      !callResult.callControlId
+    ) {
+      const providerError =
+        callResult?.error ||
+        "Telnyx outbound call failed";
+
+      await markSessionFailed({
+        sessionId,
+        errorKey: "telnyx_test_error",
+        errorMessage: providerError,
+      });
 
       return res.status(502).json({
         ok: false,
-        message:
-          callResult.error ||
-          "Telnyx outbound call failed",
+        reason: "provider_call_failed",
+        message: providerError,
         session_id: sessionId,
+        provider_details:
+          callResult?.details || null,
       });
     }
 
+    const refreshedSession =
+      await getFreshCallSession({
+        sessionId,
+        userId,
+      });
+
     return res.status(201).json({
       ok: true,
-      session: sessionResult.session,
+      session:
+        refreshedSession ||
+        sessionResult.session,
       provider: {
         name: "telnyx",
-        call_control_id: callResult.callControlId,
-        call_leg_id: callResult.callLegId,
-        call_session_id: callResult.callSessionId,
-        status: callResult.status,
+        call_control_id:
+          callResult.callControlId,
+        call_leg_id:
+          callResult.callLegId,
+        call_session_id:
+          callResult.callSessionId,
+        status:
+          callResult.status,
       },
+      routing:
+        sessionResult.routing || null,
     });
   } catch (error) {
-    console.error("❌ TELNYX START CALL ERROR:", error);
+    console.error(
+      "❌ TELNYX START CALL ERROR:",
+      {
+        message:
+          error.message,
+        statusCode:
+          error.statusCode || null,
+        telnyxResponse:
+          error.telnyxResponse || null,
+        stack:
+          error.stack,
+      }
+    );
 
     if (sessionId) {
       try {
-        await db.query(
-          `
-          UPDATE call_sessions
-          SET status = 'failed',
-              provider = 'telnyx',
-              provider_status = 'failed',
-              meta = COALESCE(meta, '{}'::jsonb) ||
-                     jsonb_build_object(
-                       'telnyx_controller_error',
-                       $2::text
-                     )
-          WHERE id = $1
-          `,
-          [sessionId, error.message]
-        );
+        await markSessionFailed({
+          sessionId,
+          errorKey:
+            "telnyx_test_controller_error",
+          errorMessage:
+            error.message,
+        });
       } catch (databaseError) {
         console.error(
           "❌ FAILED TO SAVE TELNYX ERROR:",
@@ -256,7 +502,10 @@ async function startTelnyxOutboundCall(req, res) {
 
     return res.status(500).json({
       ok: false,
-      message: error.message,
+      reason: "telnyx_test_exception",
+      message:
+        error.message ||
+        "Telnyx outbound call failed",
     });
   }
 }
@@ -264,16 +513,24 @@ async function startTelnyxOutboundCall(req, res) {
 /**
  * User call end request.
  *
- * provider_call_id থাকলে Telnyx call-ও hangup করার চেষ্টা করবে।
- * এরপর existing wallet/session end service চালাবে।
+ * If provider_call_id exists, the active Telnyx call
+ * is terminated before the session end service runs.
  */
 async function endCall(req, res) {
   try {
-    console.log("📴 END CALL USER =>", req.user);
-    console.log("📴 END CALL PARAMS =>", req.params);
+    console.log(
+      "📴 END CALL USER =>",
+      req.user
+    );
+
+    console.log(
+      "📴 END CALL PARAMS =>",
+      req.params
+    );
 
     const userId = req.user?.id;
-    const sessionId = Number(req.params.id);
+    const sessionId =
+      Number(req.params.id);
 
     if (!userId) {
       return res.status(401).json({
@@ -282,7 +539,10 @@ async function endCall(req, res) {
       });
     }
 
-    if (!Number.isInteger(sessionId) || sessionId <= 0) {
+    if (
+      !Number.isInteger(sessionId) ||
+      sessionId <= 0
+    ) {
       return res.status(400).json({
         ok: false,
         message: "Invalid session id",
@@ -291,14 +551,16 @@ async function endCall(req, res) {
 
     const { rows } = await db.query(
       `
-      SELECT
-        id,
-        provider,
-        provider_call_id
-      FROM call_sessions
-      WHERE id = $1
-        AND user_id = $2
-      LIMIT 1
+        SELECT
+          id,
+          provider,
+          provider_call_id,
+          provider_status,
+          status
+        FROM call_sessions
+        WHERE id = $1
+          AND user_id = $2
+        LIMIT 1
       `,
       [sessionId, userId]
     );
@@ -306,7 +568,8 @@ async function endCall(req, res) {
     if (!rows.length) {
       return res.status(404).json({
         ok: false,
-        message: "Call session not found",
+        message:
+          "Call session not found",
       });
     }
 
@@ -317,87 +580,107 @@ async function endCall(req, res) {
       callSession.provider === "telnyx" &&
       callSession.provider_call_id
     ) {
-      providerHangupResult = await hangupCall({
-        callControlId: callSession.provider_call_id,
-      });
+      providerHangupResult =
+        await hangupCall({
+          callControlId:
+            callSession.provider_call_id,
+        });
+
+      console.log(
+        "📴 TELNYX HANGUP RESULT =>",
+        providerHangupResult
+      );
     }
 
-    const result = await endCallAndCharge({
-      userId,
-      sessionId,
-    });
+    const result =
+      await endCallAndCharge({
+        userId,
+        sessionId,
+      });
 
     if (!result.ok) {
       return res.status(400).json({
         ok: false,
-        reason: result.reason,
+        reason:
+          result.reason,
         message:
           result.message ||
           result.reason ||
           "Unable to end call",
-        provider_hangup: providerHangupResult,
+        provider_hangup:
+          providerHangupResult,
       });
     }
 
     return res.json({
       ok: true,
+      reason:
+        result.reason || null,
       charged_amount_cents:
-        result.charged_amount_cents,
-      wallet: result.wallet,
-      tx: result.tx,
-      provider_hangup: providerHangupResult,
+        result.charged_amount_cents ??
+        null,
+      wallet:
+        result.wallet || null,
+      tx:
+        result.tx || null,
+      provider_hangup:
+        providerHangupResult,
     });
   } catch (error) {
-    console.error("❌ CALL END ERROR:", error);
+    console.error(
+      "❌ CALL END ERROR:",
+      error
+    );
 
     return res.status(500).json({
       ok: false,
-      message: error.message,
+      message:
+        error.message ||
+        "Unable to end call",
     });
   }
 }
 
 /**
- * Production-এ manual test endpoint বন্ধ।
+ * Manual test endpoint is disabled in production.
  */
 async function testCall(req, res) {
   return res.status(403).json({
     ok: false,
-    message: "Test call disabled in production",
+    message:
+      "Test call disabled in production",
   });
 }
 
 /**
  * Telnyx Voice API webhook.
  *
- * Expected event examples:
+ * Expected examples:
  * - call.initiated
  * - call.ringing
  * - call.answered
  * - call.hangup
- *
- * Telnyx webhook body:
- * {
- *   data: {
- *     event_type: "...",
- *     payload: {...}
- *   }
- * }
  */
 async function telnyxStatusCallback(req, res) {
   try {
     const event = req.body?.data;
-    const eventType = event?.event_type;
-    const payload = event?.payload || {};
+    const eventType =
+      event?.event_type;
 
-    console.log("📞 TELNYX WEBHOOK EVENT =>", {
-      eventType,
-      payload,
-    });
+    const payload =
+      event?.payload || {};
+
+    console.log(
+      "📞 TELNYX WEBHOOK EVENT =>",
+      {
+        eventType,
+        payload,
+      }
+    );
 
     /*
-     * Telnyx webhook delivery যেন retry না করে,
-     * malformed/unknown event-ও 200 দিয়ে ignore করা হচ্ছে।
+     * Return 200 for malformed/unknown events to avoid
+     * unnecessary Telnyx webhook retries.
      */
     if (!eventType) {
       return res.status(200).json({
@@ -407,9 +690,10 @@ async function telnyxStatusCallback(req, res) {
       });
     }
 
-    const clientState = decodeTelnyxClientState(
-      payload.client_state
-    );
+    const clientState =
+      decodeTelnyxClientState(
+        payload.client_state
+      );
 
     const sessionId = Number(
       clientState.session_id ||
@@ -427,42 +711,59 @@ async function telnyxStatusCallback(req, res) {
     const callSessionId =
       payload.call_session_id || null;
 
-    let providerStatus = String(eventType)
-      .replace(/^call\./, "")
-      .trim();
+    let providerStatus =
+      String(eventType)
+        .replace(/^call\./, "")
+        .trim();
 
-    if (eventType === "call.answered") {
+    if (
+      eventType === "call.answered"
+    ) {
       providerStatus = "answered";
     }
 
-    if (eventType === "call.hangup") {
+    if (
+      eventType === "call.hangup"
+    ) {
       providerStatus = "completed";
     }
 
     /*
-     * sessionId অথবা provider_call_id—যেটি পাওয়া যায়,
-     * সেটি দিয়ে session update হবে।
+     * Update by client_state session id or provider call id.
      */
-    if (sessionId > 0 || callControlId) {
+        if (
+      sessionId > 0 ||
+      callControlId
+    ) {
       await db.query(
         `
-        UPDATE call_sessions
-        SET provider = 'telnyx',
+          UPDATE call_sessions
+          SET
+            provider = 'telnyx',
 
             provider_call_id =
-              COALESCE($2, provider_call_id),
+              COALESCE(
+                $2,
+                provider_call_id
+              ),
 
             provider_status = $3,
 
             answered_at = CASE
               WHEN $4 = 'call.answered'
-              THEN COALESCE(answered_at, NOW())
+              THEN COALESCE(
+                answered_at,
+                NOW()
+              )
               ELSE answered_at
             END,
 
             ended_at = CASE
               WHEN $4 = 'call.hangup'
-              THEN COALESCE(ended_at, NOW())
+              THEN COALESCE(
+                ended_at,
+                NOW()
+              )
               ELSE ended_at
             END,
 
@@ -476,27 +777,47 @@ async function telnyxStatusCallback(req, res) {
               ELSE status
             END,
 
-            status_callback_payload = $5::jsonb,
+            status_callback_payload =
+              $5::jsonb,
 
-            meta = COALESCE(meta, '{}'::jsonb) ||
-                   jsonb_build_object(
-                     'telnyx_call_leg_id',
-                     COALESCE($6::text, ''),
+            meta =
+              COALESCE(
+                meta,
+                '{}'::jsonb
+              ) ||
+              jsonb_build_object(
+                'telnyx_call_leg_id',
+                COALESCE(
+                  $6::text,
+                  ''
+                ),
 
-                     'telnyx_call_session_id',
-                     COALESCE($7::text, ''),
+                'telnyx_call_session_id',
+                COALESCE(
+                  $7::text,
+                  ''
+                ),
 
-                     'telnyx_last_event',
-                     $4::text,
+                'telnyx_last_event',
+                $4::text,
 
-                     'telnyx_hangup_cause',
-                     COALESCE($8::text, '')
-                   )
+                'telnyx_hangup_cause',
+                COALESCE(
+                  $8::text,
+                  ''
+                )
+              )
 
-        WHERE
-          ($1 > 0 AND id = $1)
-          OR
-          ($2 IS NOT NULL AND provider_call_id = $2)
+          WHERE
+            (
+              $1 > 0
+              AND id = $1
+            )
+            OR
+            (
+              $2 IS NOT NULL
+              AND provider_call_id = $2
+            )
         `,
         [
           sessionId,
@@ -506,50 +827,55 @@ async function telnyxStatusCallback(req, res) {
           JSON.stringify(req.body),
           callLegId,
           callSessionId,
-          payload.hangup_cause || null,
+          payload.hangup_cause ||
+            payload.hangup_source ||
+            null,
         ]
       );
     }
 
     /*
-     * এখনই webhook duration দিয়ে wallet charge করা হচ্ছে না।
+     * Final wallet charging is not performed here yet.
      *
-     * কারণ Telnyx call.hangup payload এবং Telnyx CDR-এর
-     * billable duration/cost যাচাই না করে user wallet charge করলে
-     * ভুল billing হতে পারে।
-     *
-     * Final Telnyx billing/CDR integration-এর সময় এটি করা হবে।
+     * Telnyx CDR/billable duration must be verified before
+     * production wallet charging is finalized.
      */
     return res.status(200).json({
       ok: true,
       event_type: eventType,
-      session_id: sessionId || null,
+      session_id:
+        sessionId || null,
+      provider_call_id:
+        callControlId,
     });
   } catch (error) {
     console.error(
       "❌ TELNYX WEBHOOK ERROR:",
-      error
+      {
+        message:
+          error.message,
+        stack:
+          error.stack,
+      }
     );
 
-    /*
-     * Development অবস্থায় error বোঝার জন্য 500 রাখা হলো।
-     * Signature verification ও idempotent event processing
-     * যুক্ত করার পরে production retry handling final হবে।
-     */
     return res.status(500).json({
       ok: false,
-      message: error.message,
+      message:
+        error.message ||
+        "Telnyx webhook processing failed",
     });
   }
 }
 
 /**
- * Authenticated user-এর call status।
+ * Return authenticated user's call status.
  */
 async function getCallStatus(req, res) {
   try {
     const userId = req.user?.id;
-    const sessionId = Number(req.params.id);
+    const sessionId =
+      Number(req.params.id);
 
     if (!userId) {
       return res.status(401).json({
@@ -558,7 +884,10 @@ async function getCallStatus(req, res) {
       });
     }
 
-    if (!Number.isInteger(sessionId) || sessionId <= 0) {
+    if (
+      !Number.isInteger(sessionId) ||
+      sessionId <= 0
+    ) {
       return res.status(400).json({
         ok: false,
         message: "Invalid session id",
@@ -567,22 +896,33 @@ async function getCallStatus(req, res) {
 
     const { rows } = await db.query(
       `
-      SELECT
-        id,
-        status,
-        provider,
-        provider_call_id,
-        provider_status,
-        answered_at,
-        ended_at,
-        duration_sec,
-        charged_minutes,
-        charged_amount_cents,
-        billing_source
-      FROM call_sessions
-      WHERE id = $1
-        AND user_id = $2
-      LIMIT 1
+        SELECT
+          id,
+          user_id,
+          to_phone_e164,
+          status,
+
+          provider,
+          provider_call_id,
+          provider_status,
+
+          price_per_min_cents,
+          sell_rate_usd_per_min,
+
+          answered_at,
+          ended_at,
+          duration_sec,
+
+          charged_minutes,
+          charged_amount_cents,
+          billing_source,
+
+          created_at,
+          updated_at
+        FROM call_sessions
+        WHERE id = $1
+          AND user_id = $2
+        LIMIT 1
       `,
       [sessionId, userId]
     );
@@ -606,7 +946,9 @@ async function getCallStatus(req, res) {
 
     return res.status(500).json({
       ok: false,
-      message: error.message,
+      message:
+        error.message ||
+        "Unable to read call status",
     });
   }
 }
