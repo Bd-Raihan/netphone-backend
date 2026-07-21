@@ -661,11 +661,24 @@ async function testCall(req, res) {
  * - call.answered
  * - call.hangup
  */
+/**
+ * Telnyx Voice API webhook.
+ *
+ * Expected events include:
+ * - call.initiated
+ * - call.ringing
+ * - call.answered
+ * - call.hangup
+ */
 async function telnyxStatusCallback(req, res) {
   try {
-    const event = req.body?.data;
+    const event =
+      req.body?.data || null;
+
     const eventType =
-      event?.event_type;
+      String(
+        event?.event_type || ""
+      ).trim();
 
     const payload =
       event?.payload || {};
@@ -679,8 +692,8 @@ async function telnyxStatusCallback(req, res) {
     );
 
     /*
-     * Return 200 for malformed/unknown events to avoid
-     * unnecessary Telnyx webhook retries.
+     * Return HTTP 200 for malformed or unsupported
+     * events so Telnyx does not continuously retry them.
      */
     if (!eventType) {
       return res.status(200).json({
@@ -695,156 +708,242 @@ async function telnyxStatusCallback(req, res) {
         payload.client_state
       );
 
-    const sessionId = Number(
+    const rawSessionId =
       clientState.session_id ||
-      req.query.SessionId ||
+      req.query?.SessionId ||
       req.body?.SessionId ||
-      0
-    );
+      0;
+
+    const parsedSessionId =
+      Number(rawSessionId);
+
+    const sessionId =
+      Number.isInteger(parsedSessionId) &&
+      parsedSessionId > 0
+        ? parsedSessionId
+        : 0;
 
     const callControlId =
-      payload.call_control_id || null;
+      payload.call_control_id
+        ? String(
+            payload.call_control_id
+          )
+        : null;
 
     const callLegId =
-      payload.call_leg_id || null;
+      payload.call_leg_id
+        ? String(
+            payload.call_leg_id
+          )
+        : null;
 
     const callSessionId =
-      payload.call_session_id || null;
+      payload.call_session_id
+        ? String(
+            payload.call_session_id
+          )
+        : null;
+
+    const hangupCause =
+      payload.hangup_cause ||
+      payload.hangup_source ||
+      null;
 
     let providerStatus =
-      String(eventType)
+      eventType
         .replace(/^call\./, "")
         .trim();
+
+    let internalStatus = null;
+
+    if (
+      eventType === "call.initiated"
+    ) {
+      providerStatus = "initiated";
+    }
+
+    if (
+      eventType === "call.ringing"
+    ) {
+      providerStatus = "ringing";
+    }
 
     if (
       eventType === "call.answered"
     ) {
       providerStatus = "answered";
+      internalStatus = "started";
     }
 
     if (
       eventType === "call.hangup"
     ) {
       providerStatus = "completed";
+      internalStatus = "ended";
     }
 
     /*
-     * Update by client_state session id or provider call id.
+     * A webhook may arrive before makeCall() finishes
+     * persisting provider_call_id.
+     *
+     * The encoded session id lets us safely locate the
+     * record during that race condition.
      */
-        if (
+    if (
       sessionId > 0 ||
       callControlId
     ) {
-      await db.query(
-        `
-          UPDATE call_sessions
-          SET
-            provider = 'telnyx',
+      const updateResult =
+        await db.query(
+          `
+            UPDATE call_sessions
+            SET
+              provider =
+                'telnyx',
 
-            provider_call_id =
-              COALESCE(
-                $2,
-                provider_call_id
-              ),
-
-            provider_status = $3,
-
-            answered_at = CASE
-              WHEN $4 = 'call.answered'
-              THEN COALESCE(
-                answered_at,
-                NOW()
-              )
-              ELSE answered_at
-            END,
-
-            ended_at = CASE
-              WHEN $4 = 'call.hangup'
-              THEN COALESCE(
-                ended_at,
-                NOW()
-              )
-              ELSE ended_at
-            END,
-
-            status = CASE
-              WHEN $4 = 'call.answered'
-              THEN 'started'
-
-              WHEN $4 = 'call.hangup'
-              THEN 'ended'
-
-              ELSE status
-            END,
-
-            status_callback_payload =
-              $5::jsonb,
-
-            meta =
-              COALESCE(
-                meta,
-                '{}'::jsonb
-              ) ||
-              jsonb_build_object(
-                'telnyx_call_leg_id',
+              provider_call_id =
                 COALESCE(
-                  $6::text,
-                  ''
+                  $2::text,
+                  provider_call_id
                 ),
 
-                'telnyx_call_session_id',
-                COALESCE(
-                  $7::text,
-                  ''
-                ),
+              provider_status =
+                $3::text,
 
-                'telnyx_last_event',
-                $4::text,
+              answered_at =
+                CASE
+                  WHEN $4::text =
+                       'call.answered'
+                  THEN COALESCE(
+                    answered_at,
+                    NOW()
+                  )
+                  ELSE answered_at
+                END,
 
-                'telnyx_hangup_cause',
+              ended_at =
+                CASE
+                  WHEN $4::text =
+                       'call.hangup'
+                  THEN COALESCE(
+                    ended_at,
+                    NOW()
+                  )
+                  ELSE ended_at
+                END,
+
+              status =
+                CASE
+                  WHEN $9::text
+                       IS NOT NULL
+                  THEN $9::text
+                  ELSE status
+                END,
+
+              status_callback_payload =
+                $5::jsonb,
+
+              meta =
                 COALESCE(
-                  $8::text,
-                  ''
+                  meta,
+                  '{}'::jsonb
+                ) ||
+                jsonb_build_object(
+                  'telnyx_call_leg_id',
+                  COALESCE(
+                    $6::text,
+                    ''
+                  ),
+
+                  'telnyx_call_session_id',
+                  COALESCE(
+                    $7::text,
+                    ''
+                  ),
+
+                  'telnyx_last_event',
+                  $4::text,
+
+                  'telnyx_hangup_cause',
+                  COALESCE(
+                    $8::text,
+                    ''
+                  )
                 )
+
+            WHERE
+              (
+                $1::bigint > 0
+                AND id =
+                    $1::bigint
+              )
+              OR
+              (
+                $2::text
+                    IS NOT NULL
+                AND provider_call_id =
+                    $2::text
               )
 
-          WHERE
-            (
-              $1 > 0
-              AND id = $1
-            )
-            OR
-            (
-              $2 IS NOT NULL
-              AND provider_call_id = $2
-            )
-        `,
-        [
-          sessionId,
-          callControlId,
-          providerStatus,
+            RETURNING
+              id,
+              user_id,
+              status,
+              provider_status,
+              provider_call_id
+          `,
+          [
+            sessionId,
+            callControlId,
+            providerStatus,
+            eventType,
+            JSON.stringify(req.body),
+            callLegId,
+            callSessionId,
+            hangupCause,
+            internalStatus,
+          ]
+        );
+
+      console.log(
+        "✅ TELNYX WEBHOOK SESSION UPDATE =>",
+        {
           eventType,
-          JSON.stringify(req.body),
-          callLegId,
-          callSessionId,
-          payload.hangup_cause ||
-            payload.hangup_source ||
+          sessionId:
+            sessionId || null,
+          callControlId,
+          updatedRows:
+            updateResult.rowCount,
+          session:
+            updateResult.rows[0] ||
             null,
-        ]
+        }
+      );
+    } else {
+      console.warn(
+        "⚠️ TELNYX WEBHOOK SESSION NOT IDENTIFIED:",
+        {
+          eventType,
+          clientState,
+          callControlId,
+        }
       );
     }
 
     /*
-     * Final wallet charging is not performed here yet.
-     *
-     * Telnyx CDR/billable duration must be verified before
-     * production wallet charging is finalized.
+     * Final wallet charging is intentionally not
+     * triggered here until Telnyx billable duration/CDR
+     * reconciliation has been completed.
      */
     return res.status(200).json({
       ok: true,
-      event_type: eventType,
+
+      event_type:
+        eventType,
+
       session_id:
         sessionId || null,
+
       provider_call_id:
         callControlId,
     });
@@ -854,6 +953,13 @@ async function telnyxStatusCallback(req, res) {
       {
         message:
           error.message,
+
+        code:
+          error.code || null,
+
+        detail:
+          error.detail || null,
+
         stack:
           error.stack,
       }
@@ -861,6 +967,7 @@ async function telnyxStatusCallback(req, res) {
 
     return res.status(500).json({
       ok: false,
+
       message:
         error.message ||
         "Telnyx webhook processing failed",
