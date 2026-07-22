@@ -516,33 +516,25 @@ async function startTelnyxOutboundCall(req, res) {
  * If provider_call_id exists, the active Telnyx call
  * is terminated before the session end service runs.
  */
+/**
+ * End a user call safely and idempotently.
+ */
 async function endCall(req, res) {
   try {
-    console.log(
-      "📴 END CALL USER =>",
-      req.user
-    );
+    console.log("📴 END CALL USER =>", req.user);
+    console.log("📴 END CALL PARAMS =>", req.params);
 
-    console.log(
-      "📴 END CALL PARAMS =>",
-      req.params
-    );
+    const userId = Number(req.user?.id);
+    const sessionId = Number(req.params.id);
 
-    const userId = req.user?.id;
-    const sessionId =
-      Number(req.params.id);
-
-    if (!userId) {
+    if (!Number.isInteger(userId) || userId <= 0) {
       return res.status(401).json({
         ok: false,
         message: "Unauthorized user",
       });
     }
 
-    if (
-      !Number.isInteger(sessionId) ||
-      sessionId <= 0
-    ) {
+    if (!Number.isInteger(sessionId) || sessionId <= 0) {
       return res.status(400).json({
         ok: false,
         message: "Invalid session id",
@@ -553,13 +545,15 @@ async function endCall(req, res) {
       `
         SELECT
           id,
+          status,
           provider,
           provider_call_id,
           provider_status,
-          status
+          ended_at,
+          charged_amount_cents
         FROM call_sessions
-        WHERE id = $1
-          AND user_id = $2
+        WHERE id = $1::bigint
+          AND user_id = $2::bigint
         LIMIT 1
       `,
       [sessionId, userId]
@@ -568,75 +562,98 @@ async function endCall(req, res) {
     if (!rows.length) {
       return res.status(404).json({
         ok: false,
-        message:
-          "Call session not found",
+        message: "Call session not found",
       });
     }
 
     const callSession = rows[0];
-    let providerHangupResult = null;
+
+    const alreadyEnded =
+      callSession.status === "ended" ||
+      callSession.status === "charged" ||
+      callSession.provider_status === "completed" ||
+      callSession.ended_at != null;
+
+    let providerHangupResult = {
+      ok: true,
+      skipped: true,
+      reason: "Provider call already ended",
+    };
 
     if (
+      !alreadyEnded &&
       callSession.provider === "telnyx" &&
       callSession.provider_call_id
     ) {
-      providerHangupResult =
-        await hangupCall({
-          callControlId:
-            callSession.provider_call_id,
-        });
-
-      console.log(
-        "📴 TELNYX HANGUP RESULT =>",
-        providerHangupResult
-      );
-    }
-
-    const result =
-      await endCallAndCharge({
-        userId,
-        sessionId,
+      providerHangupResult = await hangupCall({
+        callControlId: callSession.provider_call_id,
       });
 
+      /*
+       * Telnyx 90018 means the call is already ended.
+       * Treat it as an idempotent success.
+       */
+      if (
+        providerHangupResult?.ok === false &&
+        String(providerHangupResult?.errorCode || "") === "90018"
+      ) {
+        providerHangupResult = {
+          ok: true,
+          alreadyEnded: true,
+          providerCode: "90018",
+        };
+      }
+    }
+
+    const result = await endCallAndCharge({
+      userId,
+      sessionId,
+    });
+
+    /*
+     * A repeated end request must not become a server error.
+     */
     if (!result.ok) {
-      return res.status(400).json({
-        ok: false,
-        reason:
-          result.reason,
-        message:
-          result.message ||
-          result.reason ||
-          "Unable to end call",
-        provider_hangup:
-          providerHangupResult,
-      });
+      const idempotentReasons = new Set([
+        "already_ended",
+        "already_charged",
+        "call_already_ended",
+      ]);
+
+      if (!idempotentReasons.has(String(result.reason || ""))) {
+        return res.status(400).json({
+          ok: false,
+          reason: result.reason,
+          message:
+            result.message ||
+            result.reason ||
+            "Unable to end call",
+          provider_hangup: providerHangupResult,
+        });
+      }
     }
 
-    return res.json({
+    return res.status(200).json({
       ok: true,
-      reason:
-        result.reason || null,
+      already_ended: alreadyEnded,
       charged_amount_cents:
         result.charged_amount_cents ??
-        null,
-      wallet:
-        result.wallet || null,
-      tx:
-        result.tx || null,
-      provider_hangup:
-        providerHangupResult,
+        callSession.charged_amount_cents ??
+        0,
+      wallet: result.wallet ?? null,
+      tx: result.tx ?? null,
+      provider_hangup: providerHangupResult,
     });
   } catch (error) {
-    console.error(
-      "❌ CALL END ERROR:",
-      error
-    );
+    console.error("❌ CALL END ERROR:", {
+      message: error.message,
+      code: error.code || null,
+      stack: error.stack,
+    });
 
     return res.status(500).json({
       ok: false,
-      message:
-        error.message ||
-        "Unable to end call",
+      message: error.message || "Unable to end call",
     });
   }
 }
@@ -978,23 +995,22 @@ async function telnyxStatusCallback(req, res) {
 /**
  * Return authenticated user's call status.
  */
+/**
+ * Authenticated user call status.
+ */
 async function getCallStatus(req, res) {
   try {
-    const userId = req.user?.id;
-    const sessionId =
-      Number(req.params.id);
+    const userId = Number(req.user?.id);
+    const sessionId = Number(req.params.id);
 
-    if (!userId) {
+    if (!Number.isInteger(userId) || userId <= 0) {
       return res.status(401).json({
         ok: false,
         message: "Unauthorized user",
       });
     }
 
-    if (
-      !Number.isInteger(sessionId) ||
-      sessionId <= 0
-    ) {
+    if (!Number.isInteger(sessionId) || sessionId <= 0) {
       return res.status(400).json({
         ok: false,
         message: "Invalid session id",
@@ -1008,27 +1024,21 @@ async function getCallStatus(req, res) {
           user_id,
           to_phone_e164,
           status,
-
           provider,
           provider_call_id,
           provider_status,
-
-          price_per_min_cents,
-          sell_rate_usd_per_min,
-
           answered_at,
           ended_at,
           duration_sec,
-
           charged_minutes,
           charged_amount_cents,
           billing_source,
-
-          created_at,
-          updated_at
+          price_per_min_cents,
+          provider_rate_usd_per_min,
+          sell_rate_usd_per_min
         FROM call_sessions
-        WHERE id = $1
-          AND user_id = $2
+        WHERE id = $1::bigint
+          AND user_id = $2::bigint
         LIMIT 1
       `,
       [sessionId, userId]
@@ -1041,21 +1051,20 @@ async function getCallStatus(req, res) {
       });
     }
 
-    return res.json({
+    return res.status(200).json({
       ok: true,
       call: rows[0],
     });
   } catch (error) {
-    console.error(
-      "❌ GET CALL STATUS ERROR:",
-      error
-    );
+    console.error("❌ GET CALL STATUS ERROR:", {
+      message: error.message,
+      code: error.code || null,
+      stack: error.stack,
+    });
 
     return res.status(500).json({
       ok: false,
-      message:
-        error.message ||
-        "Unable to read call status",
+      message: error.message || "Unable to read call status",
     });
   }
 }
