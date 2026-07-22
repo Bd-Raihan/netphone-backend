@@ -11,6 +11,7 @@ const router = express.Router();
 // Controllers
 const {
   startCall,
+  getWebrtcToken,
   startTelnyxOutboundCall,
   endCall,
   testCall,
@@ -34,6 +35,12 @@ router.get("/test", testCall);
 
 // Call session তৈরি
 router.post("/start", authRequired, startCall);
+// Telnyx WebRTC access token
+router.post(
+  "/webrtc-token",
+  authRequired,
+  getWebrtcToken
+);
 
 // Telnyx outbound test call
 router.post(

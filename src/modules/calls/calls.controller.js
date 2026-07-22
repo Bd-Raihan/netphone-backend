@@ -27,6 +27,10 @@ const {
 
 const db = require("../../config/db");
 
+const {
+  issueWebrtcToken,
+} = require("./telnyx-webrtc.service");
+
 /**
  * Decode Telnyx Base64 client_state.
  */
@@ -108,26 +112,127 @@ async function getFreshCallSession({
 }
 
 /**
- * Production Flutter call-start endpoint.
+ * Return a short-lived Telnyx WebRTC JWT
+ * to an authenticated Flutter user.
+ */
+async function getWebrtcToken(req, res) {
+  try {
+    const userId =
+      Number(req.user?.id);
+
+    if (
+      !Number.isInteger(userId) ||
+      userId <= 0
+    ) {
+      return res.status(401).json({
+        ok: false,
+        message: "Unauthorized user",
+      });
+    }
+
+    if (
+      req.user?.status &&
+      req.user.status !== "active"
+    ) {
+      return res.status(403).json({
+        ok: false,
+        message: "User is not active",
+      });
+    }
+
+    const tokenResult =
+      await issueWebrtcToken({
+        userId,
+      });
+
+    return res.status(200).json({
+      ok: true,
+
+      token:
+        tokenResult.token,
+
+      token_type:
+        "telnyx_webrtc_jwt",
+
+      caller_id_name:
+        "NetPhone",
+
+      caller_id_number:
+        String(
+          process.env.TELNYX_PHONE_NUMBER ||
+          ""
+        ).trim(),
+
+      credential_expires_at:
+        tokenResult.credentialExpiresAt,
+    });
+  } catch (error) {
+    console.error(
+      "❌ TELNYX WEBRTC TOKEN ERROR:",
+      {
+        message:
+          error.message,
+
+        statusCode:
+          error.statusCode || null,
+
+        telnyxResponse:
+          error.telnyxResponse || null,
+
+        stack:
+          error.stack,
+      }
+    );
+
+    return res.status(
+      error.statusCode || 500
+    ).json({
+      ok: false,
+
+      message:
+        error.message ||
+        "Unable to create WebRTC token",
+    });
+  }
+}
+
+/**
+ * Production Flutter WebRTC call-session endpoint.
  *
- * Flow:
- * 1. Resolve route/rate/provider
- * 2. Validate wallet
- * 3. Create call_sessions record
- * 4. Send real call request to Telnyx
- * 5. Return fresh session with provider_call_id
+ * This endpoint does NOT create a Telnyx PSTN call.
+ * Flutter Telnyx WebRTC SDK creates the actual call.
+ *
+ * Responsibilities:
+ * 1. Validate destination
+ * 2. Resolve provider route and rate
+ * 3. Validate wallet
+ * 4. Create immutable call session
+ * 5. Return WebRTC correlation data
  */
 async function startCall(req, res) {
-  let sessionId = null;
-
   try {
-    console.log("📞 START CALL BODY =>", req.body);
-    console.log("📞 START CALL USER =>", req.user);
+    console.log(
+      "📞 WEBRTC START CALL BODY =>",
+      req.body
+    );
 
-    const userId = req.user?.id;
-    const { to_phone_e164, meta } = req.body || {};
+    console.log(
+      "📞 WEBRTC START CALL USER =>",
+      req.user
+    );
 
-    if (!userId) {
+    const userId =
+      Number(req.user?.id);
+
+    const {
+      to_phone_e164,
+      meta,
+    } = req.body || {};
+
+    if (
+      !Number.isInteger(userId) ||
+      userId <= 0
+    ) {
       return res.status(401).json({
         ok: false,
         message: "Unauthorized user",
@@ -144,39 +249,56 @@ async function startCall(req, res) {
       });
     }
 
-    const destination = to_phone_e164.trim();
+    const destination =
+      to_phone_e164.trim();
 
-    /*
-     * Create routed/priced session first.
-     */
-    const sessionResult = await startCallSession({
-      userId,
-      toPhoneE164: destination,
-      meta: {
-        ...(meta || {}),
-        provider: "telnyx",
-        initiation_type: "production_server_api",
-      },
-    });
+    const sessionResult =
+      await startCallSession({
+        userId,
+
+        toPhoneE164:
+          destination,
+
+        meta: {
+          ...(meta || {}),
+
+          provider:
+            "telnyx",
+
+          initiation_type:
+            "flutter_webrtc",
+
+          media_source:
+            "telnyx_flutter_sdk",
+        },
+      });
 
     console.log(
-      "✅ START CALL SESSION RESULT =>",
+      "✅ WEBRTC CALL SESSION RESULT =>",
       sessionResult
     );
 
     if (!sessionResult.ok) {
       return res.status(400).json({
         ok: false,
-        reason: sessionResult.reason,
+
+        reason:
+          sessionResult.reason,
+
         message:
           sessionResult.message ||
           sessionResult.reason ||
-          "Unable to start call session",
-        routing: sessionResult.routing || null,
+          "Unable to create call session",
+
+        routing:
+          sessionResult.routing || null,
       });
     }
 
-    sessionId = Number(sessionResult.session?.id);
+    const sessionId =
+      Number(
+        sessionResult.session?.id
+      );
 
     if (
       !Number.isInteger(sessionId) ||
@@ -184,67 +306,64 @@ async function startCall(req, res) {
     ) {
       return res.status(500).json({
         ok: false,
-        reason: "invalid_session_id",
+
+        reason:
+          "invalid_session_id",
+
         message:
           "Call session was created without a valid id",
       });
     }
 
     /*
-     * The Flutter application uses /api/calls/start.
-     * Therefore this endpoint must also dispatch the actual
-     * Telnyx call—not merely create the database session.
+     * Flutter passes this value into the Telnyx SDK
+     * call client_state field.
+     *
+     * Telnyx webhook returns it so the Backend can
+     * correlate the provider call with call_sessions.id.
      */
-    const callResult = await makeCall({
-      to: destination,
-      sessionId,
-    });
+    const clientState =
+      Buffer.from(
+        JSON.stringify({
+          session_id:
+            sessionId,
 
-    console.log("📞 TELNYX MAKE CALL RESULT =>", {
-      ok: callResult?.ok === true,
-      callControlId:
-        callResult?.callControlId || null,
-      callLegId:
-        callResult?.callLegId || null,
-      callSessionId:
-        callResult?.callSessionId || null,
-      status:
-        callResult?.status || null,
-      error:
-        callResult?.error || null,
-      details:
-        callResult?.details || null,
-    });
+          user_id:
+            userId,
+        }),
+        "utf8"
+      ).toString("base64");
 
-    if (
-      !callResult?.ok ||
-      !callResult.callControlId
-    ) {
-      const providerError =
-        callResult?.error ||
-        "Telnyx did not return call_control_id";
+    await db.query(
+      `
+        UPDATE call_sessions
+        SET
+          provider = 'telnyx',
 
-      await markSessionFailed({
+          provider_status =
+            'webrtc_session_created',
+
+          meta =
+            COALESCE(
+              meta,
+              '{}'::jsonb
+            ) ||
+            jsonb_build_object(
+              'webrtc_client_state',
+              $2::text,
+
+              'webrtc_session_created_at',
+              NOW()::text
+            )
+
+        WHERE id = $1::bigint
+      `,
+      [
         sessionId,
-        errorKey: "telnyx_error",
-        errorMessage: providerError,
-      });
+        clientState,
+      ]
+    );
 
-      return res.status(502).json({
-        ok: false,
-        reason: "provider_call_failed",
-        message: providerError,
-        session_id: sessionId,
-        provider: "telnyx",
-        provider_details:
-          callResult?.details || null,
-      });
-    }
-
-    /*
-     * makeCall() updates provider_call_id/provider_status.
-     * Return a fresh row instead of the stale original session.
-     */
     const refreshedSession =
       await getFreshCallSession({
         sessionId,
@@ -253,56 +372,57 @@ async function startCall(req, res) {
 
     return res.status(201).json({
       ok: true,
+
       session:
         refreshedSession ||
         sessionResult.session,
-      provider: {
-        name: "telnyx",
-        call_control_id:
-          callResult.callControlId,
-        call_leg_id:
-          callResult.callLegId,
-        call_session_id:
-          callResult.callSessionId,
-        status:
-          callResult.status,
-      },
+
       routing:
         sessionResult.routing || null,
+
+      webrtc: {
+        provider:
+          "telnyx",
+
+        destination,
+
+        client_state:
+          clientState,
+
+        caller_id_name:
+          "NetPhone",
+
+        caller_id_number:
+          String(
+            process.env.TELNYX_PHONE_NUMBER ||
+            ""
+          ).trim(),
+      },
     });
   } catch (error) {
-    console.error("❌ CALL START ERROR:", {
-      message:
-        error.message,
-      statusCode:
-        error.statusCode || null,
-      telnyxResponse:
-        error.telnyxResponse || null,
-      stack:
-        error.stack,
-    });
+    console.error(
+      "❌ WEBRTC CALL SESSION ERROR:",
+      {
+        message:
+          error.message,
 
-    if (sessionId) {
-      try {
-        await markSessionFailed({
-          sessionId,
-          errorKey: "telnyx_controller_error",
-          errorMessage: error.message,
-        });
-      } catch (databaseError) {
-        console.error(
-          "❌ FAILED TO SAVE CALL START ERROR:",
-          databaseError
-        );
+        code:
+          error.code || null,
+
+        stack:
+          error.stack,
       }
-    }
+    );
 
     return res.status(500).json({
       ok: false,
-      reason: "call_start_exception",
+
+      reason:
+        "call_session_exception",
+
       message:
         error.message ||
-        "Call start failed",
+        "Unable to create WebRTC call session",
     });
   }
 }
@@ -1071,6 +1191,7 @@ async function getCallStatus(req, res) {
 
 module.exports = {
   startCall,
+  getWebrtcToken,
   startTelnyxOutboundCall,
   endCall,
   testCall,
