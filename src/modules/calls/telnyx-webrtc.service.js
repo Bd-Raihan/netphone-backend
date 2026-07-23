@@ -353,28 +353,42 @@ async function issueWebrtcToken({
    * Telnyx token endpoint may return the JWT as a
    * JSON string instead of an object.
    */
-  const token =
-    typeof result === "string"
-      ? result
-      : (
-          result?.token ||
-          result?.data?.token ||
-          result?.data ||
-          ""
-        );
+  const tokenCandidate =
+  typeof result === "string"
+    ? result
+    : (
+        result?.token ||
+        result?.access_token ||
+        result?.data?.token ||
+        result?.data?.access_token ||
+        (
+          typeof result?.data === "string"
+            ? result.data
+            : ""
+        ) ||
+        result?.message ||
+        ""
+      );
 
-  const normalizedToken =
-    String(token || "").trim();
+const normalizedToken = String(
+  tokenCandidate || ""
+)
+  .trim()
+  .replace(/^"(.*)"$/s, "$1");
 
-  if (!normalizedToken) {
-    const error = new Error(
-      "Telnyx did not return a WebRTC token"
-    );
 
-    error.telnyxResponse = result;
+  if (
+  !normalizedToken ||
+  !normalizedToken.startsWith("eyJ")
+) {
+  const error = new Error(
+    "Telnyx did not return a valid WebRTC token"
+  );
 
-    throw error;
-  }
+  error.telnyxResponse = result;
+
+  throw error;
+}
 
   await db.query(
     `
