@@ -31,30 +31,97 @@ const {
   issueWebrtcToken,
 } = require("./telnyx-webrtc.service");
 
+
 /**
- * Decode Telnyx Base64 client_state.
+ * Decode Telnyx client_state safely.
+ *
+ * Telnyx sends client_state as a Base64/Base64URL encoded string.
+ * This helper also supports plain JSON for backward compatibility.
  */
-function decodeTelnyxClientState(encodedClientState) {
-  if (!encodedClientState) {
-    return {};
+function decodeTelnyxClientState(rawClientState) {
+  if (rawClientState === null || rawClientState === undefined) {
+    return null;
   }
 
-  try {
-    const decoded = Buffer.from(
-      encodedClientState,
-      "base64"
-    ).toString("utf8");
+  const rawValue = String(rawClientState).trim();
 
-    return JSON.parse(decoded);
+  if (!rawValue) {
+    return null;
+  }
+
+  const candidates = [rawValue];
+
+  // Preferred decoding for URL-safe Base64 strings such as eyJ...
+  try {
+    const decodedBase64Url = Buffer.from(
+      rawValue,
+      "base64url",
+    )
+      .toString("utf8")
+      .trim();
+
+    if (decodedBase64Url) {
+      candidates.push(decodedBase64Url);
+    }
   } catch (error) {
-    console.error(
-      "⚠️ TELNYX CLIENT STATE DECODE ERROR:",
-      error.message
+    console.warn(
+      "⚠️ TELNYX CLIENT STATE BASE64URL DECODE WARNING:",
+      error.message,
+    );
+  }
+
+  // Compatibility fallback for standard Base64.
+  try {
+    const normalizedBase64 = rawValue
+      .replace(/-/g, "+")
+      .replace(/_/g, "/");
+
+    const paddedBase64 = normalizedBase64.padEnd(
+      Math.ceil(normalizedBase64.length / 4) * 4,
+      "=",
     );
 
-    return {};
+    const decodedBase64 = Buffer.from(
+      paddedBase64,
+      "base64",
+    )
+      .toString("utf8")
+      .trim();
+
+    if (decodedBase64) {
+      candidates.push(decodedBase64);
+    }
+  } catch (error) {
+    console.warn(
+      "⚠️ TELNYX CLIENT STATE BASE64 DECODE WARNING:",
+      error.message,
+    );
   }
+
+  for (const candidate of candidates) {
+    try {
+      let parsed = JSON.parse(candidate);
+
+      // Also support a JSON string containing another JSON object.
+      if (typeof parsed === "string") {
+        parsed = JSON.parse(parsed);
+      }
+
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        !Array.isArray(parsed)
+      ) {
+        return parsed;
+      }
+    } catch (_) {
+      // Try the next candidate.
+    }
+  }
+
+  return null;
 }
+
 
 /**
  * Mark a created session as failed.
@@ -792,15 +859,6 @@ async function testCall(req, res) {
 /**
  * Telnyx Voice API webhook.
  *
- * Expected examples:
- * - call.initiated
- * - call.ringing
- * - call.answered
- * - call.hangup
- */
-/**
- * Telnyx Voice API webhook.
- *
  * Expected events include:
  * - call.initiated
  * - call.ringing
@@ -840,25 +898,58 @@ async function telnyxStatusCallback(req, res) {
       });
     }
 
-    const clientState =
-      decodeTelnyxClientState(
-        payload.client_state
-      );
+    const decodedClientState =
+  decodeTelnyxClientState(
+    payload.client_state
+  );
 
-    const rawSessionId =
-      clientState.session_id ||
-      req.query?.SessionId ||
-      req.body?.SessionId ||
-      0;
+if (
+  payload.client_state &&
+  !decodedClientState
+) {
+  console.warn(
+    "⚠️ TELNYX CLIENT STATE COULD NOT BE DECODED",
+    {
+      eventType,
+      hasClientState: true,
+    }
+  );
+}
 
-    const parsedSessionId =
-      Number(rawSessionId);
+const rawSessionId =
+  decodedClientState?.session_id ??
+  decodedClientState?.sessionId ??
+  decodedClientState?.call_session_id ??
+  decodedClientState?.callSessionId ??
+  req.query?.SessionId ??
+  req.body?.SessionId ??
+  null;
 
-    const sessionId =
-      Number.isInteger(parsedSessionId) &&
-      parsedSessionId > 0
-        ? parsedSessionId
-        : 0;
+const parsedSessionId =
+  Number(rawSessionId);
+
+const sessionId =
+  Number.isInteger(parsedSessionId) &&
+  parsedSessionId > 0
+    ? parsedSessionId
+    : 0;
+
+console.log(
+  "🔗 TELNYX CLIENT STATE RESULT =>",
+  {
+    eventType,
+    decoded:
+      Boolean(decodedClientState),
+
+    sessionId:
+      sessionId || null,
+
+    keys:
+      decodedClientState
+        ? Object.keys(decodedClientState)
+        : [],
+  }
+);
 
     const callControlId =
       payload.call_control_id
@@ -1057,14 +1148,15 @@ async function telnyxStatusCallback(req, res) {
         }
       );
     } else {
-      console.warn(
+    console.warn(
         "⚠️ TELNYX WEBHOOK SESSION NOT IDENTIFIED:",
-        {
-          eventType,
-          clientState,
-          callControlId,
-        }
-      );
+      {
+        eventType,
+        decodedClientState:
+        decodedClientState || null,
+        callControlId,
+  }
+);
     }
 
     /*
