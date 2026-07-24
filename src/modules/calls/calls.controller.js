@@ -389,17 +389,10 @@ async function startCall(req, res) {
      * Telnyx webhook returns it so the Backend can
      * correlate the provider call with call_sessions.id.
      */
-    const clientState =
-      Buffer.from(
-        JSON.stringify({
-          session_id:
-            sessionId,
-
-          user_id:
-            userId,
-        }),
-        "utf8"
-      ).toString("base64");
+const clientState = JSON.stringify({
+  session_id: sessionId,
+  user_id: userId,
+});
 
     await db.query(
       `
