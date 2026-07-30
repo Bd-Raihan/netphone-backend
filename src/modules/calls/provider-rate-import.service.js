@@ -7,7 +7,7 @@
  * 1. Provider CSV/rate deck stream করে পড়া
  * 2. CSV header validate করা
  * 3. Prefix, rate ও billing values normalize করা
- * 4. Duplicate prefix-এর ক্ষেত্রে highest rate রাখা
+ * 4. Duplicate prefix-এর ক্ষেত্রে Telnyx applicable destination rate রাখা
  * 5. voice_provider_rate_cards তৈরি করা
  * 6. voice_provider_rates table-এ batch import করা
  * 7. Successful import-এর পরে নতুন rate card activate করা
@@ -317,7 +317,164 @@ async function sha256File(filePath) {
  *
  * PART-2 অবশ্যই এর ঠিক নিচে বসবে।
  * ========================================================= */
+/**
+ * Telnyx duplicate destination description normalize করে।
+ */
+function normalizeDestinationDescription(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
 
+/**
+ * Telnyx rate deck-এ একই prefix-এর duplicate row থাকলে
+ * কোন row public outbound termination-এর জন্য বেশি applicable
+ * সেটি নির্ধারণ করে।
+ *
+ * CDR verification অনুযায়ী:
+ *
+ * Bangladesh       88017  0.0201  -> applicable
+ * Bangladesh local 88017  0.0975  -> alternate/local variant
+ *
+ * Lower score = higher priority.
+ */
+function getTelnyxDuplicatePreference(row) {
+  const description =
+    normalizeDestinationDescription(
+      row?.destination_name
+    );
+
+  /*
+   * “local” destination variant সাধারণ public outbound
+   * termination row-এর পরে থাকবে।
+   */
+  const isLocalVariant =
+    /\blocal\b/i.test(description);
+
+  /*
+   * কিছু rate deck-এ special/premium destination থাকতে পারে।
+   * এগুলো সাধারণ outbound destination-এর ওপর priority পাবে না।
+   */
+  const isSpecialVariant =
+    /\b(premium|special|satellite|shared cost|toll free)\b/i
+      .test(description);
+
+  let categoryPriority = 0;
+
+  if (isLocalVariant) {
+    categoryPriority += 100;
+  }
+
+  if (isSpecialVariant) {
+    categoryPriority += 200;
+  }
+
+  return {
+    category_priority:
+      categoryPriority,
+
+    is_local_variant:
+      isLocalVariant,
+
+    is_special_variant:
+      isSpecialVariant,
+
+    normalized_description:
+      description,
+  };
+}
+
+/**
+ * একই prefix-এর দুটি Telnyx row-এর মধ্যে applicable row নির্বাচন করে।
+ *
+ * Priority:
+ * 1. সাধারণ outbound row
+ * 2. lower provider rate
+ * 3. lower connection fee
+ * 4. earlier CSV source row
+ */
+function selectPreferredDuplicateRateRow(
+  existingRow,
+  currentRow
+) {
+  const existingPreference =
+    getTelnyxDuplicatePreference(
+      existingRow
+    );
+
+  const currentPreference =
+    getTelnyxDuplicatePreference(
+      currentRow
+    );
+
+  if (
+    currentPreference.category_priority <
+    existingPreference.category_priority
+  ) {
+    return currentRow;
+  }
+
+  if (
+    currentPreference.category_priority >
+    existingPreference.category_priority
+  ) {
+    return existingRow;
+  }
+
+  const existingRate = Number(
+    existingRow?.raw_rate_usd_per_min || 0
+  );
+
+  const currentRate = Number(
+    currentRow?.raw_rate_usd_per_min || 0
+  );
+
+  if (currentRate < existingRate) {
+    return currentRow;
+  }
+
+  if (currentRate > existingRate) {
+    return existingRow;
+  }
+
+  const existingConnectionFee = Number(
+    existingRow?.connection_fee_usd || 0
+  );
+
+  const currentConnectionFee = Number(
+    currentRow?.connection_fee_usd || 0
+  );
+
+  if (
+    currentConnectionFee <
+    existingConnectionFee
+  ) {
+    return currentRow;
+  }
+
+  if (
+    currentConnectionFee >
+    existingConnectionFee
+  ) {
+    return existingRow;
+  }
+
+  const existingSourceLine = Number(
+    existingRow?.metadata?.source_line ||
+    Number.MAX_SAFE_INTEGER
+  );
+
+  const currentSourceLine = Number(
+    currentRow?.metadata?.source_line ||
+    Number.MAX_SAFE_INTEGER
+  );
+
+  return currentSourceLine <
+    existingSourceLine
+      ? currentRow
+      : existingRow;
+}
 /* =========================================================
  * PART-2 START
  * CSV row normalization and PostgreSQL batch insertion
@@ -444,23 +601,28 @@ function buildRow(
       minimum_duration_seconds:
         minimumDurationSeconds,
 
-      metadata: {
-        source_line:
-          sourceLine,
+     metadata: {
+    source_line:
+    sourceLine,
 
-        exact_match:
-          toBooleanOrNull(
-            get("Exact Match")
-          ),
+  exact_match:
+    toBooleanOrNull(
+      get("Exact Match")
+    ),
 
-        /**
-         * একই prefix একাধিকবার থাকলে সর্বোচ্চ provider cost রাখা হবে।
-         *
-         * Loss protection-এর জন্য conservative rule।
-         */
-        duplicate_strategy:
-          "highest_rate_wins",
-      },
+  /*
+   * Duplicate selection এখন Telnyx CDR-verified
+   * destination preference ব্যবহার করবে।
+   */
+  duplicate_strategy:
+    "telnyx_applicable_destination_then_lowest_rate",
+
+  duplicate_preference:
+    getTelnyxDuplicatePreference({
+      destination_name:
+        destinationName,
+    }),
+    },
     },
   };
 }
@@ -469,27 +631,24 @@ function buildRow(
 /**
  * একই database batch-এর duplicate prefix merge করে।
  *
- * PostgreSQL একই INSERT ... ON CONFLICT command-এর মধ্যে
- * একই unique key-কে একাধিকবার update করতে পারে না।
+ * Telnyx CDR-verified duplicate policy:
  *
- * তাই database query চালানোর আগেই:
- * - একই prefix-এর rows একত্র করা হয়
- * - সর্বোচ্চ provider rate রাখা হয়
- * - সর্বোচ্চ connection fee রাখা হয়
- * - highest-rate row-এর destination/billing data রাখা হয়
+ * 1. সাধারণ outbound destination row আগে
+ * 2. “local”/special variant পরে
+ * 3. একই category হলে lower provider rate
+ * 4. একই rate হলে lower connection fee
  *
- * এটি PostgreSQL error 21000 প্রতিরোধ করে।
+ * এটি PostgreSQL error 21000-ও প্রতিরোধ করে।
  */
 function mergeDuplicatePrefixesInBatch(rows) {
   const rowsByPrefix = new Map();
 
   for (const currentRow of rows) {
     const existingRow =
-      rowsByPrefix.get(currentRow.prefix);
+      rowsByPrefix.get(
+        currentRow.prefix
+      );
 
-    /*
-     * Prefix প্রথমবার পাওয়া গেলে সরাসরি সংরক্ষণ।
-     */
     if (!existingRow) {
       rowsByPrefix.set(
         currentRow.prefix,
@@ -499,7 +658,8 @@ function mergeDuplicatePrefixesInBatch(rows) {
           metadata: {
             ...(currentRow.metadata || {}),
 
-            duplicate_rows_merged_in_batch: 0,
+            duplicate_rows_merged_in_batch:
+              0,
           },
         }
       );
@@ -507,61 +667,88 @@ function mergeDuplicatePrefixesInBatch(rows) {
       continue;
     }
 
-    const existingRate = Number(
-      existingRow.raw_rate_usd_per_min || 0
-    );
+    const preferredRow =
+      selectPreferredDuplicateRateRow(
+        existingRow,
+        currentRow
+      );
 
-    const currentRate = Number(
-      currentRow.raw_rate_usd_per_min || 0
-    );
-
-    const existingConnectionFee = Number(
-      existingRow.connection_fee_usd || 0
-    );
-
-    const currentConnectionFee = Number(
-      currentRow.connection_fee_usd || 0
-    );
-
-    /*
-     * Highest provider rate row-কে primary row হিসেবে রাখি।
-     * সমান rate হলে সর্বশেষ row রাখা হয়।
-     */
-    const highestRateRow =
-      currentRate >= existingRate
-        ? currentRow
-        : existingRow;
+    const rejectedRow =
+      preferredRow === currentRow
+        ? existingRow
+        : currentRow;
 
     const existingMergedCount = Number(
       existingRow.metadata
-        ?.duplicate_rows_merged_in_batch || 0
+        ?.duplicate_rows_merged_in_batch ||
+      0
     );
 
     rowsByPrefix.set(
       currentRow.prefix,
       {
-        ...highestRateRow,
+        ...preferredRow,
 
         /*
-         * Connection fee-ও conservative maximum নেওয়া হয়।
+         * Connection fee preferred applicable row থেকেই নেওয়া হবে।
+         * Highest fee নেওয়া হবে না—কারণ সেটিও alternate destination
+         * variant-এর fee হতে পারে।
          */
-        connection_fee_usd: Math.max(
-          existingConnectionFee,
-          currentConnectionFee
-        ),
+        connection_fee_usd:
+          Number(
+            preferredRow
+              .connection_fee_usd ||
+            0
+          ),
 
         metadata: {
           ...(existingRow.metadata || {}),
           ...(currentRow.metadata || {}),
-          ...(highestRateRow.metadata || {}),
+          ...(preferredRow.metadata || {}),
 
-          duplicate_prefix_detected: true,
+          duplicate_prefix_detected:
+            true,
 
           duplicate_rows_merged_in_batch:
             existingMergedCount + 1,
 
           duplicate_strategy:
-            "highest_rate_wins",
+            "telnyx_applicable_destination_then_lowest_rate",
+
+          selected_destination_name:
+            preferredRow.destination_name ||
+            null,
+
+          selected_rate_usd_per_min:
+            Number(
+              preferredRow
+                .raw_rate_usd_per_min ||
+              0
+            ),
+
+          rejected_duplicate: {
+            destination_name:
+              rejectedRow
+                .destination_name ||
+              null,
+
+            raw_rate_usd_per_min:
+              Number(
+                rejectedRow
+                  .raw_rate_usd_per_min ||
+                0
+              ),
+
+            source_line:
+              rejectedRow.metadata
+                ?.source_line ||
+              null,
+          },
+
+          duplicate_preference:
+            getTelnyxDuplicatePreference(
+              preferredRow
+            ),
         },
       }
     );
@@ -577,11 +764,11 @@ function mergeDuplicatePrefixesInBatch(rows) {
 /**
  * Normalized rate rows PostgreSQL-এ batch আকারে insert করে।
  *
- * Duplicate rule:
- * একই rate-card-এর একই prefix থাকলে:
- * - সর্বোচ্চ raw rate রাখা হবে
- * - সর্বোচ্চ connection fee রাখা হবে
- * - highest-rate row-এর billing values রাখা হবে
+ * Duplicate policy:
+ * - general outbound destination preferred
+ * - local/special variant lower priority
+ * - same category হলে lower rate
+ * - same rate হলে lower connection fee
  */
 async function insertBatch(
   client,
@@ -599,14 +786,12 @@ async function insertBatch(
     };
   }
 
-  /*
-   * একই batch-এর duplicate prefix database query-এর আগেই merge।
-   */
   const uniqueRows =
     mergeDuplicatePrefixesInBatch(rows);
 
   const duplicateRowsMerged =
-    rows.length - uniqueRows.length;
+    rows.length -
+    uniqueRows.length;
 
   await client.query(
     `
@@ -662,6 +847,7 @@ async function insertBatch(
       minimum_duration_seconds,
 
       TRUE,
+
       COALESCE(
         metadata,
         '{}'::jsonb
@@ -676,23 +862,181 @@ async function insertBatch(
 
     DO UPDATE SET
       country_code =
-        COALESCE(
-          EXCLUDED.country_code,
-          voice_provider_rates.country_code
-        ),
+        CASE
+          WHEN
+            (
+              COALESCE(
+                (
+                  EXCLUDED.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+              <
+              COALESCE(
+                (
+                  voice_provider_rates.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+            )
+            OR
+            (
+              COALESCE(
+                (
+                  EXCLUDED.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+              =
+              COALESCE(
+                (
+                  voice_provider_rates.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+              AND
+              EXCLUDED.raw_rate_usd_per_min
+              <
+              voice_provider_rates
+                .raw_rate_usd_per_min
+            )
+          THEN
+            COALESCE(
+              EXCLUDED.country_code,
+              voice_provider_rates.country_code
+            )
+          ELSE
+            voice_provider_rates.country_code
+        END,
 
       country_name =
-        COALESCE(
-          EXCLUDED.country_name,
-          voice_provider_rates.country_name
-        ),
+        CASE
+          WHEN
+            (
+              COALESCE(
+                (
+                  EXCLUDED.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+              <
+              COALESCE(
+                (
+                  voice_provider_rates.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+            )
+            OR
+            (
+              COALESCE(
+                (
+                  EXCLUDED.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+              =
+              COALESCE(
+                (
+                  voice_provider_rates.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+              AND
+              EXCLUDED.raw_rate_usd_per_min
+              <
+              voice_provider_rates
+                .raw_rate_usd_per_min
+            )
+          THEN
+            COALESCE(
+              EXCLUDED.country_name,
+              voice_provider_rates.country_name
+            )
+          ELSE
+            voice_provider_rates.country_name
+        END,
 
       destination_name =
         CASE
           WHEN
-            EXCLUDED.raw_rate_usd_per_min
-            >=
-            voice_provider_rates.raw_rate_usd_per_min
+            (
+              COALESCE(
+                (
+                  EXCLUDED.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+              <
+              COALESCE(
+                (
+                  voice_provider_rates.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+            )
+            OR
+            (
+              COALESCE(
+                (
+                  EXCLUDED.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+              =
+              COALESCE(
+                (
+                  voice_provider_rates.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+              AND
+              (
+                EXCLUDED.raw_rate_usd_per_min
+                <
+                voice_provider_rates
+                  .raw_rate_usd_per_min
+
+                OR
+                (
+                  EXCLUDED.raw_rate_usd_per_min
+                  =
+                  voice_provider_rates
+                    .raw_rate_usd_per_min
+
+                  AND
+
+                  EXCLUDED.connection_fee_usd
+                  <
+                  voice_provider_rates
+                    .connection_fee_usd
+                )
+              )
+            )
           THEN
             EXCLUDED.destination_name
           ELSE
@@ -700,53 +1044,357 @@ async function insertBatch(
         END,
 
       raw_rate_usd_per_min =
-        GREATEST(
-          voice_provider_rates.raw_rate_usd_per_min,
-          EXCLUDED.raw_rate_usd_per_min
-        ),
+        CASE
+          WHEN
+            (
+              COALESCE(
+                (
+                  EXCLUDED.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+              <
+              COALESCE(
+                (
+                  voice_provider_rates.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+            )
+            OR
+            (
+              COALESCE(
+                (
+                  EXCLUDED.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+              =
+              COALESCE(
+                (
+                  voice_provider_rates.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+              AND
+              (
+                EXCLUDED.raw_rate_usd_per_min
+                <
+                voice_provider_rates
+                  .raw_rate_usd_per_min
+
+                OR
+                (
+                  EXCLUDED.raw_rate_usd_per_min
+                  =
+                  voice_provider_rates
+                    .raw_rate_usd_per_min
+
+                  AND
+
+                  EXCLUDED.connection_fee_usd
+                  <
+                  voice_provider_rates
+                    .connection_fee_usd
+                )
+              )
+            )
+          THEN
+            EXCLUDED.raw_rate_usd_per_min
+          ELSE
+            voice_provider_rates
+              .raw_rate_usd_per_min
+        END,
 
       connection_fee_usd =
-        GREATEST(
-          voice_provider_rates.connection_fee_usd,
-          EXCLUDED.connection_fee_usd
-        ),
+        CASE
+          WHEN
+            (
+              COALESCE(
+                (
+                  EXCLUDED.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+              <
+              COALESCE(
+                (
+                  voice_provider_rates.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+            )
+            OR
+            (
+              COALESCE(
+                (
+                  EXCLUDED.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+              =
+              COALESCE(
+                (
+                  voice_provider_rates.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+              AND
+              (
+                EXCLUDED.raw_rate_usd_per_min
+                <
+                voice_provider_rates
+                  .raw_rate_usd_per_min
+
+                OR
+                (
+                  EXCLUDED.raw_rate_usd_per_min
+                  =
+                  voice_provider_rates
+                    .raw_rate_usd_per_min
+
+                  AND
+
+                  EXCLUDED.connection_fee_usd
+                  <
+                  voice_provider_rates
+                    .connection_fee_usd
+                )
+              )
+            )
+          THEN
+            EXCLUDED.connection_fee_usd
+          ELSE
+            voice_provider_rates
+              .connection_fee_usd
+        END,
 
       billing_increment_seconds =
         CASE
           WHEN
-            EXCLUDED.raw_rate_usd_per_min
-            >=
-            voice_provider_rates.raw_rate_usd_per_min
+            (
+              COALESCE(
+                (
+                  EXCLUDED.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+              <
+              COALESCE(
+                (
+                  voice_provider_rates.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+            )
+            OR
+            (
+              COALESCE(
+                (
+                  EXCLUDED.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+              =
+              COALESCE(
+                (
+                  voice_provider_rates.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+              AND
+              EXCLUDED.raw_rate_usd_per_min
+              <=
+              voice_provider_rates
+                .raw_rate_usd_per_min
+            )
           THEN
             EXCLUDED.billing_increment_seconds
           ELSE
-            voice_provider_rates.billing_increment_seconds
+            voice_provider_rates
+              .billing_increment_seconds
         END,
 
       minimum_duration_seconds =
         CASE
           WHEN
-            EXCLUDED.raw_rate_usd_per_min
-            >=
-            voice_provider_rates.raw_rate_usd_per_min
+            (
+              COALESCE(
+                (
+                  EXCLUDED.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+              <
+              COALESCE(
+                (
+                  voice_provider_rates.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+            )
+            OR
+            (
+              COALESCE(
+                (
+                  EXCLUDED.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+              =
+              COALESCE(
+                (
+                  voice_provider_rates.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+              AND
+              EXCLUDED.raw_rate_usd_per_min
+              <=
+              voice_provider_rates
+                .raw_rate_usd_per_min
+            )
           THEN
             EXCLUDED.minimum_duration_seconds
           ELSE
-            voice_provider_rates.minimum_duration_seconds
+            voice_provider_rates
+              .minimum_duration_seconds
         END,
 
       is_active =
         TRUE,
 
       metadata =
-        voice_provider_rates.metadata
-        ||
-        EXCLUDED.metadata
-        ||
-        jsonb_build_object(
-          'duplicate_prefix_detected',
-          TRUE
-        ),
+        CASE
+          WHEN
+            (
+              COALESCE(
+                (
+                  EXCLUDED.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+              <
+              COALESCE(
+                (
+                  voice_provider_rates.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+            )
+            OR
+            (
+              COALESCE(
+                (
+                  EXCLUDED.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+              =
+              COALESCE(
+                (
+                  voice_provider_rates.metadata
+                    #>>
+                  '{duplicate_preference,category_priority}'
+                )::integer,
+                0
+              )
+              AND
+              (
+                EXCLUDED.raw_rate_usd_per_min
+                <
+                voice_provider_rates
+                  .raw_rate_usd_per_min
+
+                OR
+                (
+                  EXCLUDED.raw_rate_usd_per_min
+                  =
+                  voice_provider_rates
+                    .raw_rate_usd_per_min
+
+                  AND
+
+                  EXCLUDED.connection_fee_usd
+                  <
+                  voice_provider_rates
+                    .connection_fee_usd
+                )
+              )
+            )
+          THEN
+            voice_provider_rates.metadata
+            ||
+            EXCLUDED.metadata
+            ||
+            jsonb_build_object(
+              'duplicate_prefix_detected',
+              TRUE,
+
+              'duplicate_strategy',
+              'telnyx_applicable_destination_then_lowest_rate'
+            )
+          ELSE
+            voice_provider_rates.metadata
+            ||
+            jsonb_build_object(
+              'duplicate_prefix_detected',
+              TRUE,
+
+              'duplicate_strategy',
+              'telnyx_applicable_destination_then_lowest_rate',
+
+              'rejected_later_duplicate',
+              jsonb_build_object(
+                'destination_name',
+                EXCLUDED.destination_name,
+
+                'raw_rate_usd_per_min',
+                EXCLUDED.raw_rate_usd_per_min,
+
+                'source_line',
+                EXCLUDED.metadata->'source_line'
+              )
+            )
+        END,
 
       updated_at =
         NOW()
@@ -758,13 +1406,16 @@ async function insertBatch(
     ]
   );
 
-   return {
-    input_rows: rows.length,
-    unique_rows: uniqueRows.length,
+  return {
+    input_rows:
+      rows.length,
+
+    unique_rows:
+      uniqueRows.length,
+
     duplicate_rows_merged:
       duplicateRowsMerged,
   };
-
 }
 
 /* =========================================================
@@ -975,7 +1626,7 @@ async function createStagingRateCard(
         $9::text,
 
         'duplicate_strategy',
-        'highest_rate_wins',
+        'telnyx_applicable_destination_then_lowest_rate',
 
         'created_by',
         'provider-rate-import.service'
