@@ -18,6 +18,7 @@
 const {
   startCallSession,
   endCallAndCharge,
+  billCompletedCallByProvider,
 } = require("./calls.service");
 
 const {
@@ -852,123 +853,163 @@ async function testCall(req, res) {
 /**
  * Telnyx Voice API webhook.
  *
- * Expected events include:
+ * Supported lifecycle events:
  * - call.initiated
  * - call.ringing
  * - call.answered
  * - call.hangup
+ *
+ * Final billing is triggered only by call.hangup.
  */
 async function telnyxStatusCallback(req, res) {
   try {
     const event =
       req.body?.data || null;
 
-    const eventType =
-      String(
-        event?.event_type || ""
-      ).trim();
+    const eventType = String(
+      event?.event_type || ""
+    ).trim();
 
     const payload =
-      event?.payload || {};
+      event?.payload &&
+      typeof event.payload === "object"
+        ? event.payload
+        : {};
 
     console.log(
       "📞 TELNYX WEBHOOK EVENT =>",
       {
         eventType,
-        payload,
+
+        callControlId:
+          payload.call_control_id ||
+          null,
+
+        callLegId:
+          payload.call_leg_id ||
+          null,
+
+        callSessionId:
+          payload.call_session_id ||
+          null,
       }
     );
 
     /*
-     * Return HTTP 200 for malformed or unsupported
-     * events so Telnyx does not continuously retry them.
+     * Malformed event-এর জন্য HTTP 200 return করা হয়,
+     * যাতে Telnyx একই invalid event বারবার retry না করে।
      */
     if (!eventType) {
       return res.status(200).json({
         ok: true,
         ignored: true,
-        reason: "Missing event type",
+        reason: "missing_event_type",
       });
     }
 
-    const decodedClientState =
-  decodeTelnyxClientState(
-    payload.client_state
-  );
+    const supportedEvents = new Set([
+      "call.initiated",
+      "call.ringing",
+      "call.answered",
+      "call.hangup",
+    ]);
 
-if (
-  payload.client_state &&
-  !decodedClientState
-) {
-  console.warn(
-    "⚠️ TELNYX CLIENT STATE COULD NOT BE DECODED",
-    {
-      eventType,
-      hasClientState: true,
+    if (!supportedEvents.has(eventType)) {
+      return res.status(200).json({
+        ok: true,
+        ignored: true,
+        reason: "unsupported_event_type",
+        event_type: eventType,
+      });
     }
-  );
-}
 
-const rawSessionId =
-  decodedClientState?.session_id ??
-  decodedClientState?.sessionId ??
-  decodedClientState?.call_session_id ??
-  decodedClientState?.callSessionId ??
-  req.query?.SessionId ??
-  req.body?.SessionId ??
-  null;
+    /*
+     * Flutter WebRTC call client_state থেকে
+     * internal call_sessions.id resolve করা হয়।
+     */
+    const decodedClientState =
+      decodeTelnyxClientState(
+        payload.client_state
+      );
 
-const parsedSessionId =
-  Number(rawSessionId);
+    if (
+      payload.client_state &&
+      !decodedClientState
+    ) {
+      console.warn(
+        "⚠️ TELNYX CLIENT STATE COULD NOT BE DECODED",
+        {
+          eventType,
+          hasClientState: true,
+        }
+      );
+    }
 
-const sessionId =
-  Number.isInteger(parsedSessionId) &&
-  parsedSessionId > 0
-    ? parsedSessionId
-    : 0;
+    const rawSessionId =
+      decodedClientState?.session_id ??
+      decodedClientState?.sessionId ??
+      decodedClientState?.call_session_id ??
+      decodedClientState?.callSessionId ??
+      req.query?.SessionId ??
+      req.body?.SessionId ??
+      null;
 
-console.log(
-  "🔗 TELNYX CLIENT STATE RESULT =>",
-  {
-    eventType,
-    decoded:
-      Boolean(decodedClientState),
+    const parsedSessionId =
+      Number(rawSessionId);
 
-    sessionId:
-      sessionId || null,
-
-    keys:
-      decodedClientState
-        ? Object.keys(decodedClientState)
-        : [],
-  }
-);
+    const sessionId =
+      Number.isInteger(parsedSessionId) &&
+      parsedSessionId > 0
+        ? parsedSessionId
+        : 0;
 
     const callControlId =
       payload.call_control_id
         ? String(
             payload.call_control_id
-          )
+          ).trim()
         : null;
 
     const callLegId =
       payload.call_leg_id
         ? String(
             payload.call_leg_id
-          )
+          ).trim()
         : null;
 
-    const callSessionId =
+    const providerCallSessionId =
       payload.call_session_id
         ? String(
             payload.call_session_id
-          )
+          ).trim()
         : null;
 
     const hangupCause =
       payload.hangup_cause ||
       payload.hangup_source ||
       null;
+
+    console.log(
+      "🔗 TELNYX WEBHOOK CORRELATION =>",
+      {
+        eventType,
+
+        decodedClientState:
+          Boolean(decodedClientState),
+
+        sessionId:
+          sessionId || null,
+
+        callControlId,
+
+        clientStateKeys:
+          decodedClientState
+            ? Object.keys(
+                decodedClientState
+              )
+            : [],
+      }
+    );
 
     let providerStatus =
       eventType
@@ -977,38 +1018,44 @@ console.log(
 
     let internalStatus = null;
 
-    if (
-      eventType === "call.initiated"
-    ) {
+    if (eventType === "call.initiated") {
       providerStatus = "initiated";
     }
 
-    if (
-      eventType === "call.ringing"
-    ) {
+    if (eventType === "call.ringing") {
       providerStatus = "ringing";
     }
 
-    if (
-      eventType === "call.answered"
-    ) {
+    if (eventType === "call.answered") {
       providerStatus = "answered";
       internalStatus = "started";
     }
 
-    if (
-      eventType === "call.hangup"
-    ) {
+    if (eventType === "call.hangup") {
       providerStatus = "completed";
+
+      /*
+       * Final status billing function সফল হওয়ার পরে
+       * charged হবে। Webhook update পর্যায়ে ended রাখা হচ্ছে।
+       */
       internalStatus = "ended";
     }
 
     /*
-     * A webhook may arrive before makeCall() finishes
-     * persisting provider_call_id.
+     * Telnyx webhook request payload audit-এর জন্য
+     * সম্পূর্ণ body save করা হবে।
+     */
+    const serializedWebhookBody =
+      JSON.stringify(req.body || {});
+
+    let updatedSession = null;
+
+    /*
+     * Webhook দ্রুত পৌঁছালে telnyx.service.js এখনো
+     * provider_call_id save না-ও করে থাকতে পারে।
      *
-     * The encoded session id lets us safely locate the
-     * record during that race condition.
+     * তাই internal sessionId অথবা callControlId—
+     * যেকোনো একটি দিয়ে session update করা হবে।
      */
     if (
       sessionId > 0 ||
@@ -1017,157 +1064,508 @@ console.log(
       const updateResult =
         await db.query(
           `
-            UPDATE call_sessions
-            SET
-              provider =
-                'telnyx',
+          UPDATE call_sessions
+          SET
+            provider = 'telnyx',
 
-              provider_call_id =
+            provider_call_id =
+              COALESCE(
+                $2::text,
+                provider_call_id
+              ),
+
+            provider_status =
+              $3::text,
+
+            answered_at =
+              CASE
+                WHEN $4::text =
+                     'call.answered'
+                THEN COALESCE(
+                  answered_at,
+                  NOW()
+                )
+                ELSE answered_at
+              END,
+
+            ended_at =
+              CASE
+                WHEN $4::text =
+                     'call.hangup'
+                THEN COALESCE(
+                  ended_at,
+                  NOW()
+                )
+                ELSE ended_at
+              END,
+
+            status =
+              CASE
+                /*
+                 * Already charged session-কে repeated webhook
+                 * আবার ended বা started বানাবে না।
+                 */
+                WHEN status = 'charged'
+                THEN status
+
+                WHEN $9::text IS NOT NULL
+                THEN $9::text
+
+                ELSE status
+              END,
+
+            status_callback_payload =
+              $5::jsonb,
+
+            meta =
+              COALESCE(
+                meta,
+                '{}'::jsonb
+              ) ||
+              jsonb_build_object(
+                'telnyx_call_leg_id',
                 COALESCE(
-                  $2::text,
-                  provider_call_id
+                  $6::text,
+                  ''
                 ),
 
-              provider_status =
-                $3::text,
-
-              answered_at =
-                CASE
-                  WHEN $4::text =
-                       'call.answered'
-                  THEN COALESCE(
-                    answered_at,
-                    NOW()
-                  )
-                  ELSE answered_at
-                END,
-
-              ended_at =
-                CASE
-                  WHEN $4::text =
-                       'call.hangup'
-                  THEN COALESCE(
-                    ended_at,
-                    NOW()
-                  )
-                  ELSE ended_at
-                END,
-
-              status =
-                CASE
-                  WHEN $9::text
-                       IS NOT NULL
-                  THEN $9::text
-                  ELSE status
-                END,
-
-              status_callback_payload =
-                $5::jsonb,
-
-              meta =
+                'telnyx_call_session_id',
                 COALESCE(
-                  meta,
-                  '{}'::jsonb
-                ) ||
-                jsonb_build_object(
-                  'telnyx_call_leg_id',
-                  COALESCE(
-                    $6::text,
-                    ''
-                  ),
+                  $7::text,
+                  ''
+                ),
 
-                  'telnyx_call_session_id',
-                  COALESCE(
-                    $7::text,
-                    ''
-                  ),
+                'telnyx_last_event',
+                $4::text,
 
-                  'telnyx_last_event',
-                  $4::text,
+                'telnyx_hangup_cause',
+                COALESCE(
+                  $8::text,
+                  ''
+                ),
 
-                  'telnyx_hangup_cause',
-                  COALESCE(
-                    $8::text,
-                    ''
-                  )
-                )
-
-            WHERE
-              (
-                $1::bigint > 0
-                AND id =
-                    $1::bigint
-              )
-              OR
-              (
-                $2::text
-                    IS NOT NULL
-                AND provider_call_id =
-                    $2::text
+                'telnyx_last_event_at',
+                NOW()::text
               )
 
-            RETURNING
-              id,
-              user_id,
-              status,
-              provider_status,
-              provider_call_id
+          WHERE
+            (
+              $1::bigint > 0
+              AND id = $1::bigint
+            )
+            OR
+            (
+              $2::text IS NOT NULL
+              AND provider_call_id =
+                  $2::text
+            )
+
+          RETURNING
+            id,
+            user_id,
+            status,
+            provider,
+            provider_status,
+            provider_call_id,
+            answered_at,
+            ended_at,
+            charged_amount_cents,
+            tx_id
           `,
           [
             sessionId,
             callControlId,
             providerStatus,
             eventType,
-            JSON.stringify(req.body),
+            serializedWebhookBody,
             callLegId,
-            callSessionId,
+            providerCallSessionId,
             hangupCause,
             internalStatus,
           ]
         );
 
+      updatedSession =
+        updateResult.rows[0] || null;
+
       console.log(
         "✅ TELNYX WEBHOOK SESSION UPDATE =>",
+        {
+          eventType,
+
+          requestedSessionId:
+            sessionId || null,
+
+          resolvedSessionId:
+            updatedSession?.id ||
+            null,
+
+          callControlId,
+
+          updatedRows:
+            updateResult.rowCount,
+
+          status:
+            updatedSession?.status ||
+            null,
+
+          providerStatus:
+            updatedSession
+              ?.provider_status ||
+            null,
+        }
+      );
+    } else {
+      console.warn(
+        "⚠️ TELNYX WEBHOOK SESSION NOT IDENTIFIED:",
+        {
+          eventType,
+
+          decodedClientState:
+            decodedClientState ||
+            null,
+
+          callControlId,
+        }
+      );
+
+      /*
+       * Session identify না হলেও Telnyx-কে 200 দেওয়া হবে।
+       * নইলে একই event অনবরত retry করতে পারে।
+       */
+      return res.status(200).json({
+        ok: true,
+        ignored: true,
+
+        reason:
+          "session_not_identified",
+
+        event_type:
+          eventType,
+
+        provider_call_id:
+          callControlId,
+      });
+    }
+
+    if (!updatedSession) {
+      console.warn(
+        "⚠️ TELNYX WEBHOOK MATCHED NO SESSION:",
         {
           eventType,
           sessionId:
             sessionId || null,
           callControlId,
-          updatedRows:
-            updateResult.rowCount,
-          session:
-            updateResult.rows[0] ||
-            null,
         }
       );
-    } else {
-    console.warn(
-        "⚠️ TELNYX WEBHOOK SESSION NOT IDENTIFIED:",
-      {
-        eventType,
-        decodedClientState:
-        decodedClientState || null,
-        callControlId,
-  }
-);
+
+      return res.status(200).json({
+        ok: true,
+        ignored: true,
+
+        reason:
+          "session_not_found",
+
+        event_type:
+          eventType,
+
+        session_id:
+          sessionId || null,
+
+        provider_call_id:
+          callControlId,
+      });
     }
 
     /*
-     * Final wallet charging is intentionally not
-     * triggered here until Telnyx billable duration/CDR
-     * reconciliation has been completed.
+     * initiated/ringing/answered events শুধু lifecycle update।
+     * Wallet billing কেবল final call.hangup event-এ হবে।
      */
+    if (eventType !== "call.hangup") {
+      return res.status(200).json({
+        ok: true,
+
+        event_type:
+          eventType,
+
+        session_id:
+          updatedSession.id,
+
+        provider_call_id:
+          updatedSession
+            .provider_call_id ||
+          callControlId,
+
+        provider_status:
+          updatedSession
+            .provider_status,
+
+        billing_triggered:
+          false,
+      });
+    }
+
+    /*
+     * Telnyx hangup payload billing service-এর কাছে
+     * normalized top-level object হিসেবে পাঠানো হচ্ছে।
+     *
+     * Duration payload-এ না থাকলে calls.service.js
+     * answered_at → ended_at fallback ব্যবহার করবে।
+     */
+    const billingPayload = {
+      ...payload,
+
+      event_type:
+        eventType,
+
+      telnyx_event_id:
+        event?.id || null,
+
+      webhook_received_at:
+        new Date().toISOString(),
+
+      raw_webhook:
+        req.body || {},
+    };
+
+    let billingResult;
+
+    try {
+      billingResult =
+        await billCompletedCallByProvider({
+          callSid:
+            updatedSession
+              .provider_call_id ||
+            callControlId,
+
+          sessionId:
+            updatedSession.id,
+
+          rawPayload:
+            billingPayload,
+        });
+    } catch (billingError) {
+      /*
+       * Webhook lifecycle update ইতোমধ্যে save হয়েছে।
+       *
+       * Billing exception log এবং session meta-তে রাখা হচ্ছে।
+       * Telnyx-কে 200 দেওয়া হবে, যাতে repeated provider
+       * webhook accidental duplicate processing না ঘটায়।
+       */
+      console.error(
+        "❌ TELNYX HANGUP BILLING EXCEPTION:",
+        {
+          sessionId:
+            updatedSession.id,
+
+          callControlId,
+
+          message:
+            billingError.message,
+
+          code:
+            billingError.code || null,
+
+          stack:
+            billingError.stack,
+        }
+      );
+
+      await db.query(
+        `
+        UPDATE call_sessions
+        SET
+          billing_source =
+            'provider_webhook_billing_exception',
+
+          meta =
+            COALESCE(
+              meta,
+              '{}'::jsonb
+            ) ||
+            jsonb_build_object(
+              'billing_exception',
+              jsonb_build_object(
+                'message',
+                $2::text,
+
+                'code',
+                COALESCE(
+                  $3::text,
+                  ''
+                ),
+
+                'recorded_at',
+                NOW()::text
+              )
+            )
+
+        WHERE id = $1::bigint
+        `,
+        [
+          updatedSession.id,
+
+          billingError.message ||
+            "Unknown billing exception",
+
+          billingError.code
+            ? String(
+                billingError.code
+              )
+            : null,
+        ]
+      );
+
+      return res.status(200).json({
+        ok: true,
+
+        event_type:
+          eventType,
+
+        session_id:
+          updatedSession.id,
+
+        provider_call_id:
+          updatedSession
+            .provider_call_id ||
+          callControlId,
+
+        billing_triggered:
+          true,
+
+        billing_completed:
+          false,
+
+        billing_reason:
+          "billing_exception",
+      });
+    }
+
+    console.log(
+      "💰 TELNYX HANGUP BILLING RESULT =>",
+      {
+        sessionId:
+          updatedSession.id,
+
+        callControlId,
+
+        ok:
+          billingResult?.ok === true,
+
+        reason:
+          billingResult?.reason ||
+          null,
+
+        actualDurationSeconds:
+          billingResult
+            ?.duration_sec ??
+          null,
+
+        billableSeconds:
+          billingResult
+            ?.billable_seconds ??
+          null,
+
+        chargedAmountCents:
+          billingResult
+            ?.charged_amount_cents ??
+          null,
+
+        providerCostUsd:
+          billingResult
+            ?.provider_cost_usd ??
+          null,
+
+        profitUsd:
+          billingResult
+            ?.profit_usd ??
+          null,
+      }
+    );
+
     return res.status(200).json({
+      /*
+       * Webhook গ্রহণ সফল হয়েছে।
+       * billingResult.ok false হলেও Telnyx delivery itself
+       * সফল হওয়ায় HTTP 200 রাখা হচ্ছে।
+       */
       ok: true,
 
       event_type:
         eventType,
 
       session_id:
-        sessionId || null,
+        updatedSession.id,
 
       provider_call_id:
+        updatedSession
+          .provider_call_id ||
         callControlId,
+
+      provider_status:
+        "completed",
+
+      billing_triggered:
+        true,
+
+      billing_completed:
+        billingResult?.ok === true,
+
+      billing_reason:
+        billingResult?.reason ||
+        null,
+
+      billing: {
+        actual_duration_seconds:
+          billingResult
+            ?.duration_sec ??
+          null,
+
+        billable_seconds:
+          billingResult
+            ?.billable_seconds ??
+          null,
+
+        charged_minutes:
+          billingResult
+            ?.charged_minutes ??
+          null,
+
+        billing_increment_seconds:
+          billingResult
+            ?.billing_increment_seconds ??
+          null,
+
+        minimum_duration_seconds:
+          billingResult
+            ?.minimum_duration_seconds ??
+          null,
+
+        sell_rate_usd_per_min:
+          billingResult
+            ?.sell_rate_usd_per_min ??
+          null,
+
+        charged_amount_cents:
+          billingResult
+            ?.charged_amount_cents ??
+          0,
+
+        charged_amount_usd:
+          billingResult
+            ?.charged_amount_usd ??
+          null,
+
+        provider_cost_usd:
+          billingResult
+            ?.provider_cost_usd ??
+          null,
+
+        profit_usd:
+          billingResult
+            ?.profit_usd ??
+          null,
+      },
     });
   } catch (error) {
     console.error(
@@ -1187,6 +1585,10 @@ console.log(
       }
     );
 
+    /*
+     * এখানে database/session lifecycle update-ই ব্যর্থ হয়েছে।
+     * Telnyx retry করলে event পুনরায় process হওয়ার সুযোগ থাকবে।
+     */
     return res.status(500).json({
       ok: false,
 

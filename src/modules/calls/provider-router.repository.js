@@ -245,12 +245,21 @@ async function findProviderRate({
 }
 
 /**
- * Existing public sell-rate row খুঁজে দেয়।
+ * Active manual customer rate override খুঁজে দেয়।
  *
- * Router integration চলাকালে backward compatibility-এর জন্য রাখা হয়েছে।
+ * Priority:
+ * - longest matching prefix
+ * - manual_override = TRUE
+ *
+ * Linked provider rate থাকলে Telnyx/provider billing interval,
+ * minimum duration এবং connection fee-ও সঙ্গে return করবে।
  */
-async function findLegacyCallRate(toPhoneE164) {
-  const phone = cleanPhone(toPhoneE164);
+async function findManualOverrideRate(
+  toPhoneE164
+) {
+  const phone = cleanPhone(
+    toPhoneE164
+  );
 
   if (!phone) {
     return null;
@@ -259,35 +268,179 @@ async function findLegacyCallRate(toPhoneE164) {
   const { rows } = await db.query(
     `
     SELECT
-      id,
-      country_code,
-      country_name,
-      prefix,
-      currency,
-      price_per_min_cents,
-      provider,
-      provider_rate_usd_per_min,
-      sell_rate_usd_per_min,
-      markup_percent,
-      min_profit_usd_per_min,
-      manual_override,
-      rate_source,
-      last_synced_at,
-      is_active,
-      route_id,
-      provider_id,
-      provider_plan_id,
-      provider_rate_id,
-      platform_fee_usd_per_min,
-      discounted_provider_rate_usd_per_min,
-      max_provider_rate_usd_per_min,
-      publish_rate,
-      disabled_reason
-    FROM call_rates
-    WHERE is_active = TRUE
-      AND publish_rate = TRUE
-      AND $1 LIKE prefix || '%'
-    ORDER BY LENGTH(prefix) DESC
+      cr.id,
+      cr.country_code,
+      cr.country_name,
+      cr.prefix,
+      cr.currency,
+      cr.price_per_min_cents,
+
+      cr.provider,
+      cr.provider_rate_usd_per_min,
+      cr.sell_rate_usd_per_min,
+
+      cr.markup_percent,
+      cr.min_profit_usd_per_min,
+      cr.manual_override,
+      cr.rate_source,
+      cr.last_synced_at,
+
+      cr.is_active,
+      cr.route_id,
+      cr.provider_id,
+      cr.provider_plan_id,
+      cr.provider_rate_id,
+
+      cr.platform_fee_usd_per_min,
+      cr.discounted_provider_rate_usd_per_min,
+      cr.max_provider_rate_usd_per_min,
+
+      cr.publish_rate,
+      cr.disabled_reason,
+
+      COALESCE(
+        vpr.connection_fee_usd,
+        0
+      ) AS connection_fee_usd,
+
+      COALESCE(
+        vpr.billing_increment_seconds,
+        vprc.billing_increment_seconds,
+        60
+      ) AS billing_increment_seconds,
+
+      COALESCE(
+        vpr.minimum_duration_seconds,
+        vprc.minimum_duration_seconds,
+        60
+      ) AS minimum_duration_seconds,
+
+      vpr.destination_name,
+      vpr.rate_card_id,
+      vprc.code AS rate_card_code
+
+    FROM call_rates cr
+
+    LEFT JOIN voice_provider_rates vpr
+      ON vpr.id =
+         cr.provider_rate_id
+
+    LEFT JOIN voice_provider_rate_cards vprc
+      ON vprc.id =
+         vpr.rate_card_id
+
+    WHERE cr.is_active = TRUE
+      AND cr.manual_override = TRUE
+      AND cr.publish_rate = TRUE
+      AND $1 LIKE cr.prefix || '%'
+
+    ORDER BY
+      LENGTH(cr.prefix) DESC,
+      cr.id DESC
+
+    LIMIT 1
+    `,
+    [phone]
+  );
+
+  return rows[0] || null;
+}
+
+
+/**
+ * Existing automatic/legacy retail rate খুঁজে দেয়।
+ *
+ * Manual override এখানে return হবে না।
+ * Manual override আলাদা priority resolver ব্যবহার করবে।
+ */
+async function findLegacyCallRate(
+  toPhoneE164
+) {
+  const phone = cleanPhone(
+    toPhoneE164
+  );
+
+  if (!phone) {
+    return null;
+  }
+
+  const { rows } = await db.query(
+    `
+    SELECT
+      cr.id,
+      cr.country_code,
+      cr.country_name,
+      cr.prefix,
+      cr.currency,
+      cr.price_per_min_cents,
+
+      cr.provider,
+      cr.provider_rate_usd_per_min,
+      cr.sell_rate_usd_per_min,
+
+      cr.markup_percent,
+      cr.min_profit_usd_per_min,
+      cr.manual_override,
+      cr.rate_source,
+      cr.last_synced_at,
+
+      cr.is_active,
+      cr.route_id,
+      cr.provider_id,
+      cr.provider_plan_id,
+      cr.provider_rate_id,
+
+      cr.platform_fee_usd_per_min,
+      cr.discounted_provider_rate_usd_per_min,
+      cr.max_provider_rate_usd_per_min,
+
+      cr.publish_rate,
+      cr.disabled_reason,
+
+      COALESCE(
+        vpr.connection_fee_usd,
+        0
+      ) AS connection_fee_usd,
+
+      COALESCE(
+        vpr.billing_increment_seconds,
+        vprc.billing_increment_seconds,
+        60
+      ) AS billing_increment_seconds,
+
+      COALESCE(
+        vpr.minimum_duration_seconds,
+        vprc.minimum_duration_seconds,
+        60
+      ) AS minimum_duration_seconds,
+
+      vpr.destination_name,
+      vpr.rate_card_id,
+      vprc.code AS rate_card_code
+
+    FROM call_rates cr
+
+    LEFT JOIN voice_provider_rates vpr
+      ON vpr.id =
+         cr.provider_rate_id
+
+    LEFT JOIN voice_provider_rate_cards vprc
+      ON vprc.id =
+         vpr.rate_card_id
+
+    WHERE cr.is_active = TRUE
+      AND COALESCE(
+        cr.manual_override,
+        FALSE
+      ) = FALSE
+
+      AND cr.publish_rate = TRUE
+      AND $1 LIKE cr.prefix || '%'
+
+    ORDER BY
+      LENGTH(cr.prefix) DESC,
+      cr.id DESC
+
     LIMIT 1
     `,
     [phone]
@@ -302,5 +455,6 @@ module.exports = {
   findActiveRoute,
   findRouteProviderCandidates,
   findProviderRate,
+  findManualOverrideRate,
   findLegacyCallRate,
 };

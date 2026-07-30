@@ -10,32 +10,195 @@ function round7(value) {
 }
 
 /**
- * Existing wallet engine cent-based হওয়ায় এক মিনিটের sell rate
- * USD cents-এ convert করে।
- *
- * উদাহরণ:
- * 0.0125 USD -> 1 cent
- * 0.0270 USD -> 3 cents
+ * Safe non-negative decimal parser.
  */
-function toUsdCents(usd) {
+function toNonNegativeNumber(value, fallback = 0) {
+  const parsed = Number(value);
+
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return fallback;
+  }
+
+  return parsed;
+}
+
+/**
+ * Safe positive integer parser.
+ *
+ * Telnyx CSV billing increment invalid বা missing হলে
+ * fallback value ব্যবহার করবে।
+ */
+function toPositiveInteger(value, fallback = 60) {
+  const parsed = Number.parseInt(
+    String(value ?? ""),
+    10
+  );
+
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    return fallback;
+  }
+
+  return parsed;
+}
+
+/**
+ * USD total amount-কে wallet cents-এ convert করে।
+ *
+ * Important:
+ * Per-minute rate আগে cents-এ convert করা হবে না।
+ * পুরো call-এর decimal total হিসাব হওয়ার পরে একবারে
+ * wallet cents-এ convert হবে।
+ */
+function usdTotalToWalletCents(usdAmount) {
+  const safeAmount =
+    toNonNegativeNumber(usdAmount, 0);
+
+  if (safeAmount <= 0) {
+    return 0;
+  }
+
   return Math.max(
-    0,
-    Math.ceil(Number(usd || 0) * 100)
+    1,
+    Math.ceil(
+      (safeAmount * 100) - Number.EPSILON
+    )
   );
 }
 
 /**
- * Current billing policy:
- * Answered call-এর duration প্রতি শুরু হওয়া minute অনুযায়ী charge হবে।
+ * Telnyx/provider billing policy অনুযায়ী billable seconds হিসাব করে।
+ *
+ * Formula:
+ * 1. actual duration এবং minimum duration-এর বড় value নেওয়া
+ * 2. billing increment অনুযায়ী উপরের দিকে round করা
  */
-function ceilMinutes(seconds) {
-  const safeSeconds = Number(seconds || 0);
+function calculateBillableSeconds({
+  actualDurationSeconds,
+  minimumDurationSeconds,
+  billingIncrementSeconds,
+}) {
+  const actualSeconds = Math.max(
+    0,
+    Math.floor(
+      toNonNegativeNumber(
+        actualDurationSeconds,
+        0
+      )
+    )
+  );
 
-  if (!Number.isFinite(safeSeconds) || safeSeconds <= 0) {
+  if (actualSeconds <= 0) {
     return 0;
   }
 
-  return Math.max(1, Math.ceil(safeSeconds / 60));
+  const minimumSeconds = Math.max(
+    0,
+    Math.floor(
+      toNonNegativeNumber(
+        minimumDurationSeconds,
+        0
+      )
+    )
+  );
+
+  const incrementSeconds =
+    toPositiveInteger(
+      billingIncrementSeconds,
+      60
+    );
+
+  const minimumAppliedSeconds = Math.max(
+    actualSeconds,
+    minimumSeconds
+  );
+
+  return (
+    Math.ceil(
+      minimumAppliedSeconds /
+        incrementSeconds
+    ) * incrementSeconds
+  );
+}
+
+/**
+ * Provider webhook payload থেকে duration বের করে।
+ *
+ * Telnyx event-এ duration না থাকলে answered_at এবং ended_at
+ * timestamp-এর পার্থক্য ব্যবহার করা হবে।
+ */
+function resolveActualDurationSeconds({
+  rawPayload,
+  answeredAt,
+  endedAt,
+}) {
+  const payload = rawPayload || {};
+
+  const durationCandidates = [
+    payload.CallDuration,
+    payload.Duration,
+    payload.duration_sec,
+    payload.duration_secs,
+    payload.duration_seconds,
+    payload.billable_duration_sec,
+    payload.billable_duration_secs,
+    payload.billable_seconds,
+  ];
+
+  for (const candidate of durationCandidates) {
+    const parsed = Number(candidate);
+
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return Math.max(
+        1,
+        Math.floor(parsed)
+      );
+    }
+  }
+
+  const answeredTimestamp =
+    answeredAt
+      ? new Date(answeredAt).getTime()
+      : Number.NaN;
+
+  const endedTimestamp =
+    endedAt
+      ? new Date(endedAt).getTime()
+      : Date.now();
+
+  if (
+    Number.isFinite(answeredTimestamp) &&
+    Number.isFinite(endedTimestamp) &&
+    endedTimestamp > answeredTimestamp
+  ) {
+    return Math.max(
+      1,
+      Math.floor(
+        (endedTimestamp - answeredTimestamp) /
+          1000
+      )
+    );
+  }
+
+  return 0;
+}
+
+/**
+ * Call session-এর immutable pricing snapshot safely read করে।
+ */
+function readPricingSnapshot(session) {
+  const meta =
+    session?.meta &&
+    typeof session.meta === "object"
+      ? session.meta
+      : {};
+
+  const snapshot =
+    meta.pricing_snapshot &&
+    typeof meta.pricing_snapshot === "object"
+      ? meta.pricing_snapshot
+      : {};
+
+  return snapshot;
 }
 
 /**
@@ -54,6 +217,50 @@ function normalizeRouterRate(routerResult) {
   const routeProvider = routerResult.route_provider || {};
   const providerPlan = routerResult.provider_plan || {};
   const callRate = routerResult.call_rate || null;
+    const providerConnectionFeeUsd =
+    toNonNegativeNumber(
+      pricing.provider_connection_fee_usd ??
+        pricing.connection_fee_usd ??
+        providerRate.connection_fee_usd ??
+        callRate?.provider_connection_fee_usd ??
+        callRate?.connection_fee_usd ??
+        0,
+      0
+    );
+
+  /*
+   * বর্তমানে customer connection fee provider fee-এর সমান।
+   * পরবর্তী Admin API-তে আলাদা manual customer fee দেওয়া যাবে।
+   */
+  const customerConnectionFeeUsd =
+    toNonNegativeNumber(
+      pricing.customer_connection_fee_usd ??
+        callRate?.customer_connection_fee_usd ??
+        providerConnectionFeeUsd,
+      providerConnectionFeeUsd
+    );
+
+  const billingIncrementSeconds =
+    toPositiveInteger(
+      pricing.billing_increment_seconds ??
+        providerRate.billing_increment_seconds ??
+        callRate?.billing_increment_seconds ??
+        60,
+      60
+    );
+
+  const minimumDurationSeconds = Math.max(
+    0,
+    Math.floor(
+      toNonNegativeNumber(
+        pricing.minimum_duration_seconds ??
+          providerRate.minimum_duration_seconds ??
+          callRate?.minimum_duration_seconds ??
+          60,
+        60
+      )
+    )
+  );
 
   const rawProviderRate = Number(
     pricing.raw_provider_rate_usd_per_min ??
@@ -179,6 +386,18 @@ function normalizeRouterRate(routerResult) {
     total_provider_cost_usd_per_min:
       round7(totalProviderCost),
 
+    provider_connection_fee_usd:
+      round7(providerConnectionFeeUsd),
+
+    customer_connection_fee_usd:
+      round7(customerConnectionFeeUsd),
+
+    billing_increment_seconds:
+      billingIncrementSeconds,
+
+    minimum_duration_seconds:
+      minimumDurationSeconds,
+
     provider_rate_usd_per_min:
       round7(rawProviderRate),
 
@@ -202,11 +421,15 @@ function normalizeRouterRate(routerResult) {
       callRate?.max_provider_rate_usd_per_min ??
       null,
 
+     /*
+     * এটি শুধু backward-compatible display/snapshot field।
+     * Final billing এই cents value দিয়ে হবে না।
+     */
     price_per_min_cents: Math.max(
       1,
-      Number(
-        callRate?.price_per_min_cents ||
-          toUsdCents(sellRate)
+      Math.ceil(
+        (sellRate * 100) -
+          Number.EPSILON
       )
     ),
 
@@ -365,23 +588,67 @@ async function startCallSession({
     };
   }
 
-  const oneMinuteCostCents = Math.max(
-    1,
-    toUsdCents(sellRate)
+  /*
+   * Call শুরু করার minimum required balance:
+   *
+   * Telnyx minimum duration
+   * + billing increment
+   * + customer connection fee
+   *
+   * এটি শুধু call eligibility check।
+   * Final charge provider webhook-এর actual duration দিয়ে হবে।
+   */
+  const minimumBillableSeconds =
+    calculateBillableSeconds({
+      actualDurationSeconds: 1,
+
+      minimumDurationSeconds:
+        rate.minimum_duration_seconds,
+
+      billingIncrementSeconds:
+        rate.billing_increment_seconds,
+    });
+
+  const minimumUsageChargeUsd =
+    sellRate *
+    (minimumBillableSeconds / 60);
+
+  const minimumCallChargeUsd = round7(
+    minimumUsageChargeUsd +
+      toNonNegativeNumber(
+        rate.customer_connection_fee_usd,
+        0
+      )
   );
+
+  const minimumCallChargeCents =
+    usdTotalToWalletCents(
+      minimumCallChargeUsd
+    );
 
   if (
     Number(wallet.balance_cents || 0) <
-    oneMinuteCostCents
+    minimumCallChargeCents
   ) {
     return {
       ok: false,
-      reason: "insufficient_balance_for_call",
+
+      reason:
+        "insufficient_balance_for_call",
+
+      message:
+        "Insufficient wallet balance for the minimum call charge",
+
       required_balance_cents:
-        oneMinuteCostCents,
-      available_balance_cents: Number(
-        wallet.balance_cents || 0
-      ),
+        minimumCallChargeCents,
+
+      available_balance_cents:
+        Number(
+          wallet.balance_cents || 0
+        ),
+
+      minimum_billable_seconds:
+        minimumBillableSeconds,
     };
   }
 
@@ -424,6 +691,18 @@ async function startCallSession({
 
       total_provider_cost_usd_per_min:
         rate.total_provider_cost_usd_per_min,
+
+      provider_connection_fee_usd:
+        rate.provider_connection_fee_usd,
+
+      customer_connection_fee_usd:
+        rate.customer_connection_fee_usd,
+
+      billing_increment_seconds:
+        rate.billing_increment_seconds,
+
+      minimum_duration_seconds:
+        rate.minimum_duration_seconds,
 
       sell_rate_usd_per_min:
         rate.sell_rate_usd_per_min,
@@ -516,7 +795,7 @@ async function startCallSession({
       toPhoneE164,
 
       rate.id,
-      oneMinuteCostCents,
+      minimumCallChargeCents,
 
       providerCode,
       rate.provider_id,
@@ -576,6 +855,23 @@ async function startCallSession({
 
       total_provider_cost_usd_per_min:
         rate.total_provider_cost_usd_per_min,
+
+      billing: {
+        billing_increment_seconds:
+          rate.billing_increment_seconds,
+
+        minimum_duration_seconds:
+          rate.minimum_duration_seconds,
+
+        provider_connection_fee_usd:
+          rate.provider_connection_fee_usd,
+
+        customer_connection_fee_usd:
+          rate.customer_connection_fee_usd,
+
+        minimum_call_charge_cents:
+          minimumCallChargeCents,
+      },
     },
   };
 }
@@ -596,6 +892,14 @@ async function endCallAndCharge({
 
 /**
  * Provider webhook/CDR-এর final duration দিয়ে completed call bill করে।
+ *
+ * Billing source:
+ * - Telnyx/provider webhook duration
+ * - অথবা answered_at → ended_at fallback
+ *
+ * Pricing source:
+ * - Call শুরুর সময় সংরক্ষিত immutable pricing snapshot
+ * - historical session হলে existing database columns fallback
  */
 async function billCompletedCallByProvider({
   callSid,
@@ -607,25 +911,39 @@ async function billCompletedCallByProvider({
   try {
     await client.query("BEGIN");
 
-    const sessionResult = await client.query(
-      `
-      SELECT *
-      FROM call_sessions
-      WHERE
-        provider_call_id = $1
-        OR id = $2
-      ORDER BY id DESC
-      LIMIT 1
-      FOR UPDATE
-      `,
-      [
-        callSid || null,
-        Number(sessionId || 0),
-      ]
-    );
+    const normalizedSessionId =
+      Number(sessionId || 0);
+
+    const normalizedCallSid =
+      String(callSid || "").trim() || null;
+
+    const sessionResult =
+      await client.query(
+        `
+        SELECT *
+        FROM call_sessions
+        WHERE
+          (
+            $1::text IS NOT NULL
+            AND provider_call_id = $1::text
+          )
+          OR
+          (
+            $2::bigint > 0
+            AND id = $2::bigint
+          )
+        ORDER BY id DESC
+        LIMIT 1
+        FOR UPDATE
+        `,
+        [
+          normalizedCallSid,
+          normalizedSessionId,
+        ]
+      );
 
     const session =
-      sessionResult.rows[0];
+      sessionResult.rows[0] || null;
 
     if (!session) {
       await client.query("ROLLBACK");
@@ -636,17 +954,24 @@ async function billCompletedCallByProvider({
       };
     }
 
+    /*
+     * Idempotency:
+     * repeated Telnyx webhook একই call পুনরায় charge করবে না।
+     */
     if (
       session.status === "charged" ||
-      Number(
-        session.charged_amount_cents || 0
-      ) > 0
+      session.tx_id != null
     ) {
       await client.query("COMMIT");
 
       return {
         ok: true,
         reason: "already_charged",
+
+        charged_amount_cents:
+          Number(
+            session.charged_amount_cents || 0
+          ),
       };
     }
 
@@ -657,18 +982,50 @@ async function billCompletedCallByProvider({
         SET
           status = 'completed',
           provider_status = 'completed',
-          ended_at = COALESCE(ended_at, NOW()),
+
+          ended_at =
+            COALESCE(
+              ended_at,
+              NOW()
+            ),
+
           duration_sec = 0,
           charged_minutes = 0,
           charged_amount_cents = 0,
+
+          provider_cost_usd = 0,
+          charged_amount_usd = 0,
+          profit_usd = 0,
+
           billing_source =
             'answered_at_missing_no_charge',
-          status_callback_payload = $2
-        WHERE id = $1
+
+          status_callback_payload =
+            $2::jsonb,
+
+          meta =
+            COALESCE(
+              meta,
+              '{}'::jsonb
+            ) ||
+            jsonb_build_object(
+              'billing_result',
+              jsonb_build_object(
+                'charged',
+                false,
+
+                'reason',
+                'answered_at_missing'
+              )
+            )
+
+        WHERE id = $1::bigint
         `,
         [
           session.id,
-          rawPayload || {},
+          JSON.stringify(
+            rawPayload || {}
+          ),
         ]
       );
 
@@ -678,45 +1035,57 @@ async function billCompletedCallByProvider({
         ok: true,
         reason:
           "no_charge_not_answered",
+
+        charged_amount_cents: 0,
       };
     }
 
-    const durationSec = Number(
-      rawPayload?.CallDuration ??
-        rawPayload?.Duration ??
-        rawPayload?.duration_sec ??
-        rawPayload?.billable_duration_sec ??
-        0
-    );
+    const actualDurationSeconds =
+      resolveActualDurationSeconds({
+        rawPayload,
 
-    const safeDurationSec = Math.max(
-      0,
-      Math.floor(
-        Number.isFinite(durationSec)
-          ? durationSec
-          : 0
-      )
-    );
+        answeredAt:
+          session.answered_at,
 
-    if (safeDurationSec <= 0) {
+        endedAt:
+          session.ended_at,
+      });
+
+    if (actualDurationSeconds <= 0) {
       await client.query(
         `
         UPDATE call_sessions
         SET
           status = 'completed',
           provider_status = 'completed',
-          ended_at = COALESCE(ended_at, NOW()),
+
+          ended_at =
+            COALESCE(
+              ended_at,
+              NOW()
+            ),
+
           duration_sec = 0,
           charged_minutes = 0,
           charged_amount_cents = 0,
+
+          provider_cost_usd = 0,
+          charged_amount_usd = 0,
+          profit_usd = 0,
+
           billing_source =
             'zero_answered_duration',
-          status_callback_payload = $2
-        WHERE id = $1
+
+          status_callback_payload =
+            $2::jsonb
+
+        WHERE id = $1::bigint
         `,
         [
           session.id,
-          rawPayload || {},
+          JSON.stringify(
+            rawPayload || {}
+          ),
         ]
       );
 
@@ -724,77 +1093,259 @@ async function billCompletedCallByProvider({
 
       return {
         ok: true,
+
         reason:
           "no_charge_zero_duration",
+
+        charged_amount_cents: 0,
       };
     }
 
-    const chargedMinutes =
-      ceilMinutes(safeDurationSec);
+    const pricingSnapshot =
+      readPricingSnapshot(session);
 
-    const pricePerMinCents = Math.max(
-      1,
-      Number(
-        session.price_per_min_cents ||
-          toUsdCents(
-            session.sell_rate_usd_per_min
+    const sellRateUsdPerMinute =
+      toNonNegativeNumber(
+        pricingSnapshot
+          .sell_rate_usd_per_min ??
+          session.sell_rate_usd_per_min ??
+          (
+            Number(
+              session.price_per_min_cents || 0
+            ) / 100
+          ),
+        0
+      );
+
+    const providerCostRateUsdPerMinute =
+      toNonNegativeNumber(
+        pricingSnapshot
+          .total_provider_cost_usd_per_min ??
+          session
+            .total_provider_cost_usd_per_min ??
+          session.provider_rate_usd_per_min ??
+          0,
+        0
+      );
+
+    const providerConnectionFeeUsd =
+      toNonNegativeNumber(
+        pricingSnapshot
+          .provider_connection_fee_usd ??
+          0,
+        0
+      );
+
+    const customerConnectionFeeUsd =
+      toNonNegativeNumber(
+        pricingSnapshot
+          .customer_connection_fee_usd ??
+          providerConnectionFeeUsd,
+        providerConnectionFeeUsd
+      );
+
+    const billingIncrementSeconds =
+      toPositiveInteger(
+        pricingSnapshot
+          .billing_increment_seconds ??
+          60,
+        60
+      );
+
+    const minimumDurationSeconds =
+      Math.max(
+        0,
+        Math.floor(
+          toNonNegativeNumber(
+            pricingSnapshot
+              .minimum_duration_seconds ??
+              60,
+            60
           )
-      )
-    );
+        )
+      );
 
-    const amountCents =
-      chargedMinutes * pricePerMinCents;
+    if (sellRateUsdPerMinute <= 0) {
+      await client.query("ROLLBACK");
 
-    const sellRate =
-      pricePerMinCents / 100;
+      return {
+        ok: false,
+        reason: "invalid_session_sell_rate",
+      };
+    }
 
     /*
-     * Multi-provider session হলে actual cost:
-     * discounted termination rate + platform fee.
-     *
-     * Historical session হলে পুরোনো provider_rate field fallback।
+     * Telnyx CSV/native provider billing interval।
      */
-    const providerCostRate = Number(
-      session.total_provider_cost_usd_per_min ||
-        session.provider_rate_usd_per_min ||
-        0
-    );
+    const billableSeconds =
+      calculateBillableSeconds({
+        actualDurationSeconds,
+
+        minimumDurationSeconds,
+
+        billingIncrementSeconds,
+      });
+
+    if (billableSeconds <= 0) {
+      await client.query("ROLLBACK");
+
+      return {
+        ok: false,
+        reason:
+          "invalid_billable_duration",
+      };
+    }
+
+    const customerUsageChargeUsd =
+      round7(
+        sellRateUsdPerMinute *
+          (billableSeconds / 60)
+      );
 
     const chargedUsd = round7(
-      amountCents / 100
+      customerUsageChargeUsd +
+        customerConnectionFeeUsd
     );
 
+    const providerUsageCostUsd =
+      round7(
+        providerCostRateUsdPerMinute *
+          (billableSeconds / 60)
+      );
+
     const providerCostUsd = round7(
-      chargedMinutes * providerCostRate
+      providerUsageCostUsd +
+        providerConnectionFeeUsd
     );
 
     const profitUsd = round7(
       chargedUsd - providerCostUsd
     );
 
-    const providerCostCents = Math.max(
-      0,
-      Math.round(providerCostUsd * 100)
-    );
+    /*
+     * Loss protection:
+     * কোনো ভুল rate/snapshot-এর কারণে provider cost-এর নিচে
+     * customer charge হলে call charge finalize করা হবে না।
+     */
+    if (
+      providerCostUsd > 0 &&
+      chargedUsd < providerCostUsd
+    ) {
+      await client.query(
+        `
+        UPDATE call_sessions
+        SET
+          status = 'failed',
+          provider_status = 'completed',
+
+          ended_at =
+            COALESCE(
+              ended_at,
+              NOW()
+            ),
+
+          duration_sec = $2,
+
+          billing_source =
+            'billing_loss_protection',
+
+          status_callback_payload =
+            $3::jsonb,
+
+          meta =
+            COALESCE(
+              meta,
+              '{}'::jsonb
+            ) ||
+            jsonb_build_object(
+              'billing_error',
+              jsonb_build_object(
+                'reason',
+                'customer_charge_below_provider_cost',
+
+                'charged_usd',
+                $4::numeric,
+
+                'provider_cost_usd',
+                $5::numeric
+              )
+            )
+
+        WHERE id = $1::bigint
+        `,
+        [
+          session.id,
+          actualDurationSeconds,
+
+          JSON.stringify(
+            rawPayload || {}
+          ),
+
+          chargedUsd,
+          providerCostUsd,
+        ]
+      );
+
+      await client.query("COMMIT");
+
+      return {
+        ok: false,
+
+        reason:
+          "customer_charge_below_provider_cost",
+      };
+    }
+
+    const amountCents =
+      usdTotalToWalletCents(chargedUsd);
+
+    const providerCostCents =
+      Math.max(
+        0,
+        Math.round(
+          providerCostUsd * 100
+        )
+      );
 
     const profitCents =
-      amountCents - providerCostCents;
+      amountCents -
+      providerCostCents;
 
     /*
-     * Session lock transaction এখানে শেষ করা হয়।
-     * Wallet service নিজস্ব transaction/idempotency ব্যবহার করে।
+     * charged_minutes integer column backward compatibility-এর জন্য।
+     * সঠিক native charge হলো billable_seconds।
+     */
+    const chargedMinutes =
+      Math.max(
+        1,
+        Math.ceil(
+          billableSeconds / 60
+        )
+      );
+
+    /*
+     * Session row lock release করা হচ্ছে।
+     * Wallet service-এর নিজস্ব transaction এবং idempotency আছে।
      */
     await client.query("COMMIT");
 
     const debit =
       await walletService.applyWalletTx({
-        userId: session.user_id,
-        currency: "USD",
+        userId:
+          session.user_id,
+
+        currency:
+          "USD",
+
         amountCents,
-        txType: "call_charge",
+
+        txType:
+          "call_charge",
 
         meta: {
-          session_id: session.id,
+          session_id:
+            session.id,
+
           to_phone_e164:
             session.to_phone_e164,
 
@@ -816,17 +1367,42 @@ async function billCompletedCallByProvider({
           route_provider_id:
             session.route_provider_id,
 
-          duration_sec:
-            safeDurationSec,
+          provider_call_id:
+            normalizedCallSid ||
+            session.provider_call_id,
+
+          actual_duration_seconds:
+            actualDurationSeconds,
+
+          billable_seconds:
+            billableSeconds,
 
           charged_minutes:
             chargedMinutes,
 
+          billing_increment_seconds:
+            billingIncrementSeconds,
+
+          minimum_duration_seconds:
+            minimumDurationSeconds,
+
           sell_rate_usd_per_min:
-            sellRate,
+            sellRateUsdPerMinute,
 
           provider_cost_rate_usd_per_min:
-            providerCostRate,
+            providerCostRateUsdPerMinute,
+
+          customer_usage_charge_usd:
+            customerUsageChargeUsd,
+
+          customer_connection_fee_usd:
+            customerConnectionFeeUsd,
+
+          provider_usage_cost_usd:
+            providerUsageCostUsd,
+
+          provider_connection_fee_usd:
+            providerConnectionFeeUsd,
 
           charged_usd:
             chargedUsd,
@@ -836,9 +1412,6 @@ async function billCompletedCallByProvider({
 
           profit_usd:
             profitUsd,
-
-          provider_call_id:
-            callSid,
         },
 
         idempotencyKey:
@@ -852,27 +1425,81 @@ async function billCompletedCallByProvider({
         SET
           status = 'failed',
           provider_status = 'completed',
+
           ended_at =
-            COALESCE(ended_at, NOW()),
+            COALESCE(
+              ended_at,
+              NOW()
+            ),
+
           duration_sec = $2,
           charged_minutes = $3,
           charged_amount_cents = $4,
+
+          provider_cost_cents = $5,
+          profit_cents = $6,
+
+          provider_cost_usd = $7,
+          charged_amount_usd = $8,
+          profit_usd = $9,
+
           billing_source =
             'wallet_debit_failed',
-          status_callback_payload = $5
-        WHERE id = $1
+
+          status_callback_payload =
+            $10::jsonb,
+
+          meta =
+            COALESCE(
+              meta,
+              '{}'::jsonb
+            ) ||
+            jsonb_build_object(
+              'billing_result',
+              jsonb_build_object(
+                'charged',
+                false,
+
+                'reason',
+                $11::text,
+
+                'actual_duration_seconds',
+                $2::integer,
+
+                'billable_seconds',
+                $12::integer
+              )
+            )
+
+        WHERE id = $1::bigint
         `,
         [
           session.id,
-          safeDurationSec,
+          actualDurationSeconds,
           chargedMinutes,
           amountCents,
-          rawPayload || {},
+
+          providerCostCents,
+          profitCents,
+
+          providerCostUsd,
+          chargedUsd,
+          profitUsd,
+
+          JSON.stringify(
+            rawPayload || {}
+          ),
+
+          debit.reason ||
+            "wallet_debit_failed",
+
+          billableSeconds,
         ]
       );
 
       return {
         ok: false,
+
         reason:
           debit.reason ||
           "wallet_debit_failed",
@@ -885,8 +1512,13 @@ async function billCompletedCallByProvider({
       SET
         status = 'charged',
         provider_status = 'completed',
+
         ended_at =
-          COALESCE(ended_at, NOW()),
+          COALESCE(
+            ended_at,
+            NOW()
+          ),
+
         duration_sec = $2,
         charged_minutes = $3,
         charged_amount_cents = $4,
@@ -900,17 +1532,65 @@ async function billCompletedCallByProvider({
         profit_usd = $10,
 
         billing_source =
-          'provider_webhook_duration',
+          'provider_webhook_dynamic_interval',
 
-        status_callback_payload = $11
+        status_callback_payload =
+          $11::jsonb,
 
-      WHERE id = $1
+        meta =
+          COALESCE(
+            meta,
+            '{}'::jsonb
+          ) ||
+          jsonb_build_object(
+            'billing_result',
+            jsonb_build_object(
+              'charged',
+              true,
+
+              'actual_duration_seconds',
+              $2::integer,
+
+              'billable_seconds',
+              $12::integer,
+
+              'billing_increment_seconds',
+              $13::integer,
+
+              'minimum_duration_seconds',
+              $14::integer,
+
+              'sell_rate_usd_per_min',
+              $15::numeric,
+
+              'customer_connection_fee_usd',
+              $16::numeric,
+
+              'provider_cost_rate_usd_per_min',
+              $17::numeric,
+
+              'provider_connection_fee_usd',
+              $18::numeric,
+
+              'charged_usd',
+              $9::numeric,
+
+              'provider_cost_usd',
+              $8::numeric,
+
+              'profit_usd',
+              $10::numeric
+            )
+          )
+
+      WHERE id = $1::bigint
       `,
       [
         session.id,
-        safeDurationSec,
+        actualDurationSeconds,
         chargedMinutes,
         amountCents,
+
         debit.tx?.id || null,
 
         providerCostCents,
@@ -920,7 +1600,19 @@ async function billCompletedCallByProvider({
         chargedUsd,
         profitUsd,
 
-        rawPayload || {},
+        JSON.stringify(
+          rawPayload || {}
+        ),
+
+        billableSeconds,
+        billingIncrementSeconds,
+        minimumDurationSeconds,
+
+        sellRateUsdPerMinute,
+        customerConnectionFeeUsd,
+
+        providerCostRateUsdPerMinute,
+        providerConnectionFeeUsd,
       ]
     );
 
@@ -931,13 +1623,28 @@ async function billCompletedCallByProvider({
         session.provider,
 
       duration_sec:
-        safeDurationSec,
+        actualDurationSeconds,
+
+      billable_seconds:
+        billableSeconds,
 
       charged_minutes:
         chargedMinutes,
 
+      billing_increment_seconds:
+        billingIncrementSeconds,
+
+      minimum_duration_seconds:
+        minimumDurationSeconds,
+
+      sell_rate_usd_per_min:
+        sellRateUsdPerMinute,
+
       charged_amount_cents:
         amountCents,
+
+      charged_amount_usd:
+        chargedUsd,
 
       provider_cost_usd:
         providerCostUsd,

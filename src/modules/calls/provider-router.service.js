@@ -164,6 +164,284 @@ function buildFailure(reason, extra = {}) {
 }
 
 /**
+ * Manual/legacy call_rates row-কে common router result-এ convert করে।
+ */
+function buildCallRateResult({
+  rate,
+  source,
+}) {
+  if (!rate) {
+    return buildFailure(
+      "rate_not_found"
+    );
+  }
+
+  if (rate.publish_rate === false) {
+    return buildFailure(
+      "destination_unpublished",
+      {
+        rate,
+
+        disabled_reason:
+          rate.disabled_reason ||
+          "Destination rate is unpublished",
+      }
+    );
+  }
+
+  const providerRate =
+    normalizePositiveNumber(
+      rate.provider_rate_usd_per_min,
+      0
+    );
+
+  const platformFee =
+    normalizePositiveNumber(
+      rate.platform_fee_usd_per_min,
+      0
+    );
+
+  const discountedRate =
+    normalizePositiveNumber(
+      rate.discounted_provider_rate_usd_per_min,
+      providerRate
+    );
+
+  const totalProviderCost =
+    discountedRate +
+    platformFee;
+
+  const sellRate = Number(
+    rate.sell_rate_usd_per_min ??
+    (
+      Number(
+        rate.price_per_min_cents || 0
+      ) / 100
+    )
+  );
+
+  if (
+    !Number.isFinite(sellRate) ||
+    sellRate <= 0
+  ) {
+    return buildFailure(
+      "invalid_sell_rate",
+      { rate }
+    );
+  }
+
+  /*
+   * Manual rate-ও provider cost-এর নিচে হতে পারবে না।
+   */
+  if (
+    totalProviderCost > 0 &&
+    sellRate <= totalProviderCost
+  ) {
+    return buildFailure(
+      "sell_rate_not_above_cost",
+      {
+        rate,
+
+        total_provider_cost_usd_per_min:
+          round6(totalProviderCost),
+      }
+    );
+  }
+
+  const maximumRate = Number(
+    rate.max_provider_rate_usd_per_min
+  );
+
+  if (
+    Number.isFinite(maximumRate) &&
+    maximumRate > 0 &&
+    providerRate > maximumRate
+  ) {
+    return buildFailure(
+      "provider_rate_above_maximum",
+      {
+        rate,
+
+        provider_rate_usd_per_min:
+          providerRate,
+
+        max_provider_rate_usd_per_min:
+          maximumRate,
+      }
+    );
+  }
+
+  const connectionFeeUsd =
+    normalizePositiveNumber(
+      rate.connection_fee_usd,
+      0
+    );
+
+  const billingIncrementSeconds =
+    Number.isInteger(
+      Number(
+        rate.billing_increment_seconds
+      )
+    ) &&
+    Number(
+      rate.billing_increment_seconds
+    ) > 0
+      ? Number(
+          rate.billing_increment_seconds
+        )
+      : 60;
+
+  const minimumDurationSeconds =
+    Number.isFinite(
+      Number(
+        rate.minimum_duration_seconds
+      )
+    ) &&
+    Number(
+      rate.minimum_duration_seconds
+    ) >= 0
+      ? Math.floor(
+          Number(
+            rate.minimum_duration_seconds
+          )
+        )
+      : 60;
+
+  return {
+    ok: true,
+    source,
+
+    provider: {
+      id:
+        rate.provider_id || null,
+
+      code:
+        String(
+          rate.provider || "telnyx"
+        ).toLowerCase(),
+
+      name:
+        rate.provider || "Telnyx",
+    },
+
+    provider_plan: {
+      id:
+        rate.provider_plan_id ||
+        null,
+    },
+
+    route: {
+      id:
+        rate.route_id || null,
+    },
+
+    route_provider:
+      null,
+
+    provider_rate: {
+      provider_rate_id:
+        rate.provider_rate_id ||
+        null,
+
+      rate_card_id:
+        rate.rate_card_id ||
+        null,
+
+      rate_card_code:
+        rate.rate_card_code ||
+        null,
+
+      raw_rate_usd_per_min:
+        round6(providerRate),
+
+      connection_fee_usd:
+        round6(connectionFeeUsd),
+
+      billing_increment_seconds:
+        billingIncrementSeconds,
+
+      minimum_duration_seconds:
+        minimumDurationSeconds,
+
+      prefix:
+        rate.prefix,
+
+      country_code:
+        rate.country_code,
+
+      country_name:
+        rate.country_name,
+
+      destination_name:
+        rate.destination_name ||
+        null,
+    },
+
+    pricing: {
+      raw_provider_rate_usd_per_min:
+        round6(providerRate),
+
+      discounted_provider_rate_usd_per_min:
+        round6(discountedRate),
+
+      platform_fee_usd_per_min:
+        round6(platformFee),
+
+      total_provider_cost_usd_per_min:
+        round6(totalProviderCost),
+
+      markup_percent:
+        Number(
+          rate.markup_percent ??
+          DEFAULT_MARKUP_PERCENT
+        ),
+
+      min_profit_usd_per_min:
+        Number(
+          rate.min_profit_usd_per_min ??
+          DEFAULT_MIN_PROFIT_USD_PER_MIN
+        ),
+
+      sell_rate_usd_per_min:
+        round6(sellRate),
+
+      expected_profit_usd_per_min:
+        round6(
+          sellRate -
+          totalProviderCost
+        ),
+
+      provider_connection_fee_usd:
+        round6(connectionFeeUsd),
+
+      /*
+       * Manual override বর্তমানে per-minute sell rate বদলায়।
+       * Provider connection fee customer charge-এর অংশ থাকবে।
+       */
+      customer_connection_fee_usd:
+        round6(connectionFeeUsd),
+
+      billing_increment_seconds:
+        billingIncrementSeconds,
+
+      minimum_duration_seconds:
+        minimumDurationSeconds,
+    },
+
+    call_rate:
+      rate,
+
+    max_provider_rate_usd_per_min:
+      Number.isFinite(maximumRate) &&
+      maximumRate > 0
+        ? maximumRate
+        : null,
+
+    rejected_providers: [],
+  };
+}
+
+/**
  * নতুন multi-provider route table ব্যবহার করে destination resolve করে।
  */
 async function resolveMultiProviderRoute(toPhoneE164) {
@@ -297,6 +575,51 @@ async function resolveMultiProviderRoute(toPhoneE164) {
         }),
     });
 
+        /*
+     * Provider CSV native billing policy pricing result-এর
+     * সঙ্গে পাঠানো হচ্ছে।
+     */
+    pricing.provider_connection_fee_usd =
+      round6(
+        normalizePositiveNumber(
+          providerRate.connection_fee_usd,
+          0
+        )
+      );
+
+    pricing.customer_connection_fee_usd =
+      pricing.provider_connection_fee_usd;
+
+    pricing.billing_increment_seconds =
+      Number.isInteger(
+        Number(
+          providerRate.billing_increment_seconds
+        )
+      ) &&
+      Number(
+        providerRate.billing_increment_seconds
+      ) > 0
+        ? Number(
+            providerRate.billing_increment_seconds
+          )
+        : 60;
+
+    pricing.minimum_duration_seconds =
+      Number.isFinite(
+        Number(
+          providerRate.minimum_duration_seconds
+        )
+      ) &&
+      Number(
+        providerRate.minimum_duration_seconds
+      ) >= 0
+        ? Math.floor(
+            Number(
+              providerRate.minimum_duration_seconds
+            )
+          )
+        : 60;
+
     if (
       pricing.sell_rate_usd_per_min <=
       pricing.total_provider_cost_usd_per_min
@@ -354,154 +677,72 @@ async function resolveMultiProviderRoute(toPhoneE164) {
 }
 
 /**
- * পুরোনো call_rates table ব্যবহার করে backward-compatible resolution।
- *
- * Route data এখনো seed/import না হওয়া পর্যন্ত Telnyx-এর working flow
- * চালু রাখার জন্য এটি প্রয়োজন।
+ * Explicit Admin manual override resolve করে।
  */
-async function resolveLegacyRate(toPhoneE164) {
+async function resolveManualOverride(
+  toPhoneE164
+) {
   const rate =
-    await repository.findLegacyCallRate(toPhoneE164);
+    await repository
+      .findManualOverrideRate(
+        toPhoneE164
+      );
 
   if (!rate) {
-    return buildFailure("rate_not_found");
-  }
-
-  if (rate.publish_rate === false) {
-    return buildFailure("destination_unpublished", {
-      rate,
-      disabled_reason: rate.disabled_reason,
-    });
-  }
-
-  const providerRate = Number(
-    rate.provider_rate_usd_per_min || 0
-  );
-
-  const sellRate = Number(
-    rate.sell_rate_usd_per_min ||
-      Number(rate.price_per_min_cents || 0) / 100
-  );
-
-  const platformFee = Number(
-    rate.platform_fee_usd_per_min || 0
-  );
-
-  const discountedRate = Number(
-    rate.discounted_provider_rate_usd_per_min ||
-      providerRate
-  );
-
-  const totalCost =
-    discountedRate + platformFee;
-
-  if (
-    !Number.isFinite(sellRate) ||
-    sellRate <= 0
-  ) {
-    return buildFailure("invalid_sell_rate", {
-      rate,
-    });
-  }
-
-  if (
-    Number.isFinite(totalCost) &&
-    totalCost > 0 &&
-    sellRate <= totalCost
-  ) {
-    return buildFailure("sell_rate_not_above_cost", {
-      rate,
-      total_provider_cost_usd_per_min:
-        round6(totalCost),
-    });
-  }
-
-  const maximumRate = Number(
-    rate.max_provider_rate_usd_per_min
-  );
-
-  if (
-    Number.isFinite(maximumRate) &&
-    maximumRate > 0 &&
-    providerRate > maximumRate
-  ) {
     return buildFailure(
-      "provider_rate_above_maximum",
-      {
-        rate,
-        provider_rate_usd_per_min:
-          providerRate,
-        max_provider_rate_usd_per_min:
-          maximumRate,
-      }
+      "manual_override_not_found"
     );
   }
 
-  return {
-    ok: true,
-    source: "legacy_call_rates",
-    provider: {
-      id: rate.provider_id || null,
-      code: rate.provider || "telnyx",
-      name: rate.provider || "Telnyx",
-    },
-    provider_plan: {
-      id: rate.provider_plan_id || null,
-    },
-    route: {
-      id: rate.route_id || null,
-    },
-    route_provider: null,
-    provider_rate: {
-      provider_rate_id:
-        rate.provider_rate_id || null,
-      raw_rate_usd_per_min: providerRate,
-      prefix: rate.prefix,
-      country_code: rate.country_code,
-      country_name: rate.country_name,
-    },
-    pricing: {
-      raw_provider_rate_usd_per_min:
-        round6(providerRate),
-      discounted_provider_rate_usd_per_min:
-        round6(discountedRate),
-      platform_fee_usd_per_min:
-        round6(platformFee),
-      total_provider_cost_usd_per_min:
-        round6(totalCost),
-      markup_percent: Number(
-        rate.markup_percent || 25
-      ),
-      min_profit_usd_per_min: Number(
-        rate.min_profit_usd_per_min || 0
-      ),
-      sell_rate_usd_per_min:
-        round6(sellRate),
-      expected_profit_usd_per_min:
-        round6(sellRate - totalCost),
-    },
-    call_rate: rate,
-    max_provider_rate_usd_per_min:
-      Number.isFinite(maximumRate) &&
-      maximumRate > 0
-        ? maximumRate
-        : null,
-    rejected_providers: [],
-  };
+  return buildCallRateResult({
+    rate,
+    source:
+      "manual_rate_override",
+  });
+}
+
+/**
+ * Existing automatic call_rates backward-compatible fallback।
+ */
+async function resolveLegacyRate(
+  toPhoneE164
+) {
+  const rate =
+    await repository
+      .findLegacyCallRate(
+        toPhoneE164
+      );
+
+  if (!rate) {
+    return buildFailure(
+      "rate_not_found"
+    );
+  }
+
+  return buildCallRateResult({
+    rate,
+    source:
+      "legacy_call_rates",
+  });
 }
 
 /**
  * Main destination resolver.
  *
- * Priority:
+ * Final priority:
  * 1. Destination disabled policy
- * 2. Multi-provider route
- * 3. Existing call_rates backward-compatible fallback
+ * 2. Explicit Admin manual override
+ * 3. Dynamic multi-provider CSV rate
+ * 4. Automatic legacy fallback
+ * 5. Fail safely
  */
-async function resolveDestination(toPhoneE164) {
-  const phone = repository.cleanPhone(
-    toPhoneE164
-  );
+async function resolveDestination(
+  toPhoneE164
+) {
+  const phone =
+    repository.cleanPhone(
+      toPhoneE164
+    );
 
   if (!phone) {
     return buildFailure(
@@ -509,44 +750,93 @@ async function resolveDestination(toPhoneE164) {
     );
   }
 
+  /*
+   * Disabled destination কোনো manual override দিয়েও
+   * bypass করা যাবে না।
+   */
   const destinationPolicy =
-    await repository.findDestinationPolicy(
-      toPhoneE164
-    );
+    await repository
+      .findDestinationPolicy(
+        toPhoneE164
+      );
 
   if (
     destinationPolicy &&
     destinationPolicy.is_enabled === false
   ) {
-    return buildFailure("destination_disabled", {
-      destination_policy:
-        destinationPolicy,
-      disabled_reason:
-        destinationPolicy.disabled_reason ||
-        "Destination is disabled",
-    });
+    return buildFailure(
+      "destination_disabled",
+      {
+        destination_policy:
+          destinationPolicy,
+
+        disabled_reason:
+          destinationPolicy
+            .disabled_reason ||
+          "Destination is disabled",
+      }
+    );
   }
 
+  /*
+   * Admin explicit manual rate সর্বোচ্চ pricing priority।
+   */
+  const manualResult =
+    await resolveManualOverride(
+      toPhoneE164
+    );
+
+  if (manualResult.ok) {
+    return {
+      ...manualResult,
+
+      destination_policy:
+        destinationPolicy,
+    };
+  }
+
+  /*
+   * Provider CSV dynamic route।
+   */
   const multiProviderResult =
     await resolveMultiProviderRoute(
       toPhoneE164
     );
 
   if (multiProviderResult.ok) {
-    return multiProviderResult;
+    return {
+      ...multiProviderResult,
+
+      manual_override_result:
+        manualResult,
+    };
   }
 
+  /*
+   * Existing automatic call_rates fallback।
+   */
   const legacyResult =
-    await resolveLegacyRate(toPhoneE164);
+    await resolveLegacyRate(
+      toPhoneE164
+    );
 
   if (legacyResult.ok) {
     return {
       ...legacyResult,
+
+      destination_policy:
+        destinationPolicy,
+
       router_fallback_reason:
         multiProviderResult.reason,
+
       router_rejected_providers:
-        multiProviderResult.rejected_providers ||
+        multiProviderResult
+          .rejected_providers ||
         [],
+
+      manual_override_result:
+        manualResult,
     };
   }
 
@@ -558,9 +848,15 @@ async function resolveDestination(toPhoneE164) {
     {
       destination_policy:
         destinationPolicy,
+
+      manual_override_result:
+        manualResult,
+
       multi_provider_result:
         multiProviderResult,
-      legacy_result: legacyResult,
+
+      legacy_result:
+        legacyResult,
     }
   );
 }
@@ -568,6 +864,7 @@ async function resolveDestination(toPhoneE164) {
 module.exports = {
   calculatePricing,
   resolveDestination,
+  resolveManualOverride,
   resolveMultiProviderRoute,
   resolveLegacyRate,
 };
