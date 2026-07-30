@@ -15,20 +15,90 @@ async function me(req, res) {
   try {
     const userId = Number(req.user.id);
 
-    await walletService.ensureWallet(userId, "USD");
+    if (
+      !Number.isInteger(userId) ||
+      userId <= 0
+    ) {
+      return res.status(401).json({
+        ok: false,
+        message: "Unauthorized user",
+      });
+    }
 
+    await walletService.ensureWallet(
+      userId,
+      "USD"
+    );
+
+    /*
+     * Wallet balance-এর সঙ্গে user-এর সর্বশেষ valid
+     * destination sell rate নেওয়া হচ্ছে।
+     *
+     * এতে app reinstall, logout/login বা device change হলেও
+     * estimated minutes হারাবে না।
+     */
     const q = `
       SELECT
         w.user_id,
         w.currency,
         w.balance_cents,
-        w.updated_at
+        w.updated_at,
+
+        latest_call.id
+          AS latest_call_session_id,
+
+        latest_call.to_phone_e164
+          AS latest_call_to_phone_e164,
+
+        latest_call.sell_rate_usd_per_min
+          AS latest_sell_rate_usd_per_min,
+
+        latest_call.created_at
+          AS latest_call_created_at,
+
+        latest_call.meta->>'matched_prefix'
+          AS latest_matched_prefix
+
       FROM wallets w
+
+      LEFT JOIN LATERAL
+      (
+        SELECT
+          cs.id,
+          cs.to_phone_e164,
+          cs.sell_rate_usd_per_min,
+          cs.created_at,
+          cs.meta
+
+        FROM call_sessions cs
+
+        WHERE cs.user_id = w.user_id
+
+          AND cs.sell_rate_usd_per_min
+                IS NOT NULL
+
+          AND cs.sell_rate_usd_per_min > 0
+
+          AND COALESCE(
+                cs.status,
+                ''
+              ) <> 'failed'
+
+        ORDER BY
+          cs.created_at DESC,
+          cs.id DESC
+
+        LIMIT 1
+      ) latest_call
+        ON TRUE
+
       WHERE w.user_id = $1
+
       LIMIT 1;
     `;
 
-    const { rows } = await db.query(q, [userId]);
+    const { rows } =
+      await db.query(q, [userId]);
 
     if (!rows.length) {
       return res.status(404).json({
@@ -37,16 +107,62 @@ async function me(req, res) {
       });
     }
 
+    const row = rows[0];
+
+    const sellRate =
+      Number(
+        row.latest_sell_rate_usd_per_min
+      );
+
     return res.json({
       ok: true,
-      wallet: rows[0],
-    });
 
+      wallet: {
+        user_id:
+          row.user_id,
+
+        currency:
+          row.currency,
+
+        balance_cents:
+          row.balance_cents,
+
+        updated_at:
+          row.updated_at,
+      },
+
+      estimated_call_rate:
+        Number.isFinite(sellRate) &&
+        sellRate > 0
+          ? {
+              sell_rate_usd_per_min:
+                sellRate,
+
+              to_phone_e164:
+                row.latest_call_to_phone_e164,
+
+              matched_prefix:
+                row.latest_matched_prefix,
+
+              call_session_id:
+                row.latest_call_session_id,
+
+              rate_saved_at:
+                row.latest_call_created_at,
+            }
+          : null,
+    });
   } catch (e) {
-    console.error("wallet/me error:", e);
+    console.error(
+      "wallet/me error:",
+      e
+    );
+
     return res.status(500).json({
       ok: false,
-      message: e.message,
+      message:
+        e.message ||
+        "Unable to load wallet",
     });
   }
 }
