@@ -53,8 +53,8 @@ async function me(req, res) {
         latest_call.sell_rate_usd_per_min
           AS latest_sell_rate_usd_per_min,
 
-        latest_call.created_at
-          AS latest_call_created_at,
+       latest_call.started_at
+        AS latest_call_started_at,
 
         latest_call.meta->>'matched_prefix'
           AS latest_matched_prefix
@@ -67,7 +67,7 @@ async function me(req, res) {
           cs.id,
           cs.to_phone_e164,
           cs.sell_rate_usd_per_min,
-          cs.created_at,
+          cs.started_at,
           cs.meta
 
         FROM call_sessions cs
@@ -85,7 +85,7 @@ async function me(req, res) {
               ) <> 'failed'
 
         ORDER BY
-          cs.created_at DESC,
+        cs.started_at DESC,
           cs.id DESC
 
         LIMIT 1
@@ -148,7 +148,7 @@ async function me(req, res) {
                 row.latest_call_session_id,
 
               rate_saved_at:
-                row.latest_call_created_at,
+                row.latest_call_started_at,
             }
           : null,
     });
