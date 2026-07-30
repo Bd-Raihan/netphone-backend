@@ -267,10 +267,26 @@ function toBooleanOrNull(value) {
 function makeRateCardCode(
   providerCode,
   planCode,
-  checksum
+  checksum,
+  uniqueSuffix = ""
 ) {
+  const suffix = String(
+    uniqueSuffix || ""
+  )
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
   return (
-    `${providerCode}-${planCode}-${checksum.slice(0, 16)}`
+    [
+      providerCode,
+      planCode,
+      checksum.slice(0, 16),
+      suffix,
+    ]
+      .filter(Boolean)
+      .join("-")
       .toLowerCase()
       .replace(/[^a-z0-9_-]+/g, "-")
       .replace(/^-+|-+$/g, "")
@@ -1883,11 +1899,15 @@ async function importProviderRateDeck({
     }
 
     const rateCardCode =
-      makeRateCardCode(
-        provider.code,
-        plan.code,
-        checksum
-      );
+    makeRateCardCode(
+    provider.code,
+    plan.code,
+    checksum,
+
+    allowDuplicateChecksum
+      ? Date.now().toString(36)
+      : ""
+    );
 
     rateCard =
       await createStagingRateCard(
