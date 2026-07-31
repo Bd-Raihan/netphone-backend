@@ -1,351 +1,372 @@
 /**
  * otp-provider.service.js
  * --------------------------------------------------
- * NetPhone OTP Provider Adapter
+ * NetPhone Telnyx Verify OTP Provider
  *
- * এই file-এর দায়িত্ব:
+ * দায়িত্ব:
+ * 1. Telnyx Verify দিয়ে SMS OTP পাঠানো
+ * 2. Telnyx Verify দিয়ে OTP যাচাই করা
+ * 3. Auth controller-কে provider-specific code থেকে আলাদা রাখা
  *
- * 1. Auth module-কে OTP provider থেকে আলাদা রাখা
- * 2. বর্তমানে Twilio Verify দিয়ে OTP পাঠানো ও যাচাই করা
- * 3. ভবিষ্যতে Telnyx Verify migration সহজ করা
- *
- * Current:
- * OTP_PROVIDER=twilio
- *
- * Future:
- * OTP_PROVIDER=telnyx
- *
- * গুরুত্বপূর্ণ:
  * Voice calling-এর সঙ্গে এই service-এর কোনো সম্পর্ক নেই।
  */
 
-const TWILIO_VERIFY_BASE_URL =
-  "https://verify.twilio.com/v2";
-
-/* =========================================================
- * SECTION 1
- * Provider selection
- * ========================================================= */
+const TELNYX_API_BASE_URL =
+  "https://api.telnyx.com/v2";
 
 /**
- * Current OTP provider।
- *
- * .env-এ OTP_PROVIDER না থাকলে সাময়িকভাবে Twilio ব্যবহার হবে।
+ * প্রয়োজনীয় Telnyx Verify configuration যাচাই করে।
  */
-function getOtpProvider() {
-  return String(
-    process.env.OTP_PROVIDER || "twilio"
-  )
-    .trim()
-    .toLowerCase();
-}
+function getTelnyxVerifyConfig() {
+  const apiKey = String(
+    process.env.TELNYX_API_KEY || ""
+  ).trim();
 
-/* =========================================================
- * SECTION 2
- * Twilio Verify configuration
- * ========================================================= */
-
-function getTwilioConfig() {
-  const accountSid =
-    process.env.TWILIO_ACCOUNT_SID;
-
-  const authToken =
-    process.env.TWILIO_AUTH_TOKEN;
-
-  const verifyServiceSid =
-    process.env.TWILIO_VERIFY_SERVICE_SID ||
-    process.env.TWILIO_SERVICE_SID;
+  const verifyProfileId = String(
+    process.env.TELNYX_VERIFY_PROFILE_ID || ""
+  ).trim();
 
   const missing = [];
 
-  if (!accountSid) {
-    missing.push("TWILIO_ACCOUNT_SID");
+  if (!apiKey) {
+    missing.push("TELNYX_API_KEY");
   }
 
-  if (!authToken) {
-    missing.push("TWILIO_AUTH_TOKEN");
-  }
-
-  if (!verifyServiceSid) {
+  if (!verifyProfileId) {
     missing.push(
-      "TWILIO_VERIFY_SERVICE_SID"
+      "TELNYX_VERIFY_PROFILE_ID"
     );
   }
 
   if (missing.length > 0) {
-    throw new Error(
-      `Twilio Verify configuration missing: ${missing.join(
+    const error = new Error(
+      `Telnyx Verify configuration missing: ${missing.join(
         ", "
       )}`
     );
-  }
 
-  return {
-    accountSid,
-    authToken,
-    verifyServiceSid,
-  };
-}
-
-/**
- * Twilio Verify API request helper।
- *
- * npm twilio package প্রয়োজন নেই।
- * Node.js built-in fetch ব্যবহার করা হচ্ছে।
- */
-async function twilioVerifyRequest({
-  path,
-  form,
-}) {
-  const {
-    accountSid,
-    authToken,
-  } = getTwilioConfig();
-
-  const basicAuth = Buffer.from(
-    `${accountSid}:${authToken}`,
-    "utf8"
-  ).toString("base64");
-
-  const response = await fetch(
-    `${TWILIO_VERIFY_BASE_URL}${path}`,
-    {
-      method: "POST",
-
-      headers: {
-        Authorization:
-          `Basic ${basicAuth}`,
-
-        "Content-Type":
-          "application/x-www-form-urlencoded",
-
-        Accept: "application/json",
-      },
-
-      body: new URLSearchParams(form)
-        .toString(),
-    }
-  );
-
-  const responseText =
-    await response.text();
-
-  let result = {};
-
-  if (responseText) {
-    try {
-      result =
-        JSON.parse(responseText);
-    } catch {
-      result = {
-        message: responseText,
-      };
-    }
-  }
-
-  if (!response.ok) {
-    const message =
-      result?.message ||
-      result?.detail ||
-      `Twilio Verify request failed with status ${response.status}`;
-
-    const error = new Error(message);
-
-    error.statusCode =
-      response.status;
-
-    error.provider =
-      "twilio";
-
-    error.providerResponse =
-      result;
+    error.statusCode = 500;
+    error.code =
+      "TELNYX_VERIFY_CONFIG_MISSING";
+    error.provider = "telnyx";
 
     throw error;
   }
 
-  return result;
-}
-
-/* =========================================================
- * SECTION 3
- * Twilio Verify implementation
- * ========================================================= */
-
-/**
- * Twilio Verify দিয়ে SMS OTP পাঠায়।
- */
-async function sendOtpWithTwilio({
-  to,
-}) {
-  const {
-    verifyServiceSid,
-  } = getTwilioConfig();
-
-  const result =
-    await twilioVerifyRequest({
-      path:
-        `/Services/${encodeURIComponent(
-          verifyServiceSid
-        )}/Verifications`,
-
-      form: {
-        To: to,
-        Channel: "sms",
-      },
-    });
-
   return {
-    ok:
-      result.status === "pending",
-
-    provider:
-      "twilio",
-
-    status:
-      result.status || null,
-
-    verification_sid:
-      result.sid || null,
+    apiKey,
+    verifyProfileId,
   };
 }
 
 /**
- * Twilio Verify দিয়ে user-এর OTP code যাচাই করে।
+ * E.164 phone number basic validation।
  */
-async function checkOtpWithTwilio({
+function validatePhoneE164(phone) {
+  const normalizedPhone =
+    String(phone || "").trim();
+
+  if (
+    !/^\+\d{7,19}$/.test(
+      normalizedPhone
+    )
+  ) {
+    const error = new Error(
+      "Phone number must be in E.164 format"
+    );
+
+    error.statusCode = 400;
+    error.code =
+      "INVALID_PHONE_E164";
+    error.provider = "telnyx";
+
+    throw error;
+  }
+
+  return normalizedPhone;
+}
+
+/**
+ * Telnyx API request helper।
+ *
+ * কোনো নতুন npm package লাগবে না।
+ * Node.js built-in fetch ব্যবহার করা হচ্ছে।
+ */
+async function telnyxVerifyRequest({
+  path,
+  body,
+}) {
+  const { apiKey } =
+    getTelnyxVerifyConfig();
+
+  const controller =
+    new AbortController();
+
+  const timeout = setTimeout(
+    () => controller.abort(),
+    15000
+  );
+
+  try {
+    const response = await fetch(
+      `${TELNYX_API_BASE_URL}${path}`,
+      {
+        method: "POST",
+
+        headers: {
+          Authorization:
+            `Bearer ${apiKey}`,
+
+          "Content-Type":
+            "application/json",
+
+          Accept:
+            "application/json",
+        },
+
+        body: JSON.stringify(body),
+
+        signal: controller.signal,
+      }
+    );
+
+    const responseText =
+      await response.text();
+
+    let result = {};
+
+    if (responseText) {
+      try {
+        result =
+          JSON.parse(responseText);
+      } catch {
+        result = {
+          message: responseText,
+        };
+      }
+    }
+
+    if (!response.ok) {
+      const firstError =
+        Array.isArray(result?.errors)
+          ? result.errors[0]
+          : null;
+
+      const message =
+        firstError?.detail ||
+        firstError?.title ||
+        result?.detail ||
+        result?.message ||
+        `Telnyx Verify request failed with status ${response.status}`;
+
+      const error =
+        new Error(message);
+
+      error.statusCode =
+        response.status;
+
+      error.code =
+        firstError?.code ||
+        result?.code ||
+        "TELNYX_VERIFY_REQUEST_FAILED";
+
+      error.provider =
+        "telnyx";
+
+      error.providerResponse =
+        result;
+
+      throw error;
+    }
+
+    return result;
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      const timeoutError =
+        new Error(
+          "Telnyx Verify request timed out"
+        );
+
+      timeoutError.statusCode = 504;
+      timeoutError.code =
+        "TELNYX_VERIFY_TIMEOUT";
+      timeoutError.provider =
+        "telnyx";
+
+      throw timeoutError;
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
+ * Telnyx Verify দিয়ে SMS OTP পাঠায়।
+ */
+async function sendOtpWithTelnyx({
+  to,
+}) {
+  const phoneNumber =
+    validatePhoneE164(to);
+
+  const {
+    verifyProfileId,
+  } = getTelnyxVerifyConfig();
+
+  const result =
+    await telnyxVerifyRequest({
+      path:
+        "/verifications/sms",
+
+      body: {
+        phone_number:
+          phoneNumber,
+
+        verify_profile_id:
+          verifyProfileId,
+      },
+    });
+
+  const data =
+    result?.data || {};
+
+  const pending =
+    data.status === "pending";
+
+  return {
+    ok: pending,
+
+    provider:
+      "telnyx",
+
+    status:
+      data.status || null,
+
+    verification_id:
+      data.id || null,
+
+    phone_number:
+      data.phone_number ||
+      phoneNumber,
+
+    timeout_secs:
+      Number(
+        data.timeout_secs || 0
+      ),
+  };
+}
+
+/**
+ * Telnyx Verify দিয়ে OTP code যাচাই করে।
+ */
+async function checkOtpWithTelnyx({
   to,
   code,
 }) {
+  const phoneNumber =
+    validatePhoneE164(to);
+
+  const normalizedCode =
+    String(code || "").trim();
+
+  if (
+    !/^\d{4,10}$/.test(
+      normalizedCode
+    )
+  ) {
+    return {
+      ok: false,
+      provider: "telnyx",
+      status: "rejected",
+      valid: false,
+      reason:
+        "invalid_code_format",
+    };
+  }
+
   const {
-    verifyServiceSid,
-  } = getTwilioConfig();
+    verifyProfileId,
+  } = getTelnyxVerifyConfig();
+
+  const encodedPhone =
+    encodeURIComponent(
+      phoneNumber
+    );
 
   const result =
-    await twilioVerifyRequest({
+    await telnyxVerifyRequest({
       path:
-        `/Services/${encodeURIComponent(
-          verifyServiceSid
-        )}/VerificationCheck`,
+        `/verifications/by_phone_number/${encodedPhone}/actions/verify`,
 
-      form: {
-        To: to,
-        Code: code,
+      body: {
+        code:
+          normalizedCode,
+
+        verify_profile_id:
+          verifyProfileId,
       },
     });
 
-  const approved =
-    result.status === "approved" &&
-    result.valid !== false;
+  const data =
+    result?.data || {};
+
+  const responseCode =
+    String(
+      data.response_code || ""
+    )
+      .trim()
+      .toLowerCase();
+
+  const accepted =
+    responseCode === "accepted";
 
   return {
-    ok: approved,
+    ok: accepted,
 
     provider:
-      "twilio",
+      "telnyx",
 
     status:
-      result.status || null,
+      responseCode || null,
 
     valid:
-      approved,
+      accepted,
 
-    verification_sid:
-      result.sid || null,
+    reason:
+      accepted
+        ? null
+        : responseCode ||
+          "invalid_or_expired",
+
+    phone_number:
+      data.phone_number ||
+      phoneNumber,
   };
 }
 
-/* =========================================================
- * SECTION 4
- * Future Telnyx OTP placeholders
- * ========================================================= */
-
 /**
- * ভবিষ্যৎ Telnyx Verify migration এখানেই implement হবে।
+ * Provider-neutral public interface।
  *
- * Auth controller বা Flutter পরিবর্তন করতে হবে না।
- */
-async function sendOtpWithTelnyx() {
-  const error = new Error(
-    "Telnyx OTP provider is not configured yet"
-  );
-
-  error.statusCode = 503;
-  error.code =
-    "TELNYX_OTP_NOT_CONFIGURED";
-
-  throw error;
-}
-
-async function checkOtpWithTelnyx() {
-  const error = new Error(
-    "Telnyx OTP provider is not configured yet"
-  );
-
-  error.statusCode = 503;
-  error.code =
-    "TELNYX_OTP_NOT_CONFIGURED";
-
-  throw error;
-}
-
-/* =========================================================
- * SECTION 5
- * Public provider-neutral interface
- * ========================================================= */
-
-/**
- * Auth controller এই generic function call করবে।
+ * auth.controller.js এই functions-ই ব্যবহার করবে।
  */
 async function sendOtpSms({
   to,
 }) {
-  const provider =
-    getOtpProvider();
-
-  if (provider === "twilio") {
-    return sendOtpWithTwilio({
-      to,
-    });
-  }
-
-  if (provider === "telnyx") {
-    return sendOtpWithTelnyx({
-      to,
-    });
-  }
-
-  throw new Error(
-    `Unsupported OTP provider: ${provider}`
-  );
+  return sendOtpWithTelnyx({
+    to,
+  });
 }
 
-/**
- * Auth controller এই generic function call করবে।
- */
 async function checkOtpVerify({
   to,
   code,
 }) {
-  const provider =
-    getOtpProvider();
-
-  if (provider === "twilio") {
-    return checkOtpWithTwilio({
-      to,
-      code,
-    });
-  }
-
-  if (provider === "telnyx") {
-    return checkOtpWithTelnyx({
-      to,
-      code,
-    });
-  }
-
-  throw new Error(
-    `Unsupported OTP provider: ${provider}`
-  );
+  return checkOtpWithTelnyx({
+    to,
+    code,
+  });
 }
 
 module.exports = {

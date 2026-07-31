@@ -14,8 +14,7 @@ const { requestOtpSchema, verifyOtpSchema } = require("./auth.validation");
 /**
  * Provider-neutral OTP adapter।
  *
- * বর্তমানে Twilio Verify;
- * ভবিষ্যতে Telnyx Verify হবে।
+ * Telnyx Verify হবে।
  */
 const {
   sendOtpSms,
@@ -52,7 +51,7 @@ async function requestOtp(req, res) {
     let user = await findUserByPhone(phone);
     if (!user) user = await createUserWithWallet(phone);
 
-    // ✅ Production: OTP SMS sent by Twilio, OTP code response এ দেওয়া হবে না
+    // ✅ Production: OTP SMS sent by Telnyx, OTP code response এ দেওয়া হবে না
     const smsResult = await sendOtpSms({ to: phone });
     if (!smsResult.ok) {
       return res.status(500).json({ ok: false, message: "Failed to send OTP" });
