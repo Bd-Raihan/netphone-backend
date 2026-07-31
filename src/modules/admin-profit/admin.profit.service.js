@@ -77,7 +77,13 @@ async function getProfitSummary() {
         ),
         0
       )
-        AS profit_percent
+        AS profit_percent,
+
+      (
+        SELECT COUNT(*)::int
+        FROM users
+      )
+        AS total_registered_numbers
 
     FROM call_sessions
 
@@ -134,7 +140,14 @@ async function getTodayProfit() {
         ),
         0
       )
-        AS profit_percent
+        AS profit_percent,
+
+      (
+        SELECT COUNT(*)::int
+        FROM users
+        WHERE created_at >= CURRENT_DATE
+      )
+        AS total_registered_numbers
 
     FROM call_sessions
 
