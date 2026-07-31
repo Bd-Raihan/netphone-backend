@@ -128,20 +128,54 @@ async function getCallCountrySummary() {
 
 async function getRegisteredUserSummary() {
   const result = await db.query(`
+    WITH verified_users AS (
+      SELECT
+        u.id,
+        u.status,
+
+        COALESCE(
+          NULLIF(vpr.country_code, ''),
+          NULLIF(u.country_code, ''),
+          'Unknown'
+        ) AS resolved_country_code
+
+      FROM users u
+
+      LEFT JOIN LATERAL (
+        SELECT
+          r.country_code,
+          r.country_name
+        FROM voice_provider_rates r
+        WHERE REPLACE(u.phone_e164, '+', '') LIKE r.prefix || '%'
+        ORDER BY
+          LENGTH(r.prefix) DESC,
+          r.id ASC
+        LIMIT 1
+      ) vpr ON TRUE
+
+      WHERE u.phone_verified_at IS NOT NULL
+    )
+
     SELECT
       COUNT(*)::int AS total_registered_numbers,
-      COUNT(DISTINCT COALESCE(NULLIF(country_code, ''), 'Unknown'))::int
-        AS unique_registration_countries,
+
+      COUNT(
+        DISTINCT resolved_country_code
+      )::int AS unique_registration_countries,
+
       COUNT(*) FILTER (
         WHERE status = 'active'
-          AND last_login_at >= NOW() - INTERVAL '30 days'
       )::int AS active_users,
+
       COUNT(*) FILTER (
-        WHERE status = 'active'
-          AND (last_login_at IS NULL OR last_login_at < NOW() - INTERVAL '30 days')
+        WHERE status = 'inactive'
       )::int AS inactive_users,
-      COUNT(*) FILTER (WHERE status <> 'active')::int AS blocked_users
-    FROM users
+
+      COUNT(*) FILTER (
+        WHERE status = 'blocked'
+      )::int AS blocked_users
+
+    FROM verified_users
   `);
 
   return result.rows[0];
@@ -161,9 +195,10 @@ async function getRegisteredUsers() {
       u.created_at AS registered_at,
       u.last_login_at,
       CASE
-        WHEN u.status <> 'active' THEN 'Blocked'
-        WHEN u.last_login_at >= NOW() - INTERVAL '30 days' THEN 'Active'
-        ELSE 'Inactive'
+        WHEN u.status = 'blocked' THEN 'Blocked'
+        WHEN u.status = 'inactive' THEN 'Inactive'
+        WHEN u.status = 'active' THEN 'Active'
+        ELSE INITCAP(COALESCE(u.status, 'inactive'))
       END AS activity_status
     FROM users u
     LEFT JOIN LATERAL (
@@ -173,6 +208,7 @@ async function getRegisteredUsers() {
       ORDER BY LENGTH(r.prefix) DESC, r.id ASC
       LIMIT 1
     ) vpr ON TRUE
+     WHERE u.phone_verified_at IS NOT NULL
     ORDER BY u.created_at DESC, u.id DESC
   `);
 

@@ -39,14 +39,19 @@ async function createUserWithWallet(phone) {
   }
 }
 
-async function markUserLogin(userId) {
+async function markUserVerifiedLogin(userId) {
   const { rows } = await db.query(
-    `UPDATE users
-     SET last_login_at = NOW()
-     WHERE id = $1
-     RETURNING *`,
+    `
+      UPDATE users
+      SET
+        phone_verified_at = NOW(),
+        last_login_at = NOW()
+      WHERE id = $1
+      RETURNING *
+    `,
     [userId]
   );
+
   return rows[0];
 }
 
@@ -85,7 +90,7 @@ async function verifyOtp(phone, code) {
 module.exports = {
   findUserByPhone,
   createUserWithWallet,
-  markUserLogin,
+  markUserVerifiedLogin,
   createOtp,
   verifyOtp,
 };

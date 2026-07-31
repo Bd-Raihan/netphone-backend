@@ -9,7 +9,7 @@ const jwt = require("jsonwebtoken");
 const {
   findUserByPhone,
   createUserWithWallet,
-  markUserLogin,
+  markUserVerifiedLogin,
 } = require("./auth.service");
 const { requestOtpSchema, verifyOtpSchema } = require("./auth.validation");
 /**
@@ -48,9 +48,7 @@ async function requestOtp(req, res) {
     }
 
     const phone = parsed.data.phone_e164;
-    // ✅ user ensure
-    let user = await findUserByPhone(phone);
-    if (!user) user = await createUserWithWallet(phone);
+    
 
     // ✅ Production: OTP SMS sent by Telnyx, OTP code response এ দেওয়া হবে না
     const smsResult = await sendOtpSms({ to: phone });
@@ -58,12 +56,11 @@ async function requestOtp(req, res) {
       return res.status(500).json({ ok: false, message: "Failed to send OTP" });
     }
 
-    return res.json({
-      ok: true,
-      message: "OTP sent successfully",
-
-      user: { id: user.id, phone: user.phone_e164 },
-});
+   return res.json({
+    ok: true,
+    message: "OTP sent successfully",
+    phone_e164: phone,
+  });
   } catch (err) {
     return sendServerError(res, err, "requestOtp");
   }
@@ -98,7 +95,7 @@ if (!result.ok) {
     }
 
     // Successful OTP login activity snapshot
-    user = await markUserLogin(user.id);
+    user = await markUserVerifiedLogin(user.id);
 
     // ✅ Secrets check (dev-friendly)
     if (!process.env.JWT_ACCESS_SECRET || !process.env.JWT_REFRESH_SECRET) {
