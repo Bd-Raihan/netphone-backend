@@ -9,6 +9,7 @@ const jwt = require("jsonwebtoken");
 const {
   findUserByPhone,
   createUserWithWallet,
+  markUserLogin,
 } = require("./auth.service");
 const { requestOtpSchema, verifyOtpSchema } = require("./auth.validation");
 /**
@@ -95,6 +96,9 @@ if (!result.ok) {
     if (user.status !== "active") {
       return res.status(403).json({ ok: false, message: "User blocked" });
     }
+
+    // Successful OTP login activity snapshot
+    user = await markUserLogin(user.id);
 
     // ✅ Secrets check (dev-friendly)
     if (!process.env.JWT_ACCESS_SECRET || !process.env.JWT_REFRESH_SECRET) {

@@ -2,25 +2,34 @@ const service = require("./admin.profit.service");
 
 async function dashboard(req, res, next) {
   try {
-    const [summary, today, countryWise, userCountryWise] = await Promise.all([
+    const [
+      summary,
+      today,
+      callDetails,
+      callCountrySummary,
+      registeredUserSummary,
+      registeredUsers,
+    ] = await Promise.all([
       service.getProfitSummary(),
-      service.getTodayProfit(),
-      service.getCountryWiseProfit(),
-      service.getUserCountryWiseProfit(),
+      service.getProfitSummary({ todayOnly: true }),
+      service.getCallWiseProfitDetails(),
+      service.getCallCountrySummary(),
+      service.getRegisteredUserSummary(),
+      service.getRegisteredUsers(),
     ]);
 
     return res.json({
       ok: true,
       summary,
       today,
-      country_wise: countryWise,
-      user_country_wise: userCountryWise,
+      call_details: callDetails,
+      call_country_summary: callCountrySummary,
+      registered_user_summary: registeredUserSummary,
+      registered_users: registeredUsers,
     });
   } catch (err) {
     next(err);
   }
 }
 
-module.exports = {
-  dashboard,
-};
+module.exports = { dashboard };
