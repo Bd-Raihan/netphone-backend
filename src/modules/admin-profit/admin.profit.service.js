@@ -1,18 +1,86 @@
 const db = require("../../config/db");
 
+/**
+ * Weighted average customer sell rate।
+ *
+ * Formula:
+ * SUM(sell rate × charged minutes) / SUM(charged minutes)
+ *
+ * পুরোনো session-এ sell_rate missing হলে:
+ * charged_amount_usd / charged_minutes fallback ব্যবহার হবে।
+ */
+const averageSellRateSql = `
+  COALESCE(
+    ROUND(
+      SUM(
+        COALESCE(
+          sell_rate_usd_per_min,
+          CASE
+            WHEN charged_minutes > 0
+            THEN charged_amount_usd / charged_minutes
+            ELSE 0
+          END
+        ) * charged_minutes
+      )
+      /
+      NULLIF(SUM(charged_minutes), 0),
+      5
+    ),
+    0
+  )
+`;
+
 async function getProfitSummary() {
   const result = await db.query(`
     SELECT
-      COUNT(*)::int AS total_calls,
-      COALESCE(SUM(charged_minutes), 0)::int AS total_minutes,
-      COALESCE(SUM(charged_amount_usd), 0)::numeric(12,5) AS total_revenue,
-      COALESCE(SUM(provider_cost_usd), 0)::numeric(12,5) AS total_provider_cost,
-      COALESCE(SUM(profit_usd), 0)::numeric(12,5) AS total_profit,
+      COUNT(*)::int
+        AS total_calls,
+
       COALESCE(
-        ROUND((SUM(profit_usd) / NULLIF(SUM(charged_amount_usd), 0)) * 100, 2),
+        SUM(charged_minutes),
         0
-      ) AS profit_percent
+      )::int
+        AS total_minutes,
+
+      COALESCE(
+        SUM(charged_amount_usd),
+        0
+      )::numeric(12,5)
+        AS total_revenue,
+
+      COALESCE(
+        SUM(provider_cost_usd),
+        0
+      )::numeric(12,5)
+        AS total_provider_cost,
+
+      COALESCE(
+        SUM(profit_usd),
+        0
+      )::numeric(12,5)
+        AS total_profit,
+
+      ${averageSellRateSql}
+        AS avg_sell_rate_usd_per_min,
+
+      COALESCE(
+        ROUND(
+          (
+            SUM(profit_usd)
+            /
+            NULLIF(
+              SUM(charged_amount_usd),
+              0
+            )
+          ) * 100,
+          2
+        ),
+        0
+      )
+        AS profit_percent
+
     FROM call_sessions
+
     WHERE status = 'charged'
   `);
 
@@ -22,16 +90,54 @@ async function getProfitSummary() {
 async function getTodayProfit() {
   const result = await db.query(`
     SELECT
-      COUNT(*)::int AS total_calls,
-      COALESCE(SUM(charged_minutes), 0)::int AS total_minutes,
-      COALESCE(SUM(charged_amount_usd), 0)::numeric(12,5) AS total_revenue,
-      COALESCE(SUM(provider_cost_usd), 0)::numeric(12,5) AS total_provider_cost,
-      COALESCE(SUM(profit_usd), 0)::numeric(12,5) AS total_profit,
+      COUNT(*)::int
+        AS total_calls,
+
       COALESCE(
-        ROUND((SUM(profit_usd) / NULLIF(SUM(charged_amount_usd), 0)) * 100, 2),
+        SUM(charged_minutes),
         0
-      ) AS profit_percent
+      )::int
+        AS total_minutes,
+
+      COALESCE(
+        SUM(charged_amount_usd),
+        0
+      )::numeric(12,5)
+        AS total_revenue,
+
+      COALESCE(
+        SUM(provider_cost_usd),
+        0
+      )::numeric(12,5)
+        AS total_provider_cost,
+
+      COALESCE(
+        SUM(profit_usd),
+        0
+      )::numeric(12,5)
+        AS total_profit,
+
+      ${averageSellRateSql}
+        AS avg_sell_rate_usd_per_min,
+
+      COALESCE(
+        ROUND(
+          (
+            SUM(profit_usd)
+            /
+            NULLIF(
+              SUM(charged_amount_usd),
+              0
+            )
+          ) * 100,
+          2
+        ),
+        0
+      )
+        AS profit_percent
+
     FROM call_sessions
+
     WHERE status = 'charged'
       AND started_at >= CURRENT_DATE
   `);
@@ -42,23 +148,102 @@ async function getTodayProfit() {
 async function getCountryWiseProfit() {
   const result = await db.query(`
     SELECT
-      ROW_NUMBER() OVER (ORDER BY SUM(cs.profit_usd) DESC) AS serial_no,
-      cr.country_name,
-      cr.country_code,
-      COUNT(cs.id)::int AS total_calls,
-      COALESCE(SUM(cs.charged_minutes), 0)::int AS total_minutes,
-      COALESCE(SUM(cs.charged_amount_usd), 0)::numeric(12,5) AS total_user_paid,
-      COALESCE(SUM(cs.provider_cost_usd), 0)::numeric(12,5) AS total_twilio_cost,
-      COALESCE(SUM(cs.profit_usd), 0)::numeric(12,5) AS total_profit,
+      ROW_NUMBER() OVER (
+        ORDER BY
+          SUM(cs.profit_usd) DESC
+      )
+        AS serial_no,
+
       COALESCE(
-        ROUND((SUM(cs.profit_usd) / NULLIF(SUM(cs.charged_amount_usd), 0)) * 100, 2),
+        cr.country_name,
+        'Unknown'
+      )
+        AS country_name,
+
+      cr.country_code,
+
+      COUNT(cs.id)::int
+        AS total_calls,
+
+      COALESCE(
+        SUM(cs.charged_minutes),
         0
-      ) AS profit_percent
+      )::int
+        AS total_minutes,
+
+      COALESCE(
+        SUM(cs.charged_amount_usd),
+        0
+      )::numeric(12,5)
+        AS total_user_paid,
+
+      COALESCE(
+        SUM(cs.provider_cost_usd),
+        0
+      )::numeric(12,5)
+        AS total_provider_cost,
+
+      COALESCE(
+        SUM(cs.profit_usd),
+        0
+      )::numeric(12,5)
+        AS total_profit,
+
+      COALESCE(
+        ROUND(
+          SUM(
+            COALESCE(
+              cs.sell_rate_usd_per_min,
+              CASE
+                WHEN cs.charged_minutes > 0
+                THEN
+                  cs.charged_amount_usd
+                  /
+                  cs.charged_minutes
+                ELSE 0
+              END
+            ) * cs.charged_minutes
+          )
+          /
+          NULLIF(
+            SUM(cs.charged_minutes),
+            0
+          ),
+          5
+        ),
+        0
+      )
+        AS avg_sell_rate_usd_per_min,
+
+      COALESCE(
+        ROUND(
+          (
+            SUM(cs.profit_usd)
+            /
+            NULLIF(
+              SUM(cs.charged_amount_usd),
+              0
+            )
+          ) * 100,
+          2
+        ),
+        0
+      )
+        AS profit_percent
+
     FROM call_sessions cs
-    LEFT JOIN call_rates cr ON cr.id = cs.rate_id
+
+    LEFT JOIN call_rates cr
+      ON cr.id = cs.rate_id
+
     WHERE cs.status = 'charged'
-    GROUP BY cr.country_name, cr.country_code
-    ORDER BY total_profit DESC
+
+    GROUP BY
+      cr.country_name,
+      cr.country_code
+
+    ORDER BY
+      total_profit DESC
   `);
 
   return result.rows;
@@ -67,25 +252,109 @@ async function getCountryWiseProfit() {
 async function getUserCountryWiseProfit() {
   const result = await db.query(`
     SELECT
-      ROW_NUMBER() OVER (ORDER BY SUM(cs.profit_usd) DESC) AS serial_no,
+      ROW_NUMBER() OVER (
+        ORDER BY
+          SUM(cs.profit_usd) DESC
+      )
+        AS serial_no,
+
+      COALESCE(
+        cr.country_name,
+        'Unknown'
+      )
+        AS country_name,
+
+      cr.country_code,
+
+      u.phone_e164
+        AS registered_number,
+
+      COUNT(cs.id)::int
+        AS total_calls,
+
+      COALESCE(
+        SUM(cs.charged_minutes),
+        0
+      )::int
+        AS total_minutes,
+
+      COALESCE(
+        SUM(cs.charged_amount_usd),
+        0
+      )::numeric(12,5)
+        AS total_user_paid,
+
+      COALESCE(
+        SUM(cs.provider_cost_usd),
+        0
+      )::numeric(12,5)
+        AS total_provider_cost,
+
+      COALESCE(
+        SUM(cs.profit_usd),
+        0
+      )::numeric(12,5)
+        AS total_profit,
+
+      COALESCE(
+        ROUND(
+          SUM(
+            COALESCE(
+              cs.sell_rate_usd_per_min,
+              CASE
+                WHEN cs.charged_minutes > 0
+                THEN
+                  cs.charged_amount_usd
+                  /
+                  cs.charged_minutes
+                ELSE 0
+              END
+            ) * cs.charged_minutes
+          )
+          /
+          NULLIF(
+            SUM(cs.charged_minutes),
+            0
+          ),
+          5
+        ),
+        0
+      )
+        AS avg_sell_rate_usd_per_min,
+
+      COALESCE(
+        ROUND(
+          (
+            SUM(cs.profit_usd)
+            /
+            NULLIF(
+              SUM(cs.charged_amount_usd),
+              0
+            )
+          ) * 100,
+          2
+        ),
+        0
+      )
+        AS profit_percent
+
+    FROM call_sessions cs
+
+    LEFT JOIN call_rates cr
+      ON cr.id = cs.rate_id
+
+    LEFT JOIN users u
+      ON u.id = cs.user_id
+
+    WHERE cs.status = 'charged'
+
+    GROUP BY
       cr.country_name,
       cr.country_code,
-      u.phone_e164 AS registered_number,
-      COUNT(cs.id)::int AS total_calls,
-      COALESCE(SUM(cs.charged_minutes), 0)::int AS total_minutes,
-      COALESCE(SUM(cs.charged_amount_usd), 0)::numeric(12,5) AS total_user_paid,
-      COALESCE(SUM(cs.provider_cost_usd), 0)::numeric(12,5) AS total_twilio_cost,
-      COALESCE(SUM(cs.profit_usd), 0)::numeric(12,5) AS total_profit,
-      COALESCE(
-        ROUND((SUM(cs.profit_usd) / NULLIF(SUM(cs.charged_amount_usd), 0)) * 100, 2),
-        0
-      ) AS profit_percent
-    FROM call_sessions cs
-    LEFT JOIN call_rates cr ON cr.id = cs.rate_id
-    LEFT JOIN users u ON u.id = cs.user_id
-    WHERE cs.status = 'charged'
-    GROUP BY cr.country_name, cr.country_code, u.phone_e164
-    ORDER BY total_profit DESC
+      u.phone_e164
+
+    ORDER BY
+      total_profit DESC
   `);
 
   return result.rows;
