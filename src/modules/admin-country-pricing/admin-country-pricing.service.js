@@ -56,12 +56,12 @@ function calculateMarginPercent({
  * একটি active route/country-এর জন্য:
  *
  * - Active provider/plan/rate-card resolve করে
- * - Route prefix-এর অন্তর্ভুক্ত highest provider cost নেয়
+ * - Telnyx applicable destination priority অনুসরণ করে
+ * - General outbound destination-কে local/special variant-এর আগে রাখে
+ * - একই category হলে lowest provider cost নির্বাচন করে
  * - Existing manual override যুক্ত করে
  *
- * Highest cost নেওয়ার কারণ:
- * Country-wide manual rate যেন কোনো sub-prefix-এ
- * provider cost-এর নিচে না যায়।
+ * এই selection rule সকল country route-এর জন্য dynamic।
  */
 const COUNTRY_PRICING_QUERY = `
   WITH route_data AS (
@@ -321,11 +321,81 @@ const COUNTRY_PRICING_QUERY = `
           )
 
         ORDER BY
-          total_provider_cost DESC,
-          LENGTH(vpr.prefix) DESC,
-          vpr.id ASC
+  /*
+   * Telnyx applicable destination priority:
+   *
+   * 1. General outbound destination
+   * 2. Local variant
+   * 3. Premium/special/satellite/shared-cost/toll-free
+   *
+   * Imported metadata থাকলে সেটি authoritative।
+   * পুরোনো rows-এর metadata না থাকলে destination_name
+   * থেকে একই priority dynamically calculate হবে।
+   */
+  COALESCE(
+    NULLIF(
+      vpr.metadata
+        #>>
+      '{duplicate_preference,category_priority}',
+      ''
+    )::integer,
 
-        LIMIT 1
+    (
+      CASE
+        WHEN LOWER(
+          COALESCE(
+            vpr.destination_name,
+            ''
+          )
+        ) ~
+        '(^|[^a-z])local([^a-z]|$)'
+        THEN 100
+        ELSE 0
+      END
+
+      +
+
+      CASE
+        WHEN LOWER(
+          COALESCE(
+            vpr.destination_name,
+            ''
+          )
+        ) ~
+        '(^|[^a-z])(premium|special|satellite|shared cost|toll free)([^a-z]|$)'
+        THEN 200
+        ELSE 0
+      END
+    ),
+
+    0
+  ) ASC,
+
+  /*
+   * একই destination category হলে:
+   * সর্বনিম্ন effective provider cost নির্বাচন করবে।
+   */
+  total_provider_cost ASC,
+
+  /*
+   * Rate একই হলে কম connection fee আগে।
+   */
+  COALESCE(
+    vpr.connection_fee_usd,
+    0
+  ) ASC,
+
+  /*
+   * Remaining tie হলে বেশি specific prefix আগে।
+   */
+  LENGTH(vpr.prefix) DESC,
+
+  /*
+   * সম্পূর্ণ tie হলে deterministic result।
+   */
+  vpr.id ASC
+
+    LIMIT 1
       ) highest_rate
 
       CROSS JOIN LATERAL (
