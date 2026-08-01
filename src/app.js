@@ -20,6 +20,9 @@ const adminProfitRoutes = require("./modules/admin-profit/admin.profit.routes");
 const appPagesRoutes = require("./modules/app-pages/app.pages.routes");
 const ratesRoutes = require("./modules/rates/rates.routes");
 const adminContentRoutes = require("./modules/admin-content/admin.content.routes");
+const adminCountryPricingRoutes = require(
+  "./modules/admin-country-pricing/admin-country-pricing.routes"
+);
 /**
  * Admin Provider Rate Import routes
  *
@@ -72,6 +75,7 @@ app.use("/api/app-pages", appPagesRoutes);
 app.use("/api/rates", ratesRoutes); 
 app.use("/api/admin/content", adminContentRoutes);
 app.use("/api/admin/rate-import", adminRateImportRoutes);
+app.use("/api/admin/country-pricing", adminCountryPricingRoutes);
 // 404 handler (সব route fail হলে)
 app.use(notFound);
 // final error handler
