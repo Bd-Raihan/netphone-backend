@@ -5,9 +5,13 @@ const DEFAULT_MIN_PROFIT_USD_PER_MIN =
   0.002;
 
 function round7(value) {
-  return Number(
-    Number(value || 0).toFixed(7)
-  );
+  const number = Number(value);
+
+  if (!Number.isFinite(number)) {
+    return 0;
+  }
+
+  return Number(number.toFixed(7));
 }
 
 function calculateMarkupPercent({
@@ -52,188 +56,308 @@ function calculateMarginPercent({
   );
 }
 
-/*
- * একটি active route/country-এর জন্য:
+/**
+ * Provider-rate metadata-এর category priority
+ * safeভাবে numeric value-তে convert করবে।
  *
- * - Active provider/plan/rate-card resolve করে
- * - Telnyx applicable destination priority অনুসরণ করে
- * - General outbound destination-কে local/special variant-এর আগে রাখে
- * - একই category হলে lowest provider cost নির্বাচন করে
- * - Existing manual override যুক্ত করে
+ * পুরোনো metadata-তে "0.01"-এর মতো decimal string
+ * থাকলেও integer-cast error হবে না।
+ */
+const SAFE_CATEGORY_PRIORITY_SQL = `
+  CASE
+    WHEN (
+      vpr.metadata
+        #>>
+      '{duplicate_preference,category_priority}'
+    ) ~ '^[0-9]+$'
+    THEN (
+      vpr.metadata
+        #>>
+      '{duplicate_preference,category_priority}'
+    )::integer
+
+    WHEN LOWER(
+      COALESCE(
+        vpr.destination_name,
+        ''
+      )
+    ) ~
+    '(^|[^a-z])local([^a-z]|$)'
+    THEN 100
+
+    WHEN LOWER(
+      COALESCE(
+        vpr.destination_name,
+        ''
+      )
+    ) ~
+    '(^|[^a-z])(premium|special|satellite|shared cost|toll free)([^a-z]|$)'
+    THEN 200
+
+    ELSE 0
+  END
+`;
+
+/**
+ * Country Pricing Dashboard query।
  *
- * এই selection rule সকল country route-এর জন্য dynamic।
+ * Master source:
+ * voice_country_pricing_policies
+ *
+ * Provider selection:
+ * 1. Existing active route-provider association
+ * 2. Route provider priority
+ * 3. General/applicable destination
+ * 4. Lowest effective provider cost
+ * 5. Lowest connection fee
+ *
+ * Route না থাকলেও active imported provider rate থেকে
+ * country Dashboard-এ দেখাবে।
  */
 const COUNTRY_PRICING_QUERY = `
-  WITH route_data AS (
+  WITH country_pricing AS (
     SELECT
-      vr.id AS route_id,
-      vr.code AS route_code,
-      vr.name AS route_name,
-      vr.country_code,
-      vr.prefix,
-      vr.is_active AS route_is_active,
+      vcpp.id AS country_pricing_policy_id,
 
-      COALESCE(
-        vr.markup_percent,
-        vdp.markup_percent,
-        $1::numeric
-      ) AS route_markup_percent,
+      vcpp.country_code,
+      vcpp.country_name,
 
-      COALESCE(
-        vr.min_profit_usd_per_min,
-        vdp.min_profit_usd_per_min,
-        $2::numeric
-      ) AS min_profit_usd_per_min,
+      vcpp.representative_prefix
+        AS prefix,
 
-      vdp.destination_name,
-      vdp.is_enabled
-        AS destination_is_enabled,
+      vcpp.pricing_mode,
+      vcpp.markup_percent,
 
-      vdp.publish_rates
-        AS destination_publish_rates,
+      vcpp.manual_sell_rate_usd_per_min,
 
-      provider_route.route_provider_id,
-      provider_route.provider_id,
-      provider_route.provider_plan_id,
-      provider_route.rate_card_id,
+      vcpp.min_profit_usd_per_min,
 
-      provider_route.provider_code,
-      provider_route.provider_name,
-      provider_route.provider_plan_code,
+      vcpp.is_enabled
+        AS country_is_enabled,
 
-      provider_route.discount_percent,
-      provider_route.platform_fee_usd_per_min,
+      vcpp.publish_rate,
 
-      provider_cost.provider_rate_id,
-      provider_cost.provider_country_code,
-      provider_cost.provider_country_name,
-      provider_cost.provider_destination_name,
-      provider_cost.provider_prefix,
-      provider_cost.raw_provider_rate_usd_per_min,
+      vcpp.pricing_note
+        AS manual_rate_note,
 
-      provider_cost.discounted_provider_rate_usd_per_min,
+      vcpp.updated_by
+        AS manual_rate_updated_by,
 
-      provider_cost.total_provider_cost_usd_per_min,
+      vcpp.updated_at
+        AS manual_rate_updated_at,
 
-      provider_cost.billing_increment_seconds,
-      provider_cost.minimum_duration_seconds,
-      provider_cost.connection_fee_usd,
+      route_data.route_id,
+      route_data.route_code,
+      route_data.route_name,
+      route_data.route_is_active,
 
-      provider_cost.destination_rate_count
+      provider_data.route_provider_id,
 
-    FROM voice_routes vr
+      provider_data.provider_id,
+      provider_data.provider_code,
+      provider_data.provider_name,
+      provider_data.provider_type,
 
-    LEFT JOIN voice_destination_policies vdp
-      ON vdp.prefix = vr.prefix
+      provider_data.provider_plan_id,
+      provider_data.provider_plan_code,
 
+      provider_data.rate_card_id,
+      provider_data.rate_card_code,
+
+      provider_data.provider_rate_id,
+
+      provider_data.provider_country_code,
+      provider_data.provider_country_name,
+
+      provider_data.provider_destination_name,
+      provider_data.provider_prefix,
+
+      provider_data.raw_provider_rate_usd_per_min,
+
+      provider_data.discounted_provider_rate_usd_per_min,
+
+      provider_data.platform_fee_usd_per_min,
+
+      provider_data.total_provider_cost_usd_per_min,
+
+      provider_data.connection_fee_usd,
+
+      provider_data.billing_increment_seconds,
+
+      provider_data.minimum_duration_seconds,
+
+      provider_data.destination_rate_count,
+
+      updater.phone_e164
+        AS updated_by_phone
+
+    FROM voice_country_pricing_policies vcpp
+
+    /*
+     * Country-এর existing logical route থাকলে
+     * সেটি provider priority resolve করতে ব্যবহার হবে।
+     */
     LEFT JOIN LATERAL (
       SELECT
-        vrp.id AS route_provider_id,
-        vrp.provider_id,
-        vrp.provider_plan_id,
-        vrp.rate_card_id,
+        vr.id AS route_id,
+        vr.code AS route_code,
+        vr.name AS route_name,
+        vr.is_active
+          AS route_is_active
 
-        vp.code AS provider_code,
-        vp.name AS provider_name,
+      FROM voice_routes vr
 
-        vpp.code AS provider_plan_code,
-
-        COALESCE(
-          vpp.discount_percent,
-          0
-        ) AS discount_percent,
-
-        COALESCE(
-          vrp.platform_fee_usd_per_min,
-          vpp.platform_fee_usd_per_min,
-          vp.default_platform_fee_usd,
-          0
-        ) AS platform_fee_usd_per_min
-
-      FROM voice_route_providers vrp
-
-      JOIN voice_providers vp
-        ON vp.id = vrp.provider_id
-
-      LEFT JOIN voice_provider_plans vpp
-        ON vpp.id =
-           vrp.provider_plan_id
-
-      LEFT JOIN voice_provider_rate_cards vprc
-        ON vprc.id =
-           vrp.rate_card_id
-
-      WHERE vrp.route_id = vr.id
-        AND vrp.is_active = TRUE
-        AND vp.status = 'active'
-        AND vp.supports_voice = TRUE
+      WHERE vr.is_active = TRUE
 
         AND (
-          vpp.id IS NULL
-          OR vpp.is_active = TRUE
+          UPPER(
+            COALESCE(
+              vr.country_code,
+              ''
+            )
+          ) = vcpp.country_code
+
+          OR vr.prefix =
+             vcpp.representative_prefix
         )
 
         AND (
-          vprc.id IS NULL
-          OR vprc.is_active = TRUE
+          vr.valid_from IS NULL
+          OR vr.valid_from <= NOW()
         )
 
         AND (
-          vrp.valid_from IS NULL
-          OR vrp.valid_from <= NOW()
-        )
-
-        AND (
-          vrp.valid_until IS NULL
-          OR vrp.valid_until > NOW()
+          vr.valid_until IS NULL
+          OR vr.valid_until > NOW()
         )
 
       ORDER BY
-        vrp.priority ASC,
-        vrp.id ASC
+        CASE
+          WHEN UPPER(
+            COALESCE(
+              vr.country_code,
+              ''
+            )
+          ) = vcpp.country_code
+          THEN 0
+          ELSE 1
+        END,
+
+        LENGTH(vr.prefix) ASC,
+        vr.id ASC
 
       LIMIT 1
-    ) provider_route
+    ) route_data
       ON TRUE
 
+    /*
+     * Multi-provider candidate নির্বাচন।
+     *
+     * Existing route-provider link থাকলে সেটির
+     * priority আগে; route না থাকলে active imported
+     * provider rates-এর মধ্যে applicable lowest cost।
+     */
     LEFT JOIN LATERAL (
       SELECT
-        highest_rate.provider_rate_id,
-        highest_rate.country_code
+        selected_rate.route_provider_id,
+
+        selected_rate.provider_id,
+        selected_rate.provider_code,
+        selected_rate.provider_name,
+        selected_rate.provider_type,
+
+        selected_rate.provider_plan_id,
+        selected_rate.provider_plan_code,
+
+        selected_rate.rate_card_id,
+        selected_rate.rate_card_code,
+
+        selected_rate.provider_rate_id,
+
+        selected_rate.country_code
           AS provider_country_code,
 
-        highest_rate.country_name
+        selected_rate.country_name
           AS provider_country_name,
 
-        highest_rate.destination_name
+        selected_rate.destination_name
           AS provider_destination_name,
 
-        highest_rate.prefix
+        selected_rate.prefix
           AS provider_prefix,
 
-        highest_rate.raw_rate_usd_per_min
+        selected_rate.raw_rate_usd_per_min
           AS raw_provider_rate_usd_per_min,
 
-        highest_rate.discounted_rate
+        selected_rate.discounted_rate
           AS discounted_provider_rate_usd_per_min,
 
-        highest_rate.total_provider_cost
+        selected_rate.platform_fee_usd_per_min,
+
+        selected_rate.total_provider_cost
           AS total_provider_cost_usd_per_min,
 
-        highest_rate.billing_increment_seconds,
-        highest_rate.minimum_duration_seconds,
-        highest_rate.connection_fee_usd,
+        selected_rate.connection_fee_usd,
 
-        rate_count.destination_rate_count
+        selected_rate.billing_increment_seconds,
+
+        selected_rate.minimum_duration_seconds,
+
+        selected_rate.destination_rate_count
 
       FROM (
         SELECT
-          vpr.id AS provider_rate_id,
+          vrp.id
+            AS route_provider_id,
+
+          vp.id
+            AS provider_id,
+
+          vp.code
+            AS provider_code,
+
+          vp.name
+            AS provider_name,
+
+          vp.provider_type,
+
+          selected_plan.id
+            AS provider_plan_id,
+
+          selected_plan.code
+            AS provider_plan_code,
+
+          vprc.id
+            AS rate_card_id,
+
+          vprc.code
+            AS rate_card_code,
+
+          vpr.id
+            AS provider_rate_id,
+
           vpr.country_code,
           vpr.country_name,
           vpr.destination_name,
           vpr.prefix,
+
           vpr.raw_rate_usd_per_min,
+
+          COALESCE(
+            selected_plan.discount_percent,
+            0
+          ) AS discount_percent,
+
+          COALESCE(
+            vrp.platform_fee_usd_per_min,
+
+            selected_plan
+              .platform_fee_usd_per_min,
+
+            vp.default_platform_fee_usd,
+
+            0
+          ) AS platform_fee_usd_per_min,
 
           (
             vpr.raw_rate_usd_per_min
@@ -242,7 +366,7 @@ const COUNTRY_PRICING_QUERY = `
               1 -
               (
                 COALESCE(
-                  provider_route.discount_percent,
+                  selected_plan.discount_percent,
                   0
                 ) / 100.0
               )
@@ -257,19 +381,31 @@ const COUNTRY_PRICING_QUERY = `
                 1 -
                 (
                   COALESCE(
-                    provider_route.discount_percent,
+                    selected_plan.discount_percent,
                     0
                   ) / 100.0
                 )
               )
             )
+
             +
+
             COALESCE(
-              provider_route
+              vrp.platform_fee_usd_per_min,
+
+              selected_plan
                 .platform_fee_usd_per_min,
+
+              vp.default_platform_fee_usd,
+
               0
             )
           ) AS total_provider_cost,
+
+          COALESCE(
+            vpr.connection_fee_usd,
+            0
+          ) AS connection_fee_usd,
 
           COALESCE(
             vpr.billing_increment_seconds,
@@ -284,9 +420,25 @@ const COUNTRY_PRICING_QUERY = `
           ) AS minimum_duration_seconds,
 
           COALESCE(
-            vpr.connection_fee_usd,
-            0
-          ) AS connection_fee_usd
+            vrp.priority,
+            2147483647
+          ) AS route_provider_priority,
+
+          CASE
+            WHEN vrp.id IS NULL
+              THEN 1
+            ELSE 0
+          END AS route_link_priority,
+
+          ${SAFE_CATEGORY_PRIORITY_SQL}
+            AS destination_category_priority,
+
+          COUNT(*) OVER (
+            PARTITION BY
+              vpr.provider_id,
+              UPPER(vpr.country_code)
+          )::integer
+            AS destination_rate_count
 
         FROM voice_provider_rates vpr
 
@@ -294,21 +446,130 @@ const COUNTRY_PRICING_QUERY = `
           ON vprc.id =
              vpr.rate_card_id
 
-        WHERE vpr.provider_id =
-              provider_route.provider_id
+        JOIN voice_providers vp
+          ON vp.id =
+             vpr.provider_id
 
-          AND (
-            provider_route.rate_card_id
-              IS NULL
-            OR vpr.rate_card_id =
-               provider_route.rate_card_id
-          )
+        /*
+         * Existing route-এর matching provider candidate।
+         */
+        LEFT JOIN LATERAL (
+          SELECT
+            candidate.*
 
-          AND vpr.is_active = TRUE
+          FROM voice_route_providers candidate
+
+          WHERE route_data.route_id
+                IS NOT NULL
+
+            AND candidate.route_id =
+                route_data.route_id
+
+            AND candidate.provider_id =
+                vpr.provider_id
+
+            AND candidate.is_active = TRUE
+
+            AND (
+              candidate.rate_card_id
+                IS NULL
+
+              OR candidate.rate_card_id =
+                 vpr.rate_card_id
+            )
+
+            AND (
+              candidate.valid_from IS NULL
+              OR candidate.valid_from <= NOW()
+            )
+
+            AND (
+              candidate.valid_until IS NULL
+              OR candidate.valid_until > NOW()
+            )
+
+          ORDER BY
+            candidate.priority ASC,
+            candidate.id ASC
+
+          LIMIT 1
+        ) vrp
+          ON TRUE
+
+        /*
+         * Plan priority:
+         * route-provider plan
+         * → rate-card plan
+         * → provider default active plan
+         */
+        LEFT JOIN LATERAL (
+          SELECT
+            vpp.id,
+            vpp.code,
+            vpp.discount_percent,
+            vpp.platform_fee_usd_per_min
+
+          FROM voice_provider_plans vpp
+
+          WHERE vpp.provider_id =
+                vpr.provider_id
+
+            AND vpp.is_active = TRUE
+
+            AND (
+              vpp.valid_from IS NULL
+              OR vpp.valid_from <= NOW()
+            )
+
+            AND (
+              vpp.valid_until IS NULL
+              OR vpp.valid_until > NOW()
+            )
+
+            AND (
+              vpp.id =
+                vrp.provider_plan_id
+
+              OR vpp.id =
+                vprc.provider_plan_id
+
+              OR vpp.is_default = TRUE
+            )
+
+          ORDER BY
+            CASE
+              WHEN vpp.id =
+                   vrp.provider_plan_id
+                THEN 0
+
+              WHEN vpp.id =
+                   vprc.provider_plan_id
+                THEN 1
+
+              WHEN vpp.is_default = TRUE
+                THEN 2
+
+              ELSE 3
+            END,
+
+            vpp.id ASC
+
+          LIMIT 1
+        ) selected_plan
+          ON TRUE
+
+        WHERE vpr.is_active = TRUE
           AND vprc.is_active = TRUE
 
-          AND vpr.prefix
-              LIKE vr.prefix || '%'
+          AND vp.status = 'active'
+          AND vp.supports_voice = TRUE
+
+          AND UPPER(
+            COALESCE(
+              vpr.country_code,
+              ''
+            )
+          ) = vcpp.country_code
 
           AND (
             vpr.effective_from IS NULL
@@ -320,354 +581,168 @@ const COUNTRY_PRICING_QUERY = `
             OR vpr.effective_until > NOW()
           )
 
-        ORDER BY
-  /*
-   * Telnyx applicable destination priority:
-   *
-   * 1. General outbound destination
-   * 2. Local variant
-   * 3. Premium/special/satellite/shared-cost/toll-free
-   *
-   * Imported metadata থাকলে সেটি authoritative।
-   * পুরোনো rows-এর metadata না থাকলে destination_name
-   * থেকে একই priority dynamically calculate হবে।
-   */
-  COALESCE(
-    NULLIF(
-      vpr.metadata
-        #>>
-      '{duplicate_preference,category_priority}',
-      ''
-    )::integer,
-
-    (
-      CASE
-        WHEN LOWER(
-          COALESCE(
-            vpr.destination_name,
-            ''
+          AND (
+            vprc.effective_from IS NULL
+            OR vprc.effective_from <= NOW()
           )
-        ) ~
-        '(^|[^a-z])local([^a-z]|$)'
-        THEN 100
-        ELSE 0
-      END
-
-      +
-
-      CASE
-        WHEN LOWER(
-          COALESCE(
-            vpr.destination_name,
-            ''
-          )
-        ) ~
-        '(^|[^a-z])(premium|special|satellite|shared cost|toll free)([^a-z]|$)'
-        THEN 200
-        ELSE 0
-      END
-    ),
-
-    0
-  ) ASC,
-
-  /*
-   * একই destination category হলে:
-   * সর্বনিম্ন effective provider cost নির্বাচন করবে।
-   */
-  total_provider_cost ASC,
-
-  /*
-   * Rate একই হলে কম connection fee আগে।
-   */
-  COALESCE(
-    vpr.connection_fee_usd,
-    0
-  ) ASC,
-
-  /*
-   * Remaining tie হলে বেশি specific prefix আগে।
-   */
-  LENGTH(vpr.prefix) DESC,
-
-  /*
-   * সম্পূর্ণ tie হলে deterministic result।
-   */
-  vpr.id ASC
-
-    LIMIT 1
-      ) highest_rate
-
-      CROSS JOIN LATERAL (
-        SELECT
-          COUNT(*)::int
-            AS destination_rate_count
-
-        FROM voice_provider_rates counted_rate
-
-        JOIN voice_provider_rate_cards counted_card
-          ON counted_card.id =
-             counted_rate.rate_card_id
-
-        WHERE counted_rate.provider_id =
-              provider_route.provider_id
 
           AND (
-            provider_route.rate_card_id
-              IS NULL
-            OR counted_rate.rate_card_id =
-               provider_route.rate_card_id
+            vprc.effective_until IS NULL
+            OR vprc.effective_until > NOW()
           )
 
-          AND counted_rate.is_active = TRUE
-          AND counted_card.is_active = TRUE
+          /*
+           * Route থাকলে linked providers আগে।
+           * Route না থাকলে সব active provider candidate।
+           */
+          AND (
+            route_data.route_id IS NULL
+            OR vrp.id IS NOT NULL
+          )
+      ) selected_rate
 
-          AND counted_rate.prefix
-              LIKE vr.prefix || '%'
-      ) rate_count
-    ) provider_cost
+      ORDER BY
+        selected_rate.route_link_priority ASC,
+
+        selected_rate
+          .route_provider_priority ASC,
+
+        selected_rate
+          .destination_category_priority ASC,
+
+        selected_rate
+          .total_provider_cost ASC,
+
+        selected_rate
+          .connection_fee_usd ASC,
+
+        LENGTH(
+          selected_rate.prefix
+        ) DESC,
+
+        selected_rate.provider_rate_id ASC
+
+      LIMIT 1
+    ) provider_data
       ON TRUE
 
-    WHERE vr.is_active = TRUE
+    LEFT JOIN users updater
+      ON updater.id =
+         vcpp.updated_by
   )
 
   SELECT
-    rd.route_id,
-    rd.route_code,
-    rd.route_name,
+    cp.country_pricing_policy_id,
+
+    cp.route_id,
 
     COALESCE(
-      NULLIF(rd.country_code, ''),
-      NULLIF(rd.provider_country_code, ''),
-      'UNKNOWN'
-    ) AS country_code,
+      cp.route_code,
+      LOWER(cp.country_code)
+        || '_country'
+    ) AS route_code,
 
     COALESCE(
-      NULLIF(rd.provider_country_name, ''),
-      NULLIF(rd.destination_name, ''),
-      NULLIF(rd.route_name, ''),
-      'Unknown'
-    ) AS country_name,
+      cp.route_name,
+      cp.country_name
+    ) AS route_name,
 
-    rd.prefix,
+    cp.country_code,
+    cp.country_name,
 
-    rd.provider_code,
-    rd.provider_name,
-    rd.provider_plan_code,
+    cp.prefix,
 
-    rd.provider_id,
-    rd.provider_plan_id,
-    rd.provider_rate_id,
-    rd.route_provider_id,
+    cp.provider_code,
+    cp.provider_name,
+    cp.provider_type,
 
-    rd.raw_provider_rate_usd_per_min,
+    cp.provider_plan_code,
 
-    rd.discounted_provider_rate_usd_per_min,
+    cp.provider_id,
+    cp.provider_plan_id,
 
-    rd.platform_fee_usd_per_min,
+    cp.provider_rate_id,
+    cp.route_provider_id,
 
-    rd.total_provider_cost_usd_per_min,
+    cp.rate_card_id,
+    cp.rate_card_code,
 
-    rd.billing_increment_seconds,
-    rd.minimum_duration_seconds,
-    rd.connection_fee_usd,
-    rd.destination_rate_count,
+    cp.raw_provider_rate_usd_per_min,
 
-    COALESCE(
-      cr.pricing_mode,
-      CASE
-        WHEN COALESCE(
-          cr.manual_override,
-          FALSE
-        ) = TRUE
-          THEN 'manual_rate'
-        ELSE 'auto_markup'
-      END
-    ) AS pricing_mode,
+    cp.discounted_provider_rate_usd_per_min,
+
+    cp.platform_fee_usd_per_min,
+
+    cp.total_provider_cost_usd_per_min,
+
+    cp.connection_fee_usd,
+
+    cp.billing_increment_seconds,
+    cp.minimum_duration_seconds,
 
     COALESCE(
-      cr.manual_override,
-      FALSE
+      cp.destination_rate_count,
+      0
+    ) AS destination_rate_count,
+
+    cp.pricing_mode,
+
+    (
+      cp.pricing_mode =
+      'manual_rate'
     ) AS manual_override,
 
-    COALESCE(
-      CASE
-        WHEN COALESCE(
-          cr.manual_override,
-          FALSE
-        ) = TRUE
-          THEN cr.markup_percent
-        ELSE rd.route_markup_percent
-      END,
-      $1::numeric
-    ) AS markup_percent,
+    cp.markup_percent,
 
-    cr.sell_rate_usd_per_min
-      AS manual_sell_rate_usd_per_min,
+    cp.manual_sell_rate_usd_per_min,
 
     CASE
-      WHEN COALESCE(
-        cr.manual_override,
-        FALSE
-      ) = TRUE
-      THEN cr.sell_rate_usd_per_min
+      WHEN cp.pricing_mode =
+           'manual_rate'
+      THEN cp.manual_sell_rate_usd_per_min
+
+      WHEN cp.total_provider_cost_usd_per_min
+           IS NULL
+      THEN NULL
 
       ELSE GREATEST(
-        rd.total_provider_cost_usd_per_min
+        cp.total_provider_cost_usd_per_min
           *
           (
             1 +
             (
-              COALESCE(
-                rd.route_markup_percent,
-                $1::numeric
-              ) / 100.0
+              cp.markup_percent /
+              100.0
             )
           ),
 
-        rd.total_provider_cost_usd_per_min
+        cp.total_provider_cost_usd_per_min
           +
-          COALESCE(
-            rd.min_profit_usd_per_min,
-            $2::numeric
-          )
+          cp.min_profit_usd_per_min
       )
     END AS final_sell_rate_usd_per_min,
 
-    rd.min_profit_usd_per_min,
+    cp.min_profit_usd_per_min,
 
-    COALESCE(
-      cr.is_active,
-      rd.route_is_active
+    (
+      cp.country_is_enabled = TRUE
+      AND cp.publish_rate = TRUE
+      AND cp.total_provider_cost_usd_per_min
+          IS NOT NULL
     ) AS is_active,
 
-    COALESCE(
-      cr.publish_rate,
-      rd.destination_publish_rates,
-      TRUE
-    ) AS publish_rate,
+    cp.publish_rate,
 
-    cr.manual_rate_note,
-    cr.manual_rate_updated_at,
-    cr.manual_rate_updated_by,
+    cp.manual_rate_note,
+    cp.manual_rate_updated_at,
+    cp.manual_rate_updated_by,
 
-    updater.phone_e164
-      AS updated_by_phone
+    cp.updated_by_phone
 
-  FROM route_data rd
-
-  LEFT JOIN call_rates cr
-    ON cr.prefix = rd.prefix
-
-  LEFT JOIN users updater
-    ON updater.id =
-       cr.manual_rate_updated_by
+  FROM country_pricing cp
 `;
 
-async function listCountryPricing({
-  search = "",
-} = {}) {
-  const normalizedSearch =
-    String(search || "")
-      .trim()
-      .toLowerCase();
-
-  const { rows } = await db.query(
-    `
-      SELECT *
-      FROM (
-        ${COUNTRY_PRICING_QUERY}
-      ) pricing
-
-      WHERE (
-        $3 = ''
-        OR LOWER(pricing.country_name)
-           LIKE '%' || $3 || '%'
-        OR LOWER(pricing.country_code)
-           LIKE '%' || $3 || '%'
-        OR pricing.prefix
-           LIKE '%' || $3 || '%'
-      )
-
-      ORDER BY
-        pricing.country_name ASC,
-        LENGTH(pricing.prefix) ASC,
-        pricing.prefix ASC
-    `,
-    [
-      DEFAULT_MARKUP_PERCENT,
-      DEFAULT_MIN_PROFIT_USD_PER_MIN,
-      normalizedSearch,
-    ]
-  );
-
-  return rows.map((row) => {
-    const providerCost =
-      Number(
-        row.total_provider_cost_usd_per_min ||
-        0
-      );
-
-    const finalSellRate =
-      Number(
-        row.final_sell_rate_usd_per_min ||
-        0
-      );
-
-    return {
-      ...row,
-
-      provider_cost_usd_per_min:
-        round7(providerCost),
-
-      final_sell_rate_usd_per_min:
-        round7(finalSellRate),
-
-      profit_usd_per_min:
-        round7(
-          finalSellRate - providerCost
-        ),
-
-      effective_markup_percent:
-        calculateMarkupPercent({
-          providerCost,
-          sellRate: finalSellRate,
-        }),
-
-      profit_margin_percent:
-        calculateMarginPercent({
-          providerCost,
-          sellRate: finalSellRate,
-        }),
-    };
-  });
-}
-
-async function getCountryPricingByPrefix(
-  prefix
-) {
-  const { rows } = await db.query(
-    `
-      SELECT *
-      FROM (
-        ${COUNTRY_PRICING_QUERY}
-      ) pricing
-      WHERE pricing.prefix = $3
-      LIMIT 1
-    `,
-    [
-      DEFAULT_MARKUP_PERCENT,
-      DEFAULT_MIN_PROFIT_USD_PER_MIN,
-      prefix,
-    ]
-  );
-
-  const row = rows[0];
-
-  if (!row) {
-    return null;
-  }
-
+function mapPricingRow(row) {
   const providerCost =
     Number(
       row.total_provider_cost_usd_per_min ||
@@ -686,26 +761,151 @@ async function getCountryPricingByPrefix(
     provider_cost_usd_per_min:
       round7(providerCost),
 
+    raw_provider_rate_usd_per_min:
+      round7(
+        row.raw_provider_rate_usd_per_min
+      ),
+
+    discounted_provider_rate_usd_per_min:
+      round7(
+        row
+          .discounted_provider_rate_usd_per_min
+      ),
+
+    platform_fee_usd_per_min:
+      round7(
+        row.platform_fee_usd_per_min
+      ),
+
+    connection_fee_usd:
+      round7(
+        row.connection_fee_usd
+      ),
+
+    markup_percent:
+      round7(
+        row.markup_percent
+      ),
+
+    manual_sell_rate_usd_per_min:
+      row.manual_sell_rate_usd_per_min ===
+      null
+        ? null
+        : round7(
+            row
+              .manual_sell_rate_usd_per_min
+          ),
+
     final_sell_rate_usd_per_min:
       round7(finalSellRate),
 
+    min_profit_usd_per_min:
+      round7(
+        row.min_profit_usd_per_min
+      ),
+
     profit_usd_per_min:
       round7(
-        finalSellRate - providerCost
+        finalSellRate -
+          providerCost
       ),
 
     effective_markup_percent:
       calculateMarkupPercent({
         providerCost,
-        sellRate: finalSellRate,
+        sellRate:
+          finalSellRate,
       }),
 
     profit_margin_percent:
       calculateMarginPercent({
         providerCost,
-        sellRate: finalSellRate,
+        sellRate:
+          finalSellRate,
       }),
   };
+}
+
+async function listCountryPricing({
+  search = "",
+} = {}) {
+  const normalizedSearch =
+    String(search || "")
+      .trim()
+      .toLowerCase();
+
+  const { rows } = await db.query(
+    `
+      SELECT *
+      FROM (
+        ${COUNTRY_PRICING_QUERY}
+      ) pricing
+
+      WHERE (
+        $1 = ''
+
+        OR LOWER(
+          pricing.country_name
+        ) LIKE '%' || $1 || '%'
+
+        OR LOWER(
+          pricing.country_code
+        ) LIKE '%' || $1 || '%'
+
+        OR pricing.prefix
+           LIKE '%' || $1 || '%'
+
+        OR LOWER(
+          COALESCE(
+            pricing.provider_name,
+            ''
+          )
+        ) LIKE '%' || $1 || '%'
+      )
+
+      ORDER BY
+        pricing.country_name ASC,
+        pricing.country_code ASC
+    `,
+    [normalizedSearch]
+  );
+
+  return rows.map(mapPricingRow);
+}
+
+async function getCountryPricingByPrefix(
+  prefix
+) {
+  const normalizedPrefix =
+    String(prefix || "")
+      .replace(/\D/g, "");
+
+  if (!normalizedPrefix) {
+    return null;
+  }
+
+  const { rows } = await db.query(
+    `
+      SELECT *
+      FROM (
+        ${COUNTRY_PRICING_QUERY}
+      ) pricing
+
+      WHERE pricing.prefix = $1
+
+      ORDER BY
+        pricing.country_name ASC
+
+      LIMIT 1
+    `,
+    [normalizedPrefix]
+  );
+
+  if (!rows.length) {
+    return null;
+  }
+
+  return mapPricingRow(rows[0]);
 }
 
 async function updateCountryPricing({
@@ -721,13 +921,15 @@ async function updateCountryPricing({
   if (!current) {
     return {
       ok: false,
-      reason: "country_route_not_found",
+      reason:
+        "country_route_not_found",
     };
   }
 
   const providerCost =
     Number(
-      current.provider_cost_usd_per_min ||
+      current
+        .provider_cost_usd_per_min ||
       0
     );
 
@@ -742,28 +944,62 @@ async function updateCountryPricing({
     };
   }
 
+  const pricingMode =
+    String(
+      payload.pricing_mode || ""
+    )
+      .trim()
+      .toLowerCase();
+
   const client =
     await db.getClient();
 
   try {
     await client.query("BEGIN");
 
-    const countryCode =
-      payload.country_code ||
-      current.country_code;
+    /*
+     * পুরোনো prefix-level manual override যেন
+     * নতুন country policy-কে bypass না করে।
+     */
+    await client.query(
+      `
+        UPDATE call_rates
+        SET
+          manual_override = FALSE,
 
-    const countryName =
-      current.country_name ||
-      current.route_name ||
-      "Unknown";
+          pricing_mode =
+            'auto_markup',
 
-    const activeValue =
-      payload.is_active === null
-        ? true
-        : payload.is_active;
+          rate_source =
+            'country_pricing_v2',
+
+          manual_rate_updated_by = $2,
+
+          manual_rate_updated_at =
+            NOW(),
+
+          updated_at = NOW()
+
+        WHERE UPPER(
+          COALESCE(
+            country_code,
+            ''
+          )
+        ) = $1
+
+          AND COALESCE(
+            manual_override,
+            FALSE
+          ) = TRUE
+      `,
+      [
+        current.country_code,
+        adminUserId,
+      ]
+    );
 
     if (
-      payload.pricing_mode ===
+      pricingMode ===
       "auto_markup"
     ) {
       const markupPercent =
@@ -771,382 +1007,153 @@ async function updateCountryPricing({
           payload.markup_percent
         );
 
-      const minimumProfit =
-        Number(
-          current.min_profit_usd_per_min ||
-          DEFAULT_MIN_PROFIT_USD_PER_MIN
-        );
-
-      const calculatedSellRate =
-        Math.max(
-          providerCost *
-            (
-              1 +
-              markupPercent / 100
-            ),
-
-          providerCost +
-            minimumProfit
-        );
-
-      /*
-       * Auto mode-এ route markup authoritative।
-       * Provider cost বদলালে Router নতুন rate
-       * স্বয়ংক্রিয়ভাবে calculate করবে।
-       */
       await client.query(
         `
-          UPDATE voice_routes
-          SET
-            markup_percent = $2,
-            updated_at = NOW()
-          WHERE prefix = $1
-        `,
-        [
-          prefix,
-          markupPercent,
-        ]
-      );
+          UPDATE
+            voice_country_pricing_policies
 
-      /*
-       * Existing manual override থাকলে disable হবে।
-       * Row delete করা হবে না—history/config থাকবে।
-       */
-      await client.query(
-        `
-          UPDATE call_rates
           SET
-            country_code = $2,
-            country_name = $3,
-
             pricing_mode =
               'auto_markup',
 
-            manual_override = FALSE,
+            markup_percent = $2,
 
-            markup_percent = $4,
+            manual_sell_rate_usd_per_min =
+              NULL,
 
-            sell_rate_usd_per_min = $5,
-
-            price_per_min_cents =
-              GREATEST(
-                1,
-                CEIL($5 * 100)::integer
+            is_enabled =
+              COALESCE(
+                $3,
+                is_enabled
               ),
 
-            rate_source =
-              'admin_auto_markup',
+            publish_rate =
+              COALESCE(
+                $3,
+                publish_rate
+              ),
 
-            is_active = $6,
-            publish_rate = $6,
+            pricing_note = $4,
 
-            manual_rate_note = $7,
-
-            manual_rate_updated_by = $8,
-
-            manual_rate_updated_at =
-              NOW(),
+            updated_by = $5,
 
             updated_at = NOW()
 
-          WHERE prefix = $1
+          WHERE country_code = $1
         `,
         [
-          prefix,
-          countryCode,
-          countryName,
+          current.country_code,
           markupPercent,
-          round7(calculatedSellRate),
-          activeValue,
+          payload.is_active,
           payload.note,
           adminUserId,
         ]
       );
-
-      await client.query("COMMIT");
-
-      return {
-        ok: true,
-        pricing_mode:
-          "auto_markup",
-
-        data:
-          await getCountryPricingByPrefix(
-            prefix
-          ),
-      };
-    }
-
-    const manualSellRate =
-      Number(
-        payload
-          .manual_sell_rate_usd_per_min
-      );
-
-    if (
-      manualSellRate <= providerCost
+    } else if (
+      pricingMode ===
+      "manual_rate"
     ) {
-      await client.query("ROLLBACK");
+      const manualSellRate =
+        Number(
+          payload
+            .manual_sell_rate_usd_per_min
+        );
+
+      if (
+        !Number.isFinite(
+          manualSellRate
+        ) ||
+        manualSellRate <= providerCost
+      ) {
+        await client.query(
+          "ROLLBACK"
+        );
+
+        return {
+          ok: false,
+
+          reason:
+            "manual_rate_not_above_provider_cost",
+
+          provider_cost_usd_per_min:
+            round7(providerCost),
+
+          minimum_allowed_rate:
+            round7(
+              providerCost +
+                0.0000001
+            ),
+        };
+      }
+
+      const effectiveMarkup =
+        calculateMarkupPercent({
+          providerCost,
+          sellRate:
+            manualSellRate,
+        });
+
+      await client.query(
+        `
+          UPDATE
+            voice_country_pricing_policies
+
+          SET
+            pricing_mode =
+              'manual_rate',
+
+            markup_percent = $2,
+
+            manual_sell_rate_usd_per_min =
+              $3,
+
+            is_enabled =
+              COALESCE(
+                $4,
+                is_enabled
+              ),
+
+            publish_rate =
+              COALESCE(
+                $4,
+                publish_rate
+              ),
+
+            pricing_note = $5,
+
+            updated_by = $6,
+
+            updated_at = NOW()
+
+          WHERE country_code = $1
+        `,
+        [
+          current.country_code,
+          effectiveMarkup,
+          round7(manualSellRate),
+          payload.is_active,
+          payload.note,
+          adminUserId,
+        ]
+      );
+    } else {
+      await client.query(
+        "ROLLBACK"
+      );
 
       return {
         ok: false,
-
         reason:
-          "manual_rate_not_above_provider_cost",
-
-        provider_cost_usd_per_min:
-          round7(providerCost),
-
-        minimum_allowed_rate:
-          round7(
-            providerCost + 0.0000001
-          ),
+          "unsupported_pricing_mode",
       };
     }
-
-    const markupPercent =
-      calculateMarkupPercent({
-        providerCost,
-        sellRate: manualSellRate,
-      });
-
-    const discountedProviderRate =
-      Number(
-        current
-          .discounted_provider_rate_usd_per_min ||
-        current
-          .raw_provider_rate_usd_per_min ||
-        providerCost
-      );
-
-    const platformFee =
-      Number(
-        current
-          .platform_fee_usd_per_min ||
-        0
-      );
-
-    await client.query(
-      `
-        INSERT INTO call_rates (
-          country_code,
-          country_name,
-          prefix,
-
-          currency,
-          price_per_min_cents,
-
-          is_active,
-
-          provider,
-          provider_rate_usd_per_min,
-
-          discounted_provider_rate_usd_per_min,
-
-          platform_fee_usd_per_min,
-
-          sell_rate_usd_per_min,
-
-          markup_percent,
-          min_profit_usd_per_min,
-
-          manual_override,
-          rate_source,
-
-          route_id,
-          provider_id,
-          provider_plan_id,
-          provider_rate_id,
-
-          publish_rate,
-          disabled_reason,
-
-          pricing_mode,
-
-          manual_rate_note,
-          manual_rate_updated_by,
-          manual_rate_updated_at,
-
-          last_synced_at,
-          updated_at
-        )
-        VALUES (
-          $1,
-          $2,
-          $3,
-
-          'USD',
-          GREATEST(
-            1,
-            CEIL($4 * 100)::integer
-          ),
-
-          $5,
-
-          COALESCE($6, 'telnyx'),
-          $7,
-
-          $8,
-          $9,
-
-          $4,
-
-          $10,
-          $11,
-
-          TRUE,
-          'admin_manual_rate',
-
-          $12,
-          $13,
-          $14,
-          $15,
-
-          $5,
-          CASE
-            WHEN $5 = TRUE
-              THEN NULL
-            ELSE
-              'Disabled by Admin'
-          END,
-
-          'manual_rate',
-
-          $16,
-          $17,
-          NOW(),
-
-          NOW(),
-          NOW()
-        )
-
-        ON CONFLICT (prefix)
-        DO UPDATE SET
-          country_code =
-            EXCLUDED.country_code,
-
-          country_name =
-            EXCLUDED.country_name,
-
-          currency = 'USD',
-
-          price_per_min_cents =
-            EXCLUDED.price_per_min_cents,
-
-          is_active =
-            EXCLUDED.is_active,
-
-          provider =
-            EXCLUDED.provider,
-
-          provider_rate_usd_per_min =
-            EXCLUDED
-              .provider_rate_usd_per_min,
-
-          discounted_provider_rate_usd_per_min =
-            EXCLUDED
-              .discounted_provider_rate_usd_per_min,
-
-          platform_fee_usd_per_min =
-            EXCLUDED
-              .platform_fee_usd_per_min,
-
-          sell_rate_usd_per_min =
-            EXCLUDED
-              .sell_rate_usd_per_min,
-
-          markup_percent =
-            EXCLUDED.markup_percent,
-
-          min_profit_usd_per_min =
-            EXCLUDED
-              .min_profit_usd_per_min,
-
-          manual_override = TRUE,
-
-          rate_source =
-            'admin_manual_rate',
-
-          route_id =
-            EXCLUDED.route_id,
-
-          provider_id =
-            EXCLUDED.provider_id,
-
-          provider_plan_id =
-            EXCLUDED.provider_plan_id,
-
-          provider_rate_id =
-            EXCLUDED.provider_rate_id,
-
-          publish_rate =
-            EXCLUDED.publish_rate,
-
-          disabled_reason =
-            EXCLUDED.disabled_reason,
-
-          pricing_mode =
-            'manual_rate',
-
-          manual_rate_note =
-            EXCLUDED.manual_rate_note,
-
-          manual_rate_updated_by =
-            EXCLUDED
-              .manual_rate_updated_by,
-
-          manual_rate_updated_at =
-            NOW(),
-
-          last_synced_at =
-            NOW(),
-
-          updated_at =
-            NOW()
-      `,
-      [
-        countryCode,
-        countryName,
-        prefix,
-
-        round7(manualSellRate),
-        activeValue,
-
-        current.provider_code,
-
-        Number(
-          current
-            .raw_provider_rate_usd_per_min ||
-          providerCost
-        ),
-
-        discountedProviderRate,
-        platformFee,
-
-        markupPercent,
-
-        Number(
-          current
-            .min_profit_usd_per_min ||
-          DEFAULT_MIN_PROFIT_USD_PER_MIN
-        ),
-
-        current.route_id,
-        current.provider_id,
-        current.provider_plan_id,
-        current.provider_rate_id,
-
-        payload.note,
-        adminUserId,
-      ]
-    );
 
     await client.query("COMMIT");
 
     return {
       ok: true,
       pricing_mode:
-        "manual_rate",
+        pricingMode,
 
       data:
         await getCountryPricingByPrefix(
@@ -1155,7 +1162,9 @@ async function updateCountryPricing({
     };
   } catch (error) {
     try {
-      await client.query("ROLLBACK");
+      await client.query(
+        "ROLLBACK"
+      );
     } catch (_) {
       // Original error preserve হবে।
     }
@@ -1170,33 +1179,45 @@ async function disableManualOverride({
   prefix,
   adminUserId,
 }) {
+  const current =
+    await getCountryPricingByPrefix(
+      prefix
+    );
+
+  if (!current) {
+    return {
+      ok: false,
+      reason:
+        "pricing_record_not_found",
+    };
+  }
+
   const result =
     await db.query(
       `
-        UPDATE call_rates
+        UPDATE
+          voice_country_pricing_policies
+
         SET
           pricing_mode =
             'auto_markup',
 
-          manual_override = FALSE,
+          manual_sell_rate_usd_per_min =
+            NULL,
 
-          rate_source =
-            'admin_manual_override_disabled',
+          pricing_note =
+            'Manual rate disabled by Admin',
 
-          manual_rate_updated_by = $2,
+          updated_by = $2,
 
-          manual_rate_updated_at =
-            NOW(),
+          updated_at = NOW()
 
-          updated_at =
-            NOW()
-
-        WHERE prefix = $1
+        WHERE country_code = $1
 
         RETURNING id
       `,
       [
-        prefix,
+        current.country_code,
         adminUserId,
       ]
     );
@@ -1208,6 +1229,41 @@ async function disableManualOverride({
         "pricing_record_not_found",
     };
   }
+
+  /*
+   * পুরোনো prefix-level override-ও বন্ধ হবে।
+   */
+  await db.query(
+    `
+      UPDATE call_rates
+      SET
+        manual_override = FALSE,
+
+        pricing_mode =
+          'auto_markup',
+
+        rate_source =
+          'country_pricing_v2',
+
+        manual_rate_updated_by = $2,
+
+        manual_rate_updated_at =
+          NOW(),
+
+        updated_at = NOW()
+
+      WHERE UPPER(
+        COALESCE(
+          country_code,
+          ''
+        )
+      ) = $1
+    `,
+    [
+      current.country_code,
+      adminUserId,
+    ]
+  );
 
   return {
     ok: true,

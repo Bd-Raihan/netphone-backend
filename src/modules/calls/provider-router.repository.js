@@ -245,6 +245,57 @@ async function findProviderRate({
 }
 
 /**
+ * Provider rate থেকে পাওয়া country_code অনুযায়ী
+ * provider-agnostic country pricing policy খুঁজে দেয়।
+ *
+ * Provider Telnyx, Twilio বা অন্য যেটাই হোক,
+ * policy শুধু ISO country code অনুযায়ী resolve হবে।
+ */
+async function findCountryPricingPolicy(
+  countryCode
+) {
+  const normalizedCountryCode =
+    String(countryCode || "")
+      .trim()
+      .toUpperCase();
+
+  if (!normalizedCountryCode) {
+    return null;
+  }
+
+  const { rows } = await db.query(
+    `
+      SELECT
+        vcpp.id,
+        vcpp.country_code,
+        vcpp.country_name,
+        vcpp.representative_prefix,
+
+        vcpp.pricing_mode,
+        vcpp.markup_percent,
+        vcpp.manual_sell_rate_usd_per_min,
+        vcpp.min_profit_usd_per_min,
+
+        vcpp.is_enabled,
+        vcpp.publish_rate,
+
+        vcpp.pricing_note,
+        vcpp.updated_by,
+        vcpp.updated_at
+
+      FROM voice_country_pricing_policies vcpp
+
+      WHERE vcpp.country_code = $1
+
+      LIMIT 1
+    `,
+    [normalizedCountryCode]
+  );
+
+  return rows[0] || null;
+}
+
+/**
  * Active manual customer rate override খুঁজে দেয়।
  *
  * Priority:
@@ -455,6 +506,7 @@ module.exports = {
   findActiveRoute,
   findRouteProviderCandidates,
   findProviderRate,
+  findCountryPricingPolicy,
   findManualOverrideRate,
   findLegacyCallRate,
 };

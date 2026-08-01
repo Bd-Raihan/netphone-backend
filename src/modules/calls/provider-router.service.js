@@ -155,6 +155,185 @@ function getEffectiveMinimumProfit({
   return DEFAULT_MIN_PROFIT_USD_PER_MIN;
 }
 
+/**
+ * Country-level pricing policy অনুযায়ী
+ * selected provider cost-এর উপর final customer rate তৈরি করে।
+ *
+ * এই logic provider-agnostic:
+ * Telnyx, Twilio বা ভবিষ্যতের অন্য provider—
+ * সকলের ক্ষেত্রেই একই policy কাজ করবে।
+ */
+function applyCountryPricingPolicy({
+  basePricing,
+  countryPricingPolicy,
+}) {
+  if (!countryPricingPolicy) {
+    return {
+      ok: true,
+      pricing: {
+        ...basePricing,
+        pricing_mode: "auto_markup",
+        country_policy_applied: false,
+      },
+    };
+  }
+
+  const pricingMode =
+    String(
+      countryPricingPolicy.pricing_mode ||
+        "auto_markup"
+    )
+      .trim()
+      .toLowerCase();
+
+  const providerCost =
+    Number(
+      basePricing
+        .total_provider_cost_usd_per_min ||
+        0
+    );
+
+  const minimumProfit =
+    normalizePositiveNumber(
+      countryPricingPolicy
+        .min_profit_usd_per_min,
+      DEFAULT_MIN_PROFIT_USD_PER_MIN
+    );
+
+  /*
+   * Auto Markup Mode:
+   * selected provider cost বদলালে rate
+   * automatically recalculate হবে।
+   */
+  if (pricingMode === "auto_markup") {
+    const markupPercent =
+      normalizePositiveNumber(
+        countryPricingPolicy.markup_percent,
+        DEFAULT_MARKUP_PERCENT
+      );
+
+    const sellRate = Math.max(
+      providerCost *
+        (1 + markupPercent / 100),
+
+      providerCost + minimumProfit
+    );
+
+    return {
+      ok: true,
+
+      pricing: {
+        ...basePricing,
+
+        pricing_mode: "auto_markup",
+
+        markup_percent:
+          round6(markupPercent),
+
+        min_profit_usd_per_min:
+          round6(minimumProfit),
+
+        sell_rate_usd_per_min:
+          round6(sellRate),
+
+        expected_profit_usd_per_min:
+          round6(
+            sellRate - providerCost
+          ),
+
+        country_policy_applied: true,
+      },
+    };
+  }
+
+  /*
+   * Manual Rate Mode:
+   * Admin-এর fixed sell rate ব্যবহার হবে।
+   */
+  if (pricingMode === "manual_rate") {
+    const manualSellRate =
+      Number(
+        countryPricingPolicy
+          .manual_sell_rate_usd_per_min
+      );
+
+    if (
+      !Number.isFinite(manualSellRate) ||
+      manualSellRate <= 0
+    ) {
+      return {
+        ok: false,
+        reason:
+          "invalid_country_manual_rate",
+      };
+    }
+
+    if (
+      providerCost > 0 &&
+      manualSellRate <= providerCost
+    ) {
+      return {
+        ok: false,
+
+        reason:
+          "country_manual_rate_not_above_provider_cost",
+
+        manual_sell_rate_usd_per_min:
+          round6(manualSellRate),
+
+        total_provider_cost_usd_per_min:
+          round6(providerCost),
+      };
+    }
+
+    const effectiveMarkup =
+      providerCost > 0
+        ? (
+            (
+              manualSellRate -
+              providerCost
+            ) /
+            providerCost
+          ) *
+          100
+        : 0;
+
+    return {
+      ok: true,
+
+      pricing: {
+        ...basePricing,
+
+        pricing_mode: "manual_rate",
+
+        markup_percent:
+          round6(effectiveMarkup),
+
+        min_profit_usd_per_min:
+          round6(minimumProfit),
+
+        sell_rate_usd_per_min:
+          round6(manualSellRate),
+
+        expected_profit_usd_per_min:
+          round6(
+            manualSellRate -
+              providerCost
+          ),
+
+        country_policy_applied: true,
+      },
+    };
+  }
+
+  return {
+    ok: false,
+    reason:
+      "unsupported_country_pricing_mode",
+  };
+}
+
+
 function buildFailure(reason, extra = {}) {
   return {
     ok: false,
@@ -528,6 +707,65 @@ async function resolveMultiProviderRoute(toPhoneE164) {
       continue;
     }
 
+    const countryPricingPolicy =
+  await repository
+    .findCountryPricingPolicy(
+      providerRate.country_code
+    );
+
+/*
+ * Country-level calling disabled হলে
+ * provider fallback দিয়েও bypass করা যাবে না।
+ */
+if (
+  countryPricingPolicy &&
+  countryPricingPolicy.is_enabled === false
+) {
+  return buildFailure(
+    "country_pricing_disabled",
+    {
+      destination_policy:
+        destinationPolicy,
+
+      route,
+
+      country_pricing_policy:
+        countryPricingPolicy,
+
+      disabled_reason:
+        countryPricingPolicy
+          .pricing_note ||
+        "Country calling is disabled by Admin",
+    }
+  );
+}
+
+/*
+ * Rate unpublished থাকলেও call allow হবে না।
+ */
+if (
+  countryPricingPolicy &&
+  countryPricingPolicy.publish_rate === false
+) {
+  return buildFailure(
+    "country_rate_unpublished",
+    {
+      destination_policy:
+        destinationPolicy,
+
+      route,
+
+      country_pricing_policy:
+        countryPricingPolicy,
+
+      disabled_reason:
+        countryPricingPolicy
+          .pricing_note ||
+        "Country rate is unpublished",
+    }
+  );
+}
+
     const maximumRate = getEffectiveMaximumRate({
       destinationPolicy,
       route,
@@ -558,22 +796,89 @@ async function resolveMultiProviderRoute(toPhoneE164) {
       continue;
     }
 
-    const pricing = calculatePricing({
-      rawProviderRate,
-      discountPercent:
-        candidate.discount_percent,
-      platformFeeUsdPerMin:
-        candidate.platform_fee_usd_per_min,
-      markupPercent: getEffectiveMarkup({
+   const countryMarkupPercent =
+  countryPricingPolicy
+    ? normalizePositiveNumber(
+        countryPricingPolicy
+          .markup_percent,
+        DEFAULT_MARKUP_PERCENT
+      )
+    : getEffectiveMarkup({
         destinationPolicy,
         route,
-      }),
-      minimumProfitUsdPerMin:
-        getEffectiveMinimumProfit({
-          destinationPolicy,
-          route,
-        }),
-    });
+      });
+
+const countryMinimumProfit =
+  countryPricingPolicy
+    ? normalizePositiveNumber(
+        countryPricingPolicy
+          .min_profit_usd_per_min,
+        DEFAULT_MIN_PROFIT_USD_PER_MIN
+      )
+    : getEffectiveMinimumProfit({
+        destinationPolicy,
+        route,
+      });
+
+const basePricing =
+  calculatePricing({
+    rawProviderRate,
+
+    discountPercent:
+      candidate.discount_percent,
+
+    platformFeeUsdPerMin:
+      candidate
+        .platform_fee_usd_per_min,
+
+    markupPercent:
+      countryMarkupPercent,
+
+    minimumProfitUsdPerMin:
+      countryMinimumProfit,
+  });
+
+const countryPricingResult =
+  applyCountryPricingPolicy({
+    basePricing,
+    countryPricingPolicy,
+  });
+
+if (!countryPricingResult.ok) {
+  rejectedProviders.push({
+    provider_code:
+      candidate.provider_code,
+
+    route_provider_id:
+      candidate.route_provider_id,
+
+    provider_rate_id:
+      providerRate.provider_rate_id,
+
+    country_code:
+      providerRate.country_code,
+
+    reason:
+      countryPricingResult.reason,
+
+    manual_sell_rate_usd_per_min:
+      countryPricingResult
+        .manual_sell_rate_usd_per_min,
+
+    total_provider_cost_usd_per_min:
+      countryPricingResult
+        .total_provider_cost_usd_per_min,
+  });
+
+  if (!candidate.allow_fallback) {
+    break;
+  }
+
+  continue;
+}
+
+const pricing =
+  countryPricingResult.pricing;
 
         /*
      * Provider CSV native billing policy pricing result-এর
@@ -645,6 +950,8 @@ async function resolveMultiProviderRoute(toPhoneE164) {
       source: "multi_provider_router",
       destination_policy:
         destinationPolicy,
+      country_pricing_policy:
+        countryPricingPolicy,
       route,
       route_provider: candidate,
       provider: {
