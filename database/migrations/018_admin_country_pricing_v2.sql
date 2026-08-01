@@ -179,40 +179,59 @@ ON voice_provider_rates (
 -- ---------------------------------------------------------
 -- 4. সব active imported country seed
 -- ---------------------------------------------------------
-WITH imported_countries AS (
+-- ---------------------------------------------------------
+-- 4. সব active imported country seed
+-- ---------------------------------------------------------
+WITH active_country_rates AS (
   SELECT
     UPPER(
-      COALESCE(
-        NULLIF(TRIM(vpr.country_code), ''),
-        'UNKNOWN'
-      )
+      TRIM(vpr.country_code)
     ) AS country_code,
 
+    /*
+     * Provider-এর সরাসরি country_name আগে নেওয়া হবে।
+     * সেটি না থাকলে destination_name fallback হবে।
+     */
     COALESCE(
-      NULLIF(TRIM(vpr.country_name), ''),
-      NULLIF(TRIM(vpr.destination_name), ''),
-      'Unknown'
+      NULLIF(
+        TRIM(vpr.country_name),
+        ''
+      ),
+
+      NULLIF(
+        TRIM(vpr.destination_name),
+        ''
+      ),
+
+      UPPER(
+        TRIM(vpr.country_code)
+      )
     ) AS country_name,
 
-    (
-      ARRAY_AGG(
-        vpr.prefix
-        ORDER BY
-          LENGTH(vpr.prefix) ASC,
-          vpr.prefix ASC
-      )
-    )[1] AS representative_prefix
+    CASE
+      WHEN NULLIF(
+        TRIM(vpr.country_name),
+        ''
+      ) IS NOT NULL
+        THEN 0
+      ELSE 1
+    END AS country_name_priority,
+
+    vpr.prefix
 
   FROM voice_provider_rates vpr
 
   JOIN voice_provider_rate_cards vprc
-    ON vprc.id = vpr.rate_card_id
+    ON vprc.id =
+       vpr.rate_card_id
 
   JOIN voice_providers vp
-    ON vp.id = vpr.provider_id
+    ON vp.id =
+       vpr.provider_id
 
   WHERE vpr.is_active = TRUE
     AND vprc.is_active = TRUE
+
     AND vp.status = 'active'
     AND vp.supports_voice = TRUE
 
@@ -241,19 +260,54 @@ WITH imported_countries AS (
       ''
     ) IS NOT NULL
 
-  GROUP BY
-    UPPER(
-      COALESCE(
-        NULLIF(TRIM(vpr.country_code), ''),
-        'UNKNOWN'
-      )
-    ),
+    AND NULLIF(
+      TRIM(vpr.prefix),
+      ''
+    ) IS NOT NULL
+),
 
-    COALESCE(
-      NULLIF(TRIM(vpr.country_name), ''),
-      NULLIF(TRIM(vpr.destination_name), ''),
-      'Unknown'
-    )
+imported_countries AS (
+  SELECT
+    country_code,
+
+    /*
+     * একই country_code-এর জন্য মাত্র একটি
+     * professional country name নির্বাচন করবে।
+     *
+     * Priority:
+     * 1. Provider country_name
+     * 2. Destination fallback name
+     * 3. ছোট এবং deterministic name
+     */
+    (
+      ARRAY_AGG(
+        country_name
+
+        ORDER BY
+          country_name_priority ASC,
+          LENGTH(country_name) ASC,
+          country_name ASC
+      )
+    )[1] AS country_name,
+
+    /*
+     * Dashboard/API lookup-এর জন্য country-এর
+     * সবচেয়ে ছোট representative prefix।
+     */
+    (
+      ARRAY_AGG(
+        prefix
+
+        ORDER BY
+          LENGTH(prefix) ASC,
+          prefix ASC
+      )
+    )[1] AS representative_prefix
+
+  FROM active_country_rates
+
+  GROUP BY
+    country_code
 )
 
 INSERT INTO
