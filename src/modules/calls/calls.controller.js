@@ -1639,6 +1639,7 @@ async function getCallStatus(req, res) {
           duration_sec,
           charged_minutes,
           charged_amount_cents,
+          charged_amount_usd,
           billing_source,
           price_per_min_cents,
           provider_rate_usd_per_min,
