@@ -65,6 +65,32 @@ function usdTotalToWalletCents(usdAmount) {
   );
 }
 
+const MICRO_USD_PER_USD = 1_000_000;
+
+function usdTotalToMicroUsd(usdAmount) {
+  const safeAmount =
+    toNonNegativeNumber(
+      usdAmount,
+      0
+    );
+
+  if (safeAmount <= 0) {
+    return 0;
+  }
+
+  /*
+   * Call amount সর্বোচ্চ 7 decimal snapshot থেকে আসে।
+   * Wallet ledger 6 decimal পর্যন্ত exact রাখবে।
+   */
+  return Math.max(
+    1,
+    Math.round(
+      safeAmount *
+      MICRO_USD_PER_USD
+    )
+  );
+}
+
 /**
  * Telnyx/provider billing policy অনুযায়ী billable seconds হিসাব করে।
  *
@@ -1295,7 +1321,8 @@ async function billCompletedCallByProvider({
           "customer_charge_below_provider_cost",
       };
     }
-
+    const amountMicroUsd =
+      usdTotalToMicroUsd(chargedUsd);
     const amountCents =
       usdTotalToWalletCents(chargedUsd);
 
@@ -1336,7 +1363,7 @@ async function billCompletedCallByProvider({
 
         currency:
           "USD",
-
+        amountMicroUsd,
         amountCents,
 
         txType:
@@ -1642,6 +1669,9 @@ async function billCompletedCallByProvider({
 
       charged_amount_cents:
         amountCents,
+
+       charged_amount_microusd:
+        amountMicroUsd,
 
       charged_amount_usd:
         chargedUsd,

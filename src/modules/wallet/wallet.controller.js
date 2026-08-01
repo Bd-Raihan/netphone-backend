@@ -13,7 +13,8 @@ const walletService = require("./wallet.service"); // Wallet related business lo
 /// ===============================
 async function me(req, res) {
   try {
-    const userId = Number(req.user.id);
+    const userId =
+      Number(req.user?.id);
 
     if (
       !Number.isInteger(userId) ||
@@ -30,75 +31,67 @@ async function me(req, res) {
       "USD"
     );
 
-    /*
-     * Wallet balance-এর সঙ্গে user-এর সর্বশেষ valid
-     * destination sell rate নেওয়া হচ্ছে।
-     *
-     * এতে app reinstall, logout/login বা device change হলেও
-     * estimated minutes হারাবে না।
-     */
-    const q = `
-      SELECT
-        w.user_id,
-        w.currency,
-        w.balance_cents,
-        w.updated_at,
-
-        latest_call.id
-          AS latest_call_session_id,
-
-        latest_call.to_phone_e164
-          AS latest_call_to_phone_e164,
-
-        latest_call.sell_rate_usd_per_min
-          AS latest_sell_rate_usd_per_min,
-
-       latest_call.started_at
-        AS latest_call_started_at,
-
-        latest_call.meta->>'matched_prefix'
-          AS latest_matched_prefix
-
-      FROM wallets w
-
-      LEFT JOIN LATERAL
-      (
+    const { rows } = await db.query(
+      `
         SELECT
-          cs.id,
-          cs.to_phone_e164,
-          cs.sell_rate_usd_per_min,
-          cs.started_at,
-          cs.meta
+          w.user_id,
+          w.currency,
 
-        FROM call_sessions cs
+          w.balance_cents,
+          w.balance_microusd,
 
-        WHERE cs.user_id = w.user_id
+          (
+            w.balance_microusd::numeric /
+            1000000
+          )::numeric(20,7)
+            AS balance_usd,
 
-          AND cs.sell_rate_usd_per_min
-                IS NOT NULL
+          w.updated_at,
 
-          AND cs.sell_rate_usd_per_min > 0
+          u.phone_e164,
 
-          AND COALESCE(
-                cs.status,
-                ''
-              ) <> 'failed'
+          estimate.country_code
+            AS estimate_country_code,
 
-        ORDER BY
-        cs.started_at DESC,
-          cs.id DESC
+          estimate.country_name
+            AS estimate_country_name,
 
+          estimate.phone_prefix
+            AS estimate_phone_prefix,
+
+          estimate.estimate_rate_usd_per_min
+
+        FROM wallets w
+
+        JOIN users u
+          ON u.id = w.user_id
+
+        LEFT JOIN LATERAL (
+          SELECT
+            wer.country_code,
+            wer.country_name,
+            wer.phone_prefix,
+            wer.estimate_rate_usd_per_min
+          FROM wallet_estimate_rates wer
+          WHERE wer.is_active = TRUE
+            AND REPLACE(
+                  u.phone_e164,
+                  '+',
+                  ''
+                ) LIKE
+                wer.phone_prefix || '%'
+          ORDER BY
+            LENGTH(wer.phone_prefix) DESC,
+            wer.id ASC
+          LIMIT 1
+        ) estimate
+          ON TRUE
+
+        WHERE w.user_id = $1
         LIMIT 1
-      ) latest_call
-        ON TRUE
-
-      WHERE w.user_id = $1
-
-      LIMIT 1;
-    `;
-
-    const { rows } =
-      await db.query(q, [userId]);
+      `,
+      [userId]
+    );
 
     if (!rows.length) {
       return res.status(404).json({
@@ -109,9 +102,9 @@ async function me(req, res) {
 
     const row = rows[0];
 
-    const sellRate =
+    const estimateRate =
       Number(
-        row.latest_sell_rate_usd_per_min
+        row.estimate_rate_usd_per_min
       );
 
     return res.json({
@@ -127,41 +120,48 @@ async function me(req, res) {
         balance_cents:
           row.balance_cents,
 
+        balance_microusd:
+          row.balance_microusd,
+
+        balance_usd:
+          row.balance_usd,
+
         updated_at:
           row.updated_at,
       },
 
       estimated_call_rate:
-        Number.isFinite(sellRate) &&
-        sellRate > 0
+        Number.isFinite(estimateRate) &&
+        estimateRate > 0
           ? {
               sell_rate_usd_per_min:
-                sellRate,
+                estimateRate,
 
-              to_phone_e164:
-                row.latest_call_to_phone_e164,
+              country_code:
+                row.estimate_country_code,
 
-              matched_prefix:
-                row.latest_matched_prefix,
+              country_name:
+                row.estimate_country_name,
 
-              call_session_id:
-                row.latest_call_session_id,
+              phone_prefix:
+                row.estimate_phone_prefix,
 
-              rate_saved_at:
-                row.latest_call_started_at,
+              rate_source:
+                "registered_country_stable_rate",
             }
           : null,
     });
-  } catch (e) {
+  } catch (error) {
     console.error(
       "wallet/me error:",
-      e
+      error
     );
 
     return res.status(500).json({
       ok: false,
+
       message:
-        e.message ||
+        error.message ||
         "Unable to load wallet",
     });
   }
@@ -173,30 +173,38 @@ async function me(req, res) {
 /// ===============================
 async function tx(req, res) {
   try {
-    const userId = Number(req.user.id);
-    const limit = Math.min(Number(req.query.limit || 20), 100);
+    const userId =
+      Number(req.user?.id);
 
-    const q = `
-      SELECT id, type, amount_cents, status, balance_after_cents, created_at, meta
-      FROM wallet_transactions
-      WHERE user_id = $1
-      ORDER BY created_at DESC
-      LIMIT $2;
-    `;
+    const limit =
+      Math.min(
+        Math.max(
+          Number(req.query.limit || 20),
+          1
+        ),
+        100
+      );
 
-    const { rows } = await db.query(q, [userId, limit]);
+    const items =
+      await walletService.listTransactions(
+        userId,
+        limit
+      );
 
-   return res.json({
-    ok: true,
-    items: rows,
-    transactions: rows,
+    return res.json({
+      ok: true,
+      items,
+      transactions: items,
     });
+  } catch (error) {
+    console.error(
+      "wallet/tx error:",
+      error
+    );
 
-  } catch (e) {
-    console.error("wallet/tx error:", e);
     return res.status(500).json({
       ok: false,
-      message: e.message,
+      message: error.message,
     });
   }
 }

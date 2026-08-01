@@ -1,23 +1,97 @@
 const db = require("../../config/db");
+const MICRO_USD_PER_USD = 1_000_000;
+const MICRO_USD_PER_CENT = 10_000;
 
+function toSafeInteger(value, fallback = 0) {
+  const parsed = Number(value);
+
+  if (!Number.isSafeInteger(parsed)) {
+    return fallback;
+  }
+
+  return parsed;
+}
+
+function centsToMicroUsd(amountCents) {
+  return (
+    toSafeInteger(amountCents, 0) *
+    MICRO_USD_PER_CENT
+  );
+}
+
+function microUsdToLegacyCents(amountMicroUsd) {
+  const safeAmount =
+    Math.max(
+      0,
+      toSafeInteger(amountMicroUsd, 0)
+    );
+
+  /*
+   * Legacy cents field শুধু compatibility/display fallback।
+   * Primary exact ledger নয়।
+   */
+  return Math.round(
+    safeAmount / MICRO_USD_PER_CENT
+  );
+}
+
+function microUsdToUsd(amountMicroUsd) {
+  return (
+    toSafeInteger(amountMicroUsd, 0) /
+    MICRO_USD_PER_USD
+  );
+}
 async function getWalletByUserId(userId) {
   const { rows } = await db.query(
-    `SELECT user_id, currency, balance_cents, updated_at
-     FROM wallets
-     WHERE user_id = $1`,
+    `
+      SELECT
+        user_id,
+        currency,
+        balance_cents,
+        balance_microusd,
+
+        (
+          balance_microusd::numeric /
+          1000000
+        )::numeric(20,7) AS balance_usd,
+
+        updated_at
+
+      FROM wallets
+      WHERE user_id = $1
+      LIMIT 1
+    `,
     [userId]
   );
+
   return rows[0] || null;
 }
 
 // ✅ ensure wallet row exists (সেফটি)
-async function ensureWallet(userId, currency = "USD") {
+async function ensureWallet(
+  userId,
+  currency = "USD"
+) {
   await db.query(
-    `INSERT INTO wallets (user_id, currency, balance_cents)
-     VALUES ($1, $2, 0)
-     ON CONFLICT (user_id) DO NOTHING`,
+    `
+      INSERT INTO wallets (
+        user_id,
+        currency,
+        balance_cents,
+        balance_microusd
+      )
+      VALUES (
+        $1,
+        $2,
+        0,
+        0
+      )
+      ON CONFLICT (user_id)
+      DO NOTHING
+    `,
     [userId, currency]
   );
+
   return getWalletByUserId(userId);
 }
 
@@ -26,140 +100,459 @@ async function ensureWallet(userId, currency = "USD") {
 async function applyWalletTx({
   userId,
   currency = "USD",
+
+  /*
+   * নতুন exact input।
+   */
+  amountMicroUsd,
+
+  /*
+   * পুরোনো controller/recharge/transfer compatibility।
+   */
   amountCents,
-  txType, // 'admin_credit' | 'admin_debit' | 'call_charge' | ...
-  direction, // legacy support: 'credit' | 'debit' (পুরাতন কোড ভাঙবে না)
+
+  txType,
+  direction,
+
   idempotencyKey = null,
   meta = null,
 }) {
-  // ✅ backward compatible mapping (direction -> txType)
   const finalTxType =
     txType ||
-    (direction === "credit"
-      ? "admin_credit"
-      : direction === "debit"
-      ? "admin_debit"
-      : null);
+    (
+      direction === "credit"
+        ? "admin_credit"
+        : direction === "debit"
+        ? "admin_debit"
+        : null
+    );
 
   if (!finalTxType) {
     throw new Error("tx_type_missing");
   }
 
-  const client = await db.getClient();
+  const normalizedUserId =
+    Number(userId);
+
+  if (
+    !Number.isInteger(normalizedUserId) ||
+    normalizedUserId <= 0
+  ) {
+    throw new Error("invalid_user_id");
+  }
+
+  /*
+   * Exact micro-USD থাকলে সেটিই primary।
+   * না থাকলে পুরোনো cents input convert হবে।
+   */
+  const normalizedAmountMicroUsd =
+    amountMicroUsd !== undefined &&
+    amountMicroUsd !== null
+      ? toSafeInteger(amountMicroUsd, 0)
+      : centsToMicroUsd(amountCents);
+
+  if (normalizedAmountMicroUsd <= 0) {
+    throw new Error("invalid_transaction_amount");
+  }
+
+  const legacyAmountCents =
+    amountCents !== undefined &&
+    amountCents !== null
+      ? Math.abs(
+          toSafeInteger(amountCents, 0)
+        )
+      : microUsdToLegacyCents(
+          normalizedAmountMicroUsd
+        );
+
+  const client =
+    await db.getClient();
+
   try {
     await client.query("BEGIN");
 
-    // ensure wallet exists
     await client.query(
-      `INSERT INTO wallets (user_id, currency, balance_cents)
-       VALUES ($1, $2, 0)
-       ON CONFLICT (user_id) DO NOTHING`,
-      [userId, currency]
+      `
+        INSERT INTO wallets (
+          user_id,
+          currency,
+          balance_cents,
+          balance_microusd
+        )
+        VALUES (
+          $1,
+          $2,
+          0,
+          0
+        )
+        ON CONFLICT (user_id)
+        DO NOTHING
+      `,
+      [
+        normalizedUserId,
+        currency,
+      ]
     );
 
-    // wallet lock
-    const w = await client.query(
-      `SELECT user_id, currency, balance_cents
-       FROM wallets
-       WHERE user_id = $1
-       FOR UPDATE`,
-      [userId]
-    );
-
-    const wallet = w.rows[0];
-    if (!wallet) throw new Error("wallet_missing");
-
-    // idempotency check
-    if (idempotencyKey) {
-      const exist = await client.query(
-        `SELECT id, amount_cents, balance_after_cents
-         FROM wallet_transactions
-         WHERE user_id = $1 AND idempotency_key = $2
-         LIMIT 1`,
-        [userId, idempotencyKey]
+    const walletResult =
+      await client.query(
+        `
+          SELECT
+            user_id,
+            currency,
+            balance_cents,
+            balance_microusd
+          FROM wallets
+          WHERE user_id = $1
+          FOR UPDATE
+        `,
+        [normalizedUserId]
       );
-      if (exist.rows[0]) {
+
+    const wallet =
+      walletResult.rows[0];
+
+    if (!wallet) {
+      throw new Error("wallet_missing");
+    }
+
+    /*
+     * Migration-এর পরেও safety fallback।
+     */
+    const currentBalanceMicroUsd =
+      wallet.balance_microusd !== null &&
+      wallet.balance_microusd !== undefined
+        ? toSafeInteger(
+            Number(wallet.balance_microusd),
+            0
+          )
+        : centsToMicroUsd(
+            wallet.balance_cents
+          );
+
+    if (idempotencyKey) {
+      const existingResult =
+        await client.query(
+          `
+            SELECT
+              id,
+              user_id,
+              type,
+              amount_cents,
+              amount_microusd,
+              status,
+              balance_after_cents,
+              balance_after_microusd,
+              created_at,
+              meta,
+
+              (
+                amount_microusd::numeric /
+                1000000
+              )::numeric(20,7)
+                AS amount_usd,
+
+              (
+                balance_after_microusd::numeric /
+                1000000
+              )::numeric(20,7)
+                AS balance_after_usd
+
+            FROM wallet_transactions
+            WHERE user_id = $1
+              AND idempotency_key = $2
+            LIMIT 1
+          `,
+          [
+            normalizedUserId,
+            idempotencyKey,
+          ]
+        );
+
+      if (existingResult.rows[0]) {
         await client.query("COMMIT");
-        return { ok: true, duplicated: true, wallet, tx: exist.rows[0] };
+
+        return {
+          ok: true,
+          duplicated: true,
+          wallet:
+            await getWalletByUserId(
+              normalizedUserId
+            ),
+          tx: existingResult.rows[0],
+        };
       }
     }
 
-    let newBalance;
+    const creditTypes = new Set([
+      "admin_credit",
+      "recharge",
+      "refund",
+      "transfer_received",
+      "transfer_in",
+    ]);
 
-    switch (finalTxType) {
+    const debitTypes = new Set([
+      "admin_debit",
+      "call_charge",
+      "withdraw",
+      "transfer_sent",
+      "transfer_out",
+    ]);
 
-    case "admin_credit":
-    case "recharge":
-    case "refund":
-    case "transfer_received":
-    case "transfer_in":
-      newBalance =
-          Number(wallet.balance_cents) + Number(amountCents);
-      break;
+    let newBalanceMicroUsd;
 
-    case "admin_debit":
-    case "call_charge":
-    case "withdraw":
-    case "transfer_sent":
-    case "transfer_out":
-      newBalance =
-          Number(wallet.balance_cents) - Number(amountCents);
-      break;
-
-    default:
-      throw new Error("unknown_transaction_type");
-  }
-
-    // ✅ insufficient balance rule (negative allow না)
-    if (newBalance < 0) {
-      await client.query("ROLLBACK");
-      return { ok: false, reason: "insufficient_balance" };
+    if (creditTypes.has(finalTxType)) {
+      newBalanceMicroUsd =
+        currentBalanceMicroUsd +
+        normalizedAmountMicroUsd;
+    } else if (debitTypes.has(finalTxType)) {
+      newBalanceMicroUsd =
+        currentBalanceMicroUsd -
+        normalizedAmountMicroUsd;
+    } else {
+      throw new Error(
+        "unknown_transaction_type"
+      );
     }
 
+    if (newBalanceMicroUsd < 0) {
+      await client.query("ROLLBACK");
 
-    // meta jsonb safe
-    const metaJson = meta ? JSON.stringify(meta) : null;
+      return {
+        ok: false,
+        reason: "insufficient_balance",
+      };
+    }
 
-    // insert tx (type NOT NULL হবে)
-    const ins = await client.query(
-      `INSERT INTO wallet_transactions
-        (user_id, type, amount_cents, status, idempotency_key, balance_after_cents, meta)
-       VALUES
-        ($1, $2, $3, 'posted', $4, $5, $6::jsonb)
-       RETURNING id, user_id, type, amount_cents, status, balance_after_cents, created_at`,
-      [userId, finalTxType, amountCents, idempotencyKey, newBalance, metaJson]
-    );
+    /*
+     * Legacy balance_cents exact ledger নয়।
+     * Existing পুরোনো screen/API ভাঙা রোধে derived field।
+     */
+    const newBalanceCents =
+      microUsdToLegacyCents(
+        newBalanceMicroUsd
+      );
 
-    // update wallet balance
+    const metaJson =
+      meta
+        ? JSON.stringify({
+            ...meta,
+
+            exact_wallet_amount: {
+              amount_microusd:
+                normalizedAmountMicroUsd,
+
+              amount_usd:
+                microUsdToUsd(
+                  normalizedAmountMicroUsd
+                ),
+
+              balance_after_microusd:
+                newBalanceMicroUsd,
+
+              balance_after_usd:
+                microUsdToUsd(
+                  newBalanceMicroUsd
+                ),
+            },
+          })
+        : JSON.stringify({
+            exact_wallet_amount: {
+              amount_microusd:
+                normalizedAmountMicroUsd,
+
+              amount_usd:
+                microUsdToUsd(
+                  normalizedAmountMicroUsd
+                ),
+
+              balance_after_microusd:
+                newBalanceMicroUsd,
+
+              balance_after_usd:
+                microUsdToUsd(
+                  newBalanceMicroUsd
+                ),
+            },
+          });
+
+    const transactionResult =
+      await client.query(
+        `
+          INSERT INTO wallet_transactions (
+            user_id,
+            type,
+
+            amount_cents,
+            amount_microusd,
+
+            status,
+            idempotency_key,
+
+            balance_after_cents,
+            balance_after_microusd,
+
+            meta
+          )
+          VALUES (
+            $1,
+            $2,
+
+            $3,
+            $4,
+
+            'posted',
+            $5,
+
+            $6,
+            $7,
+
+            $8::jsonb
+          )
+          RETURNING
+            id,
+            user_id,
+            type,
+
+            amount_cents,
+            amount_microusd,
+
+            status,
+
+            balance_after_cents,
+            balance_after_microusd,
+
+            created_at,
+            meta,
+
+            (
+              amount_microusd::numeric /
+              1000000
+            )::numeric(20,7)
+              AS amount_usd,
+
+            (
+              balance_after_microusd::numeric /
+              1000000
+            )::numeric(20,7)
+              AS balance_after_usd
+        `,
+        [
+          normalizedUserId,
+          finalTxType,
+
+          legacyAmountCents,
+          normalizedAmountMicroUsd,
+
+          idempotencyKey,
+
+          newBalanceCents,
+          newBalanceMicroUsd,
+
+          metaJson,
+        ]
+      );
+
     await client.query(
-      `UPDATE wallets
-       SET balance_cents = $2, updated_at = NOW()
-       WHERE user_id = $1`,
-      [userId, newBalance]
+      `
+        UPDATE wallets
+        SET
+          balance_microusd = $2,
+          balance_cents = $3,
+          updated_at = NOW()
+        WHERE user_id = $1
+      `,
+      [
+        normalizedUserId,
+        newBalanceMicroUsd,
+        newBalanceCents,
+      ]
     );
 
     await client.query("COMMIT");
 
-    const updatedWallet = await getWalletByUserId(userId);
-    return { ok: true, wallet: updatedWallet, tx: ins.rows[0] };
-  } catch (e) {
-    try { await client.query("ROLLBACK"); } catch {}
-    throw e;
+    return {
+      ok: true,
+
+      wallet:
+        await getWalletByUserId(
+          normalizedUserId
+        ),
+
+      tx:
+        transactionResult.rows[0],
+    };
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {
+      // Original error preserve হবে।
+    }
+
+    throw error;
   } finally {
     client.release();
   }
 }
 
 
-async function listTransactions(userId, limit = 20) {
+async function listTransactions(
+  userId,
+  limit = 20
+) {
   const { rows } = await db.query(
-    `SELECT id, type, amount_cents, status, balance_after_cents, created_at, meta
-     FROM wallet_transactions
-     WHERE user_id = $1
-     ORDER BY created_at DESC
-     LIMIT $2`,
-    [userId, limit]
+    `
+      SELECT
+        id,
+        type,
+
+        amount_cents,
+        amount_microusd,
+
+        status,
+
+        balance_after_cents,
+        balance_after_microusd,
+
+        created_at,
+        meta,
+
+        COALESCE(
+          (
+            amount_microusd::numeric /
+            1000000
+          ),
+          (
+            amount_cents::numeric /
+            100
+          )
+        )::numeric(20,7)
+          AS amount_usd,
+
+        COALESCE(
+          (
+            balance_after_microusd::numeric /
+            1000000
+          ),
+          (
+            balance_after_cents::numeric /
+            100
+          )
+        )::numeric(20,7)
+          AS balance_after_usd
+
+      FROM wallet_transactions
+      WHERE user_id = $1
+      ORDER BY created_at DESC
+      LIMIT $2
+    `,
+    [
+      userId,
+      limit,
+    ]
   );
+
   return rows;
 }
 
