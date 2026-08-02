@@ -52,6 +52,10 @@ async function requestOtp(req, res) {
 
     // ✅ Production: OTP SMS sent by Telnyx, OTP code response এ দেওয়া হবে না
     const smsResult = await sendOtpSms({ to: phone });
+    console.log(
+     "TELNYX VERIFY RESPONSE:",
+      JSON.stringify(smsResult, null, 2)
+    );
     if (!smsResult.ok) {
       return res.status(500).json({ ok: false, message: "Failed to send OTP" });
     }
