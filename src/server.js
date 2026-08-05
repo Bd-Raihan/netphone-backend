@@ -1,20 +1,195 @@
+"use strict";
+
 /**
  * server.js
- * ----------------
- * এই ফাইলের কাজ:
- * - .env ফাইল লোড করা
- * - Express app চালু করা
- * - Server কোন PORT এ রান করবে সেট করা
+ *
+ * Responsibilities:
+ * - Load environment variables
+ * - Start Express HTTP server
+ * - Start Binance reconciliation worker when enabled
+ * - Gracefully stop HTTP server and worker
  */
 
-require("dotenv").config(); // .env ফাইল লোড
+require("dotenv").config();
 
 const app = require("./app");
 
-// PORT .env থেকে নেওয়া
-const PORT = process.env.PORT || 8080;
+const binanceReconciliationWorker = require(
+  "./modules/payment-engine/providers/binance-onchain/binance.reconciliation.worker"
+);
 
-// Server চালু
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 AlHawari Call API running on port ${PORT}`);
-});
+const PORT =
+  Number(process.env.PORT) || 8080;
+
+const HOST =
+  process.env.HOST || "0.0.0.0";
+
+let shuttingDown = false;
+
+/**
+ * Start HTTP server
+ */
+const server = app.listen(
+  PORT,
+  HOST,
+  async () => {
+    console.log(
+      `🚀 AlHawari Call API running on port ${PORT}`
+    );
+
+    try {
+      const workerResult =
+        await binanceReconciliationWorker.start();
+
+      if (workerResult.started) {
+        console.log(
+          "✅ Binance reconciliation worker started",
+          {
+            workerId:
+              workerResult.workerId,
+          }
+        );
+      } else {
+        console.log(
+          "ℹ️ Binance reconciliation worker not started",
+          {
+            reason:
+              workerResult.reason ||
+              "disabled",
+          }
+        );
+      }
+    } catch (error) {
+      console.error(
+        "❌ Binance reconciliation worker startup failed",
+        {
+          message:
+            error?.message ||
+            "unknown_worker_startup_error",
+        }
+      );
+    }
+  }
+);
+
+/**
+ * Graceful shutdown
+ */
+async function shutdown(signal) {
+  if (shuttingDown) {
+    return;
+  }
+
+  shuttingDown = true;
+
+  console.log(
+    `\n🛑 ${signal} received. Shutting down safely...`
+  );
+
+  const forceExitTimer =
+    setTimeout(() => {
+      console.error(
+        "❌ Graceful shutdown timeout. Forcing exit."
+      );
+
+      process.exit(1);
+    }, 35_000);
+
+  if (
+    typeof forceExitTimer.unref ===
+    "function"
+  ) {
+    forceExitTimer.unref();
+  }
+
+  try {
+    await binanceReconciliationWorker.stop({
+      waitTimeoutMs: 30_000,
+    });
+  } catch (error) {
+    console.error(
+      "❌ Binance reconciliation worker stop failed",
+      {
+        message:
+          error?.message ||
+          "unknown_worker_stop_error",
+      }
+    );
+  }
+
+  server.close((error) => {
+    clearTimeout(forceExitTimer);
+
+    if (error) {
+      console.error(
+        "❌ HTTP server shutdown failed",
+        error
+      );
+
+      process.exit(1);
+      return;
+    }
+
+    console.log(
+      "✅ HTTP server stopped safely"
+    );
+
+    process.exit(0);
+  });
+}
+
+process.on(
+  "SIGTERM",
+  () => shutdown("SIGTERM")
+);
+
+process.on(
+  "SIGINT",
+  () => shutdown("SIGINT")
+);
+
+process.on(
+  "uncaughtException",
+  (error) => {
+    console.error(
+      "❌ Uncaught exception",
+      {
+        message:
+          error?.message ||
+          "unknown_uncaught_exception",
+
+        stack:
+          error?.stack ||
+          null,
+      }
+    );
+
+    shutdown(
+      "UNCAUGHT_EXCEPTION"
+    );
+  }
+);
+
+process.on(
+  "unhandledRejection",
+  (reason) => {
+    console.error(
+      "❌ Unhandled promise rejection",
+      {
+        message:
+          reason?.message ||
+          String(reason),
+
+        stack:
+          reason?.stack ||
+          null,
+      }
+    );
+
+    shutdown(
+      "UNHANDLED_REJECTION"
+    );
+  }
+);
+
+module.exports = server;
