@@ -496,6 +496,437 @@ async function applyWalletTx({
   }
 }
 
+/**
+ * Payment Engine transaction-aware wallet operation.
+ *
+ * গুরুত্বপূর্ণ:
+ * - এটি নিজে BEGIN / COMMIT / ROLLBACK করে না।
+ * - caller থেকে পাওয়া একই PostgreSQL client ব্যবহার করে।
+ * - Payment order, wallet credit এবং crypto history একই
+ *   database transaction-এর মধ্যে রাখা যাবে।
+ */
+async function applyWalletTxWithClient({
+  client,
+
+  userId,
+  currency = "USD",
+
+  amountMicroUsd,
+  amountCents,
+
+  txType,
+  direction,
+
+  idempotencyKey = null,
+  reference = null,
+  meta = null,
+}) {
+  if (
+    !client ||
+    typeof client.query !== "function"
+  ) {
+    throw new Error("database_client_required");
+  }
+
+  const finalTxType =
+    txType ||
+    (
+      direction === "credit"
+        ? "admin_credit"
+        : direction === "debit"
+        ? "admin_debit"
+        : null
+    );
+
+  if (!finalTxType) {
+    throw new Error("tx_type_missing");
+  }
+
+  const normalizedUserId =
+    Number(userId);
+
+  if (
+    !Number.isInteger(normalizedUserId) ||
+    normalizedUserId <= 0
+  ) {
+    throw new Error("invalid_user_id");
+  }
+
+  const normalizedAmountMicroUsd =
+    amountMicroUsd !== undefined &&
+    amountMicroUsd !== null
+      ? toSafeInteger(
+          amountMicroUsd,
+          0
+        )
+      : centsToMicroUsd(
+          amountCents
+        );
+
+  if (
+    normalizedAmountMicroUsd <= 0
+  ) {
+    throw new Error(
+      "invalid_transaction_amount"
+    );
+  }
+
+  const legacyAmountCents =
+    amountCents !== undefined &&
+    amountCents !== null
+      ? Math.abs(
+          toSafeInteger(
+            amountCents,
+            0
+          )
+        )
+      : microUsdToLegacyCents(
+          normalizedAmountMicroUsd
+        );
+
+  /*
+   * Wallet না থাকলে একই transaction-এর মধ্যে তৈরি হবে।
+   */
+  await client.query(
+    `
+      INSERT INTO wallets (
+        user_id,
+        currency,
+        balance_cents,
+        balance_microusd
+      )
+      VALUES (
+        $1,
+        $2,
+        0,
+        0
+      )
+      ON CONFLICT (user_id)
+      DO NOTHING
+    `,
+    [
+      normalizedUserId,
+      currency,
+    ]
+  );
+
+  /*
+   * Wallet row lock।
+   */
+  const walletResult =
+    await client.query(
+      `
+        SELECT
+          user_id,
+          currency,
+          balance_cents,
+          balance_microusd,
+          updated_at
+        FROM wallets
+        WHERE user_id = $1
+        FOR UPDATE
+      `,
+      [normalizedUserId]
+    );
+
+  const wallet =
+    walletResult.rows[0];
+
+  if (!wallet) {
+    throw new Error("wallet_missing");
+  }
+
+  /*
+   * একই payment/order আগে credit হয়ে থাকলে
+   * দ্বিতীয়বার balance পরিবর্তন হবে না।
+   */
+  if (idempotencyKey) {
+    const existingResult =
+      await client.query(
+        `
+          SELECT
+            id,
+            user_id,
+            type,
+
+            amount_cents,
+            amount_microusd,
+
+            reference,
+            idempotency_key,
+            status,
+
+            balance_after_cents,
+            balance_after_microusd,
+
+            created_at,
+            meta,
+
+            (
+              amount_microusd::numeric /
+              1000000
+            )::numeric(20,7)
+              AS amount_usd,
+
+            (
+              balance_after_microusd::numeric /
+              1000000
+            )::numeric(20,7)
+              AS balance_after_usd
+
+          FROM wallet_transactions
+
+          WHERE user_id = $1
+            AND idempotency_key = $2
+
+          LIMIT 1
+        `,
+        [
+          normalizedUserId,
+          idempotencyKey,
+        ]
+      );
+
+    if (existingResult.rows[0]) {
+      return {
+        ok: true,
+        duplicated: true,
+
+        wallet: {
+          ...wallet,
+
+          balance_usd:
+            microUsdToUsd(
+              toSafeInteger(
+                wallet.balance_microusd,
+                0
+              )
+            ),
+        },
+
+        tx:
+          existingResult.rows[0],
+      };
+    }
+  }
+
+  const currentBalanceMicroUsd =
+    wallet.balance_microusd !== null &&
+    wallet.balance_microusd !== undefined
+      ? toSafeInteger(
+          Number(
+            wallet.balance_microusd
+          ),
+          0
+        )
+      : centsToMicroUsd(
+          wallet.balance_cents
+        );
+
+  const creditTypes = new Set([
+    "admin_credit",
+    "recharge",
+    "refund",
+    "transfer_received",
+    "transfer_in",
+  ]);
+
+  const debitTypes = new Set([
+    "admin_debit",
+    "call_charge",
+    "withdraw",
+    "transfer_sent",
+    "transfer_out",
+  ]);
+
+  let newBalanceMicroUsd;
+
+  if (
+    creditTypes.has(finalTxType)
+  ) {
+    newBalanceMicroUsd =
+      currentBalanceMicroUsd +
+      normalizedAmountMicroUsd;
+  } else if (
+    debitTypes.has(finalTxType)
+  ) {
+    newBalanceMicroUsd =
+      currentBalanceMicroUsd -
+      normalizedAmountMicroUsd;
+  } else {
+    throw new Error(
+      "unknown_transaction_type"
+    );
+  }
+
+  if (newBalanceMicroUsd < 0) {
+    return {
+      ok: false,
+      reason: "insufficient_balance",
+    };
+  }
+
+  const newBalanceCents =
+    microUsdToLegacyCents(
+      newBalanceMicroUsd
+    );
+
+  const finalReference =
+    reference ||
+    (
+      idempotencyKey
+        ? String(idempotencyKey)
+        : null
+    );
+
+  const metaJson =
+    JSON.stringify({
+      ...(meta || {}),
+
+      exact_wallet_amount: {
+        amount_microusd:
+          normalizedAmountMicroUsd,
+
+        amount_usd:
+          microUsdToUsd(
+            normalizedAmountMicroUsd
+          ),
+
+        balance_after_microusd:
+          newBalanceMicroUsd,
+
+        balance_after_usd:
+          microUsdToUsd(
+            newBalanceMicroUsd
+          ),
+      },
+    });
+
+  const transactionResult =
+    await client.query(
+      `
+        INSERT INTO wallet_transactions (
+          user_id,
+          type,
+
+          amount_cents,
+          amount_microusd,
+
+          reference,
+          idempotency_key,
+
+          status,
+
+          balance_after_cents,
+          balance_after_microusd,
+
+          meta
+        )
+        VALUES (
+          $1,
+          $2,
+
+          $3,
+          $4,
+
+          $5,
+          $6,
+
+          'posted',
+
+          $7,
+          $8,
+
+          $9::jsonb
+        )
+        RETURNING
+          id,
+          user_id,
+          type,
+
+          amount_cents,
+          amount_microusd,
+
+          reference,
+          idempotency_key,
+          status,
+
+          balance_after_cents,
+          balance_after_microusd,
+
+          created_at,
+          meta,
+
+          (
+            amount_microusd::numeric /
+            1000000
+          )::numeric(20,7)
+            AS amount_usd,
+
+          (
+            balance_after_microusd::numeric /
+            1000000
+          )::numeric(20,7)
+            AS balance_after_usd
+      `,
+      [
+        normalizedUserId,
+        finalTxType,
+
+        legacyAmountCents,
+        normalizedAmountMicroUsd,
+
+        finalReference,
+        idempotencyKey,
+
+        newBalanceCents,
+        newBalanceMicroUsd,
+
+        metaJson,
+      ]
+    );
+
+  const updatedWalletResult =
+    await client.query(
+      `
+        UPDATE wallets
+        SET
+          balance_microusd = $2,
+          balance_cents = $3,
+          updated_at = NOW()
+        WHERE user_id = $1
+        RETURNING
+          user_id,
+          currency,
+          balance_cents,
+          balance_microusd,
+
+          (
+            balance_microusd::numeric /
+            1000000
+          )::numeric(20,7)
+            AS balance_usd,
+
+          updated_at
+      `,
+      [
+        normalizedUserId,
+        newBalanceMicroUsd,
+        newBalanceCents,
+      ]
+    );
+
+  return {
+    ok: true,
+    duplicated: false,
+
+    wallet:
+      updatedWalletResult.rows[0],
+
+    tx:
+      transactionResult.rows[0],
+  };
+}
 
 async function listTransactions(
   userId,
@@ -584,6 +1015,7 @@ module.exports = {
   getWalletByUserId,
   ensureWallet,
   applyWalletTx,
+  applyWalletTxWithClient,
   listTransactions,
   creditWallet,
   debitWallet,
