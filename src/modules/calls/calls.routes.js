@@ -22,6 +22,10 @@ const {
 // Middleware
 const { authRequired } = require("../auth/middlewares/auth.jwt");
 
+const {
+  verifyTelnyxWebhookMiddleware,
+} = require("./middlewares/telnyx.webhook.verify");
+
 /*--------------------------------------------------
  | TEST
  *-------------------------------------------------*/
@@ -70,6 +74,7 @@ router.post(
 // Public webhook
 router.post(
   "/telnyx-events",
+  verifyTelnyxWebhookMiddleware,
   telnyxStatusCallback
 );
 

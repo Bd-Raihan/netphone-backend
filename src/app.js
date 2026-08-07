@@ -39,10 +39,28 @@ const adminRateImportRoutes = require(
 // Express app তৈরি
 const app = express();
 // Global Middlewares
-// JSON body পড়ার জন্য
-app.use(express.json());
 
-app.use(express.urlencoded({ extended: false }));
+/*
+ * JSON body parse করার পাশাপাশি original raw bytes সংরক্ষণ করা হয়।
+ *
+ * Telnyx webhook Ed25519 signature verification-এর জন্য
+ * parsed req.body নয়, exact raw request body প্রয়োজন।
+ *
+ * Existing API routes আগের মতোই req.body ব্যবহার করবে।
+ */
+app.use(
+  express.json({
+    verify: (req, res, buffer) => {
+      req.rawBody = Buffer.from(buffer);
+    },
+  })
+);
+
+app.use(
+  express.urlencoded({
+    extended: false,
+  })
+);
 /// SECURITY HEADERS
 /// Hacker থেকে basic protection দিবে
 app.use(helmet());
