@@ -835,6 +835,129 @@ async function findOrderByProviderTransactionId({
   return rows[0] || null;
 }
 
+/**
+ * Expired এবং এখনো TXID না-পাওয়া payment order atomically finalize করে।
+ *
+ * Safety rules:
+ * - শুধু created / awaiting_payment order
+ * - expires_at ইতোমধ্যে পার হয়েছে
+ * - tx_hash ও wallet_tx_id দুটোই NULL
+ *
+ * TXID submit করা বা verification চলমান order এখানে expire হবে না।
+ */
+async function expireUnpaidPaymentOrders({
+  provider,
+  limit = 100,
+  client = db,
+}) {
+  if (!isSupportedProvider(provider)) {
+    throw new Error("unsupported_payment_provider");
+  }
+
+  const normalizedLimit = Math.min(
+    Math.max(Number(limit) || 100, 1),
+    500
+  );
+
+  const { rows } = await client.query(
+    `
+      WITH candidates AS (
+        SELECT
+          po.id
+        FROM payment_orders po
+        WHERE po.provider = $1
+          AND po.expires_at IS NOT NULL
+          AND po.expires_at <= NOW()
+          AND po.status IN (
+            'created',
+            'awaiting_payment'
+          )
+          AND po.tx_hash IS NULL
+          AND po.wallet_tx_id IS NULL
+        ORDER BY
+          po.expires_at ASC,
+          po.id ASC
+        FOR UPDATE SKIP LOCKED
+        LIMIT $2
+      ),
+
+      expired_orders AS (
+        UPDATE payment_orders po
+        SET
+          status = 'expired',
+          failure_code =
+            'payment_order_expired',
+          failure_message =
+            'Payment order expired before transaction submission',
+          metadata =
+            COALESCE(
+              po.metadata,
+              '{}'::jsonb
+            ) ||
+            jsonb_build_object(
+              'expired_by',
+              'binance_reconciliation_worker',
+              'expired_at',
+              NOW()
+            ),
+          updated_at = NOW()
+        FROM candidates c
+        WHERE po.id = c.id
+        RETURNING po.*
+      ),
+
+      cancelled_jobs AS (
+        UPDATE payment_reconciliation_jobs prj
+        SET
+          job_status = 'cancelled',
+          next_attempt_at = NOW(),
+          locked_at = NULL,
+          locked_by = NULL,
+          last_finished_at = NOW(),
+          last_error_code =
+            'payment_order_expired',
+          last_error_message =
+            'Linked payment order expired before transaction submission',
+          result_payload =
+            COALESCE(
+              prj.result_payload,
+              '{}'::jsonb
+            ) ||
+            jsonb_build_object(
+              'result',
+              'expired',
+              'expired_at',
+              NOW()
+            ),
+          updated_at = NOW()
+        WHERE prj.payment_order_id IN (
+          SELECT id
+          FROM expired_orders
+        )
+          AND prj.job_status <> 'completed'
+        RETURNING
+          prj.payment_order_id
+      )
+
+      SELECT
+        eo.*,
+        EXISTS (
+          SELECT 1
+          FROM cancelled_jobs cj
+          WHERE cj.payment_order_id = eo.id
+        ) AS reconciliation_job_cancelled
+      FROM expired_orders eo
+      ORDER BY eo.id ASC
+    `,
+    [
+      provider,
+      normalizedLimit,
+    ]
+  );
+
+  return rows;
+}
+
 module.exports = {
   createPaymentOrder,
 
@@ -844,6 +967,7 @@ module.exports = {
 
   lockPaymentOrderById,
   updatePaymentOrder,
+  expireUnpaidPaymentOrders,
 
   insertCryptoHistoryEvent,
 

@@ -7,6 +7,10 @@ const reconciliationRepository = require(
   "../../payment.reconciliation.repository"
 );
 
+const paymentRepository = require(
+  "../../payment.repository"
+);
+
 const binanceDepositService = require(
   "./binance.deposit.service"
 );
@@ -55,6 +59,8 @@ const runtimeStats = {
   confirming: 0,
 
   staleJobsRecovered: 0,
+
+  expiredOrders: 0,
 
   lastLoopStartedAt: null,
   lastLoopFinishedAt: null,
@@ -1091,137 +1097,81 @@ async function runOnce({
     new Date().toISOString();
 
   try {
-    const recoveredJobs =
-      await reconciliationRepository
-        .recoverStaleJobs({
-          staleAfterSeconds:
-            getStaleLockSeconds(),
+  const expiredOrders =
+    await paymentRepository
+      .expireUnpaidPaymentOrders({
+        provider:
+          PROVIDER,
 
-          limit:
-            Math.max(
-              batchSize * 2,
-              100
-            ),
-        });
+        limit:
+          Math.max(
+            batchSize * 2,
+            100
+          ),
+      });
 
-    runtimeStats
-      .staleJobsRecovered +=
-      recoveredJobs.length;
+  runtimeStats.expiredOrders +=
+    expiredOrders.length;
 
-    if (
-      recoveredJobs.length > 0
-    ) {
-      logInfo(
-        "Recovered stale reconciliation jobs",
-        {
-          count:
-            recoveredJobs.length,
-        }
-      );
-    }
+  if (expiredOrders.length > 0) {
+    logInfo(
+      "Expired unpaid payment orders",
+      {
+        count:
+          expiredOrders.length,
 
-    const jobs =
-      await reconciliationRepository
-        .claimReadyJobs({
-          workerId:
-            normalizedWorkerId,
+        orderIds:
+          expiredOrders.map(
+            (order) => order.id
+          ),
+      }
+    );
+  }
 
-          provider:
-            PROVIDER,
+  const recoveredJobs =
+    await reconciliationRepository
+      .recoverStaleJobs({
+        staleAfterSeconds:
+          getStaleLockSeconds(),
 
-          limit:
-            batchSize,
-        });
+        limit:
+          Math.max(
+            batchSize * 2,
+            100
+          ),
+      });
 
-    runtimeStats.claimed +=
-      jobs.length;
+  runtimeStats
+    .staleJobsRecovered +=
+    recoveredJobs.length;
 
-    if (!jobs.length) {
-      return {
-        ok: true,
+  if (recoveredJobs.length > 0) {
+    logInfo(
+      "Recovered stale reconciliation jobs",
+      {
+        count:
+          recoveredJobs.length,
+      }
+    );
+  }
 
+  const jobs =
+    await reconciliationRepository
+      .claimReadyJobs({
         workerId:
           normalizedWorkerId,
 
-        claimed:
-          0,
+        provider:
+          PROVIDER,
 
-        results: [],
-      };
-    }
-
-    /*
-     * Sequential processing intentionally used.
-     *
-     * Binance signed Deposit History endpoint rate-limit রক্ষা করে।
-     * High volume scaling-এর জন্য একাধিক PM2 worker/process
-     * চালানো যাবে; SKIP LOCKED duplicate claim আটকাবে।
-     */
-    const results = [];
-
-    for (const job of jobs) {
-      if (stopRequested) {
-        /*
-         * Already claimed job processing অবস্থায় ফেলে রাখা হবে না।
-         * Short retry দিয়ে queue-তে ফেরত পাঠানো হবে।
-         */
-        const retryJob =
-          await reconciliationRepository
-            .markJobForRetry({
-              jobId:
-                job.id,
-
-              workerId:
-                normalizedWorkerId,
-
-              delaySeconds:
-                5,
-
-              errorCode:
-                "worker_stopping",
-
-              errorMessage:
-                "Worker shutdown requested before job processing",
-
-              resultPayload: {
-                shutdown:
-                  true,
-              },
-            });
-
-        results.push({
-          jobId:
-            job.id,
-
-          action:
-            "retry",
-
-          job:
-            retryJob,
-        });
-
-        continue;
-      }
-
-      const result =
-        await processJob({
-          job,
-
-          workerId:
-            normalizedWorkerId,
-        });
-
-      results.push({
-        jobId:
-          job.id,
-
-        paymentOrderId:
-          job.payment_order_id,
-
-        ...result,
+        limit:
+          batchSize,
       });
-    }
 
+  runtimeStats.claimed +=
+    jobs.length;
+
+  if (!jobs.length) {
     return {
       ok: true,
 
@@ -1229,11 +1179,102 @@ async function runOnce({
         normalizedWorkerId,
 
       claimed:
-        jobs.length,
+        0,
 
-      results,
+      expired:
+        expiredOrders.length,
+
+      results: [],
     };
-  } catch (error) {
+  }
+
+  /*
+   * Sequential processing intentionally used.
+   *
+   * Binance signed Deposit History endpoint rate-limit রক্ষা করে।
+   * High volume scaling-এর জন্য একাধিক PM2 worker/process
+   * চালানো যাবে; SKIP LOCKED duplicate claim আটকাবে।
+   */
+  const results = [];
+
+  for (const job of jobs) {
+    if (stopRequested) {
+      /*
+       * Already claimed job processing অবস্থায় ফেলে রাখা হবে না।
+       * Short retry দিয়ে queue-তে ফেরত পাঠানো হবে।
+       */
+      const retryJob =
+        await reconciliationRepository
+          .markJobForRetry({
+            jobId:
+              job.id,
+
+            workerId:
+              normalizedWorkerId,
+
+            delaySeconds:
+              5,
+
+            errorCode:
+              "worker_stopping",
+
+            errorMessage:
+              "Worker shutdown requested before job processing",
+
+            resultPayload: {
+              shutdown:
+                true,
+            },
+          });
+
+      results.push({
+        jobId:
+          job.id,
+
+        action:
+          "retry",
+
+        job:
+          retryJob,
+      });
+
+      continue;
+    }
+
+    const result =
+      await processJob({
+        job,
+
+        workerId:
+          normalizedWorkerId,
+      });
+
+    results.push({
+      jobId:
+        job.id,
+
+      paymentOrderId:
+        job.payment_order_id,
+
+      ...result,
+    });
+  }
+
+  return {
+    ok: true,
+
+    workerId:
+      normalizedWorkerId,
+
+    claimed:
+      jobs.length,
+
+    expired:
+      expiredOrders.length,
+
+    results,
+  };
+} catch (error) {
     runtimeStats.lastErrorAt =
       new Date().toISOString();
 
