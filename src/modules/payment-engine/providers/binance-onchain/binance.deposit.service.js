@@ -116,6 +116,9 @@ function normalizeNetwork(
     LTC: "LTC",
     LITECOIN: "LTC",
 
+    SOL: "SOL",
+    SOLANA: "SOL",
+
     ETH: "ERC20",
     ETHEREUM: "ERC20",
     ERC20: "ERC20",

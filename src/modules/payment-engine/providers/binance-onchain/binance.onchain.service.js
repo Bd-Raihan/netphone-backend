@@ -18,6 +18,10 @@ const paymentOrderService = require(
   "../../payment.order.service"
 );
 
+const binanceQuoteService = require(
+  "./binance.quote.service"
+);
+
 const {
   PAYMENT_PROVIDERS,
   PAYMENT_TYPES,
@@ -459,16 +463,43 @@ async function createOnchainOrder({
       );
     }
 
-    const expectedCryptoAmount =
-      resolveExpectedCryptoAmount({
+    let cryptoQuote = null;
+let expectedCryptoAmount = null;
+
+if (normalizedAsset === "USDT") {
+  /*
+   * Stablecoin:
+   * USD recharge amount = expected USDT amount.
+   *
+   * Client supplied quotedCryptoAmount intentionally ignored.
+   */
+  expectedCryptoAmount =
+    Number(
+      normalizedAmountUsd
+    ).toFixed(8);
+} else {
+  /*
+   * Volatile assets:
+   * BTC / LTC / SOL / ETH
+   *
+   * IMPORTANT:
+   * Quote always comes from the backend using Binance public
+   * market data. Flutter/client quote is never trusted.
+   */
+  cryptoQuote =
+    await binanceQuoteService
+      .createUsdQuote({
         asset:
           normalizedAsset,
 
         amountUsd:
           normalizedAmountUsd,
-
-        quotedCryptoAmount,
       });
+
+  expectedCryptoAmount =
+    cryptoQuote
+      .expectedCryptoAmount;
+}
 
     const amountMicroUsd =
       usdToMicroUsd(
@@ -549,21 +580,44 @@ async function createOnchainOrder({
               expiresAt,
 
               metadata: {
-                ...(metadata || {}),
+  ...(metadata || {}),
 
-                payment_method_id:
-                  paymentMethod.id,
+  payment_method_id:
+    paymentMethod.id,
 
-                required_confirmations:
-                  paymentMethod
-                    .required_confirmations,
+  required_confirmations:
+    paymentMethod
+      .required_confirmations,
 
-                engine_version:
-                  "payment-engine-v1",
+  engine_version:
+    "payment-engine-v1",
 
-                provider_mode:
-                  "binance_onchain",
-              },
+  provider_mode:
+    "binance_onchain",
+
+  quote_source:
+    cryptoQuote?.source ??
+    "stablecoin_1_to_1",
+
+  quote_symbol:
+    cryptoQuote?.symbol ??
+    null,
+
+  quote_market_price:
+    cryptoQuote?.marketPriceText ??
+    null,
+
+  quote_asset:
+    cryptoQuote?.quoteAsset ??
+    "USD",
+
+  quote_generated_at:
+    cryptoQuote?.quotedAt
+      ? cryptoQuote
+          .quotedAt
+          .toISOString()
+      : null,
+},
 
               client,
             });
