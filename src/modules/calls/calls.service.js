@@ -788,7 +788,7 @@ async function startCallSession({
         route_attempts,
 
         status,
-        meta,
+        meta
       )
     VALUES
       (
