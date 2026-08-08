@@ -7,7 +7,7 @@ BEGIN;
 
 UPDATE crypto_payment_methods
 SET
-    deposit_address = 'YOUR_BINANCE_PAY_ID',
+    deposit_address = '37134388',
     settings =
         COALESCE(settings, '{}'::jsonb)
         || '{

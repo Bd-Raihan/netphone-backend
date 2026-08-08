@@ -681,6 +681,15 @@ async function startCallSession({
   const sessionMeta = {
     ...(meta || {}),
 
+    provider_phone_number:
+    providerCode === "telnyx"
+      ? (
+          String(
+            process.env.TELNYX_PHONE_NUMBER || ""
+          ).trim() || null
+        )
+      : null,
+
     router_source:
       rate.rate_source,
 
@@ -744,6 +753,7 @@ async function startCallSession({
     },
   };
 
+
   const { rows } = await db.query(
     `
     INSERT INTO call_sessions
@@ -778,7 +788,7 @@ async function startCallSession({
         route_attempts,
 
         status,
-        meta
+        meta,
       )
     VALUES
       (

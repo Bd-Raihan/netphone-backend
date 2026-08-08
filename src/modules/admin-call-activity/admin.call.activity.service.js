@@ -545,6 +545,13 @@ async function getCallActivityList(
           )
             AS provider,
 
+            NULLIF(
+  cs.meta ->>
+    'provider_phone_number',
+  ''
+)
+  AS provider_phone_number,
+
           cs.provider_call_id,
 
           COUNT(*) OVER()
@@ -813,6 +820,13 @@ async function getCallActivityById(
           cs.status,
           cs.provider_status,
           cs.provider,
+
+          NULLIF(
+            cs.meta ->>
+              'provider_phone_number',
+            ''
+          )
+            AS provider_phone_number,
 
           cs.provider_call_id,
 
