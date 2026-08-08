@@ -22,6 +22,7 @@ const ratesRoutes = require("./modules/rates/rates.routes");
 const adminContentRoutes = require("./modules/admin-content/admin.content.routes");
 const adminCountryPricingRoutes = require("./modules/admin-country-pricing/admin-country-pricing.routes");
 const paymentEngine = require("./modules/payment-engine");
+const adminCallActivityRoutes = require("./modules/admin-call-activity/admin.call.activity.routes");
 
 
 
@@ -97,6 +98,7 @@ app.use("/api/admin/content", adminContentRoutes);
 app.use("/api/admin/rate-import", adminRateImportRoutes);
 app.use("/api/admin/country-pricing", adminCountryPricingRoutes);
 app.use("/api/payment-engine",paymentEngine.routes);
+app.use("/api/admin/call-activity", adminCallActivityRoutes);
 
 // 404 handler (সব route fail হলে)
 app.use(notFound);
