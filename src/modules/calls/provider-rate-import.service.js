@@ -2340,8 +2340,11 @@ async function finalizeProviderRateDeckImport(
             )
 
         WHERE provider_id = $1
-          AND provider_plan_id = $2
-          AND is_active = TRUE
+        AND (
+          provider_plan_id = $2
+          OR provider_plan_id IS NULL
+          )
+           AND is_active = TRUE
         `,
         [
           provider.id,
