@@ -124,55 +124,11 @@ async function me(req, res) {
      * Admin Country Pricing rate can be resolved.
      */
 
-    const normalizedPhone =
-      String(row.phone_e164 || "")
-        .replace(/[^0-9]/g, "");
-
-    let dynamicRate = null;
-
-    if (normalizedPhone) {
-      const publicRates =
-        await ratesService.getPublicRates();
-
-      if (
-        Array.isArray(publicRates) &&
-        publicRates.length > 0
-      ) {
-        dynamicRate =
-          publicRates
-            .filter((item) => {
-              const prefix =
-                String(item?.prefix || "")
-                  .replace(/[^0-9]/g, "");
-
-              const sellRate =
-                Number(
-                  item?.sell_rate_usd_per_min
-                );
-
-              return (
-                prefix.length > 0 &&
-                normalizedPhone.startsWith(prefix) &&
-                Number.isFinite(sellRate) &&
-                sellRate > 0
-              );
-            })
-            .sort((a, b) => {
-              const aPrefix =
-                String(a?.prefix || "")
-                  .replace(/[^0-9]/g, "");
-
-              const bPrefix =
-                String(b?.prefix || "")
-                  .replace(/[^0-9]/g, "");
-
-              return (
-                bPrefix.length -
-                aPrefix.length
-              );
-            })[0] || null;
-      }
-    }
+   const dynamicRate =
+  await ratesService
+    .getPublicRateByPhone(
+      row.phone_e164
+    );
 
     const dynamicEstimateRate =
       Number(
