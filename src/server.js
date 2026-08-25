@@ -14,6 +14,10 @@ require("dotenv").config();
 
 const app = require("./app");
 
+const ratesService = require(
+  "./modules/rates/rates.service"
+);
+
 const binanceReconciliationWorker = require(
   "./modules/payment-engine/providers/binance-onchain/binance.reconciliation.worker"
 );
@@ -69,6 +73,37 @@ const server = app.listen(
         }
       );
     }
+
+        // ============================================================
+    // Warm public pricing cache in background
+    //
+    // IMPORTANT:
+    // - HTTP server is already online.
+    // - Do NOT await this operation.
+    // - A pricing failure must never stop the production API.
+    // ============================================================
+    ratesService
+      .getPublicRates()
+      .then((rates) => {
+        console.log(
+          "✅ Public rates cache warmed",
+          {
+            rows: Array.isArray(rates)
+              ? rates.length
+              : 0,
+          }
+        );
+      })
+      .catch((error) => {
+        console.error(
+          "⚠️ Public rates cache warm-up failed",
+          {
+            message:
+              error?.message ||
+              "unknown_rates_cache_warmup_error",
+          }
+        );
+      });
   }
 );
 

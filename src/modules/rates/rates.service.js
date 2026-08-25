@@ -22,6 +22,8 @@ let publicRatesCache = {
   expiresAt: 0,
 };
 
+let publicRatesRefreshPromise = null;
+
 function normalizePublicRate(row) {
   const rate = Number(
     row.final_sell_rate_usd_per_min || 0
@@ -94,32 +96,77 @@ async function loadPublicRatesFresh() {
     );
 }
 
+async function refreshPublicRatesCache() {
+  if (publicRatesRefreshPromise) {
+    return publicRatesRefreshPromise;
+  }
+
+  publicRatesRefreshPromise =
+    loadPublicRatesFresh()
+      .then((rates) => {
+        publicRatesCache = {
+          data: rates,
+          expiresAt:
+            Date.now() +
+            PUBLIC_RATE_CACHE_TTL_MS,
+        };
+
+        return rates;
+      })
+      .finally(() => {
+        publicRatesRefreshPromise = null;
+      });
+
+  return publicRatesRefreshPromise;
+}
+
 async function getPublicRates({
   forceRefresh = false,
 } = {}) {
   const now = Date.now();
 
+  const hasCachedRates =
+    Array.isArray(publicRatesCache.data);
+
+  const cacheIsFresh =
+    hasCachedRates &&
+    publicRatesCache.expiresAt > now;
+
   if (
     !forceRefresh &&
-    Array.isArray(
-      publicRatesCache.data
-    ) &&
-    publicRatesCache.expiresAt > now
+    cacheIsFresh
   ) {
     return publicRatesCache.data;
   }
 
-  const rates =
-    await loadPublicRatesFresh();
+  /*
+   * Cache expired হলেও existing rate থাকলে
+   * user-কে সঙ্গে সঙ্গে stale data return করব।
+   *
+   * Background-এ fresh pricing reload হবে।
+   * তাই Wallet / Rates user 20 seconds wait করবে না।
+   */
+  if (
+    !forceRefresh &&
+    hasCachedRates
+  ) {
+    refreshPublicRatesCache()
+      .catch((error) => {
+        console.error(
+          "Public rates background refresh failed:",
+          error
+        );
+      });
 
-  publicRatesCache = {
-    data: rates,
-    expiresAt:
-      Date.now() +
-      PUBLIC_RATE_CACHE_TTL_MS,
-  };
+    return publicRatesCache.data;
+  }
 
-  return rates;
+  /*
+   * Server startup-এর প্রথম request অথবা
+   * explicit forceRefresh হলে fresh result-এর
+   * জন্য অপেক্ষা করব।
+   */
+  return refreshPublicRatesCache();
 }
 
 /**
