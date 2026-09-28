@@ -63,6 +63,58 @@ async function createFax(req, res) {
   }
 }
 
+// User Fax History
+async function getFaxHistory(req, res) {
+  try {
+    const userId = req.params.userId;
+
+    if (!userId) {
+      return res.status(400).json({
+        success: false,
+        message: "userId is required",
+      });
+    }
+
+    const result = await db.query(
+      `SELECT
+         id,
+         user_id,
+         sender_name,
+         direction,
+         from_number,
+         to_number,
+         telnyx_fax_id,
+         status,
+         file_name,
+         file_url,
+         pages,
+         user_email,
+         country_code,
+         failure_reason,
+         created_at,
+         updated_at
+       FROM netphone_faxes
+       WHERE user_id = $1
+       ORDER BY created_at DESC`,
+      [userId]
+    );
+
+    return res.status(200).json({
+      success: true,
+      count: result.rows.length,
+      faxes: result.rows,
+    });
+  } catch (error) {
+    console.error("Get Fax History Error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Unable to get fax history",
+    });
+  }
+}
+
 module.exports = {
   createFax,
+  getFaxHistory,
 };
