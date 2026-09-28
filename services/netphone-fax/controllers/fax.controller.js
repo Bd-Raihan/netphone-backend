@@ -1,6 +1,19 @@
 const db = require("../database/db");
 
+const {
+  sendFax,
+} = require("../services/telnyxFax.service");
+
+const {
+  createNotification,
+} = require("../notifications/notification.service");
+
+/**
+ * Create and send outbound fax
+ */
 async function createFax(req, res) {
+  let faxRecord = null;
+
   try {
     const {
       user_id,
@@ -20,7 +33,8 @@ async function createFax(req, res) {
       });
     }
 
-    const result = await db.query(
+    // Step 1: Create local fax record first
+    const insertResult = await db.query(
       `INSERT INTO netphone_faxes
        (
          user_id,
@@ -48,17 +62,118 @@ async function createFax(req, res) {
       ]
     );
 
+    faxRecord = insertResult.rows[0];
+
+    // Step 2: Send fax through Telnyx
+    const telnyxResult = await sendFax({
+      to: to_number,
+      mediaUrl: file_url,
+      clientState: `netphone-fax-${faxRecord.id}`,
+    });
+
+    const telnyxFaxId = telnyxResult?.data?.id || null;
+    const telnyxStatus =
+      telnyxResult?.data?.status || "queued";
+
+    if (!telnyxFaxId) {
+      throw new Error(
+        "Telnyx accepted request but no fax ID was returned."
+      );
+    }
+
+    // Step 3: Save Telnyx fax ID and current status
+    const updateResult = await db.query(
+      `UPDATE netphone_faxes
+       SET
+         telnyx_fax_id = $1,
+         status = $2,
+         updated_at = NOW()
+       WHERE id = $3
+       RETURNING *`,
+      [
+        telnyxFaxId,
+        telnyxStatus,
+        faxRecord.id,
+      ]
+    );
+
+    const updatedFax = updateResult.rows[0];
+
+    // Step 4: Create user notification
+    try {
+      await createNotification({
+        userId: user_id,
+        faxId: faxRecord.id,
+        title: "Fax Submitted",
+        message: `Your fax to ${to_number} has been submitted.`,
+        notificationType: "fax_submitted",
+      });
+    } catch (notificationError) {
+      console.error(
+        "Fax Notification Error:",
+        notificationError
+      );
+    }
+
     return res.status(201).json({
       success: true,
-      message: "Fax record created",
-      fax: result.rows[0],
+      message: "Fax submitted to Telnyx",
+      fax: updatedFax,
     });
   } catch (error) {
-    console.error("Create Fax Error:", error);
+    console.error(
+      "Create/Send Fax Error:",
+      error.response?.data || error.message || error
+    );
+
+    // If local fax record exists, save failure information
+    if (faxRecord?.id) {
+      try {
+        const failureReason =
+          error.response?.data?.errors?.[0]?.detail ||
+          error.response?.data?.errors?.[0]?.title ||
+          error.message ||
+          "Unable to send fax";
+
+        await db.query(
+          `UPDATE netphone_faxes
+           SET
+             status = 'failed',
+             failure_reason = $1,
+             updated_at = NOW()
+           WHERE id = $2`,
+          [
+            String(failureReason).substring(0, 2000),
+            faxRecord.id,
+          ]
+        );
+
+        try {
+          await createNotification({
+            userId: faxRecord.user_id,
+            faxId: faxRecord.id,
+            title: "Fax Submission Failed",
+            message: "Your fax could not be submitted.",
+            notificationType: "fax_failed",
+          });
+        } catch (notificationError) {
+          console.error(
+            "Fax Failure Notification Error:",
+            notificationError
+          );
+        }
+      } catch (databaseError) {
+        console.error(
+          "Fax Failure Database Update Error:",
+          databaseError
+        );
+      }
+    }
 
     return res.status(500).json({
       success: false,
-      message: "Unable to create fax",
+      message: "Unable to send fax",
+      fax_id: faxRecord?.id || null,
     });
   }
 }
