@@ -1,15 +1,26 @@
 const express = require("express");
-const router = express.Router();
+
+const {
+  faxAuthRequired,
+} = require("../middlewares/faxAuth.middleware");
 
 const {
   getNotifications,
   markAsRead,
 } = require("../controllers/notification.controller");
 
-// Get all fax notifications for a specific user
-router.get("/:userId", getNotifications);
+const router = express.Router();
 
-// Mark one notification as read
-router.patch("/:userId/:notificationId/read", markAsRead);
+router.get(
+  "/",
+  faxAuthRequired,
+  getNotifications
+);
+
+router.patch(
+  "/:notificationId/read",
+  faxAuthRequired,
+  markAsRead
+);
 
 module.exports = router;

@@ -3,21 +3,22 @@ const {
   markNotificationAsRead,
 } = require("../notifications/notification.service");
 
-/**
- * Get all fax notifications for a user
- */
 async function getNotifications(req, res) {
   try {
-    const userId = req.params.userId;
+    const userId = Number(req.user?.id);
 
-    if (!userId) {
-      return res.status(400).json({
+    if (
+      !Number.isInteger(userId) ||
+      userId <= 0
+    ) {
+      return res.status(401).json({
         success: false,
-        message: "userId is required",
+        message: "Authentication required",
       });
     }
 
-    const notifications = await getUserNotifications(userId);
+    const notifications =
+      await getUserNotifications(userId);
 
     return res.status(200).json({
       success: true,
@@ -25,7 +26,10 @@ async function getNotifications(req, res) {
       notifications,
     });
   } catch (error) {
-    console.error("Get Notifications Error:", error);
+    console.error(
+      "Get Notifications Error:",
+      error
+    );
 
     return res.status(500).json({
       success: false,
@@ -34,25 +38,40 @@ async function getNotifications(req, res) {
   }
 }
 
-/**
- * Mark one notification as read
- */
 async function markAsRead(req, res) {
   try {
-    const { userId, notificationId } = req.params;
+    const userId = Number(req.user?.id);
+    const notificationId =
+      Number(req.params.notificationId);
 
-    if (!userId || !notificationId) {
-      return res.status(400).json({
+    if (
+      !Number.isInteger(userId) ||
+      userId <= 0
+    ) {
+      return res.status(401).json({
         success: false,
-        message: "userId and notificationId are required",
+        message: "Authentication required",
       });
     }
 
-    const notification = await markNotificationAsRead(
-      notificationId,
-      userId
-    );
+    if (
+      !Number.isInteger(notificationId) ||
+      notificationId <= 0
+    ) {
+      return res.status(404).json({
+        success: false,
+        message: "Notification not found",
+      });
+    }
 
+    const notification =
+      await markNotificationAsRead(
+        notificationId,
+        userId
+      );
+
+    // Do not reveal whether another user's
+    // notification exists.
     if (!notification) {
       return res.status(404).json({
         success: false,
@@ -62,15 +81,20 @@ async function markAsRead(req, res) {
 
     return res.status(200).json({
       success: true,
-      message: "Notification marked as read",
+      message:
+        "Notification marked as read",
       notification,
     });
   } catch (error) {
-    console.error("Mark Notification Read Error:", error);
+    console.error(
+      "Mark Notification Read Error:",
+      error
+    );
 
     return res.status(500).json({
       success: false,
-      message: "Unable to update notification",
+      message:
+        "Unable to update notification",
     });
   }
 }

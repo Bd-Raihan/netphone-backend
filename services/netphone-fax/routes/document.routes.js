@@ -5,22 +5,22 @@ const {
 } = require("../middlewares/faxAuth.middleware");
 
 const {
-  createFax,
-  getFaxHistory,
-} = require("../controllers/fax.controller");
+  viewFaxDocument,
+  downloadFaxDocument,
+} = require("../controllers/document.controller");
 
 const router = express.Router();
 
-router.post(
-  "/send",
+router.get(
+  "/documents/:faxId/view",
   faxAuthRequired,
-  createFax
+  viewFaxDocument
 );
 
 router.get(
-  "/history",
+  "/documents/:faxId/download",
   faxAuthRequired,
-  getFaxHistory
+  downloadFaxDocument
 );
 
 module.exports = router;
