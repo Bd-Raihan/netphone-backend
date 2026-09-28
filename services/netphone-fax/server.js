@@ -14,6 +14,10 @@ const PORT = process.env.FAX_PORT || 8787;
 const faxRoutes = require("./routes/fax.routes");
 app.use("/api/fax", faxRoutes);
 
+// Fax notification routes
+const notificationRoutes = require("./routes/notification.routes");
+app.use("/api/fax/notifications", notificationRoutes);
+
 // Health check
 app.get("/health", (req, res) => {
   res.status(200).json({
