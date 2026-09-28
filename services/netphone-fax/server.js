@@ -18,6 +18,10 @@ app.use("/api/fax", faxRoutes);
 const notificationRoutes = require("./routes/notification.routes");
 app.use("/api/fax/notifications", notificationRoutes);
 
+// Telnyx outbound fax status routes
+const telnyxWebhookRoutes = require("./routes/telnyxWebhook.routes");
+app.use("/api/fax", telnyxWebhookRoutes);
+
 // Health check
 app.get("/health", (req, res) => {
   res.status(200).json({
