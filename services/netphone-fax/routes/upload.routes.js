@@ -52,24 +52,37 @@ const upload = multer({
     files: 1,
   },
 
-  fileFilter: (req, file, cb) => {
-    const extension = path
-      .extname(file.originalname)
-      .toLowerCase();
+ fileFilter: (req, file, cb) => {
+  const extension = path
+    .extname(file.originalname)
+    .toLowerCase();
 
-    if (
-      !allowedMimeTypes.has(file.mimetype) ||
-      !allowedExtensions.has(extension)
-    ) {
-      return cb(
-        new Error(
-          "Only PDF, JPG and PNG fax documents are allowed"
-        )
-      );
-    }
+  // Extension must always be one of the supported fax formats.
+  if (!allowedExtensions.has(extension)) {
+    return cb(
+      new Error(
+        "Only PDF, JPG and PNG fax documents are allowed"
+      )
+    );
+  }
 
-    cb(null, true);
-  },
+  // Accept the expected MIME types.
+  // Some Android file pickers send application/octet-stream
+  // even when the selected file has a valid PDF/JPG/PNG extension.
+  const mimeAllowed =
+    allowedMimeTypes.has(file.mimetype) ||
+    file.mimetype === "application/octet-stream";
+
+  if (!mimeAllowed) {
+    return cb(
+      new Error(
+        "Only PDF, JPG and PNG fax documents are allowed"
+      )
+    );
+  }
+
+  cb(null, true);
+},
 });
 
 router.post(
