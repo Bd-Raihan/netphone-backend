@@ -24,6 +24,8 @@ const adminCountryPricingRoutes = require("./modules/admin-country-pricing/admin
 const paymentEngine = require("./modules/payment-engine");
 const adminCallActivityRoutes = require("./modules/admin-call-activity/admin.call.activity.routes");
 const appUpdateRoutes = require("./modules/app-update/app.update.routes");
+const smsWebhookRoutes = require("./modules/sms-inbox/sms.webhook.routes");
+const smsAdminRoutes = require("./modules/sms-inbox/sms.admin.routes");
 
 
 /**
@@ -100,6 +102,8 @@ app.use("/api/admin/country-pricing", adminCountryPricingRoutes);
 app.use("/api/payment-engine",paymentEngine.routes);
 app.use("/api/admin/call-activity", adminCallActivityRoutes);
 app.use("/api/app-update", appUpdateRoutes);
+app.use("/api/webhooks/telnyx-sms", smsWebhookRoutes);
+app.use("/api/admin/sms-inbox", smsAdminRoutes);
 
 // 404 handler (সব route fail হলে)
 app.use(notFound);
