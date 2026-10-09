@@ -26,6 +26,7 @@ const adminCallActivityRoutes = require("./modules/admin-call-activity/admin.cal
 const appUpdateRoutes = require("./modules/app-update/app.update.routes");
 const smsWebhookRoutes = require("./modules/sms-inbox/sms.webhook.routes");
 const smsAdminRoutes = require("./modules/sms-inbox/sms.admin.routes");
+const stripeWebhookRoutes = require("./modules/payment-engine/providers/stripe/stripe.webhook.routes");
 
 
 /**
@@ -104,6 +105,7 @@ app.use("/api/admin/call-activity", adminCallActivityRoutes);
 app.use("/api/app-update", appUpdateRoutes);
 app.use("/api/webhooks/telnyx-sms", smsWebhookRoutes);
 app.use("/api/admin/sms-inbox", smsAdminRoutes);
+app.use("/api/webhooks/stripe", stripeWebhookRoutes);
 
 // 404 handler (সব route fail হলে)
 app.use(notFound);

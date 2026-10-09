@@ -88,4 +88,21 @@ router.get(
   controller.getMyOrder
 );
 
+
+const stripeController = require(
+  "./providers/stripe/stripe.payment.controller"
+);
+
+router.post(
+  "/stripe/create",
+  authRequired,
+  stripeController.createPayment
+);
+
+router.get(
+  "/stripe/orders/:orderId",
+  authRequired,
+  stripeController.getPaymentStatus
+);
+
 module.exports = router;
