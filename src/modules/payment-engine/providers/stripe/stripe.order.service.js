@@ -2,6 +2,17 @@
 "use strict";
 
 const crypto = require("crypto");
+
+function getStripeMode() {
+  const key = process.env.STRIPE_SECRET_KEY || "";
+
+  if (key.startsWith("sk_live_")) return "live";
+  if (key.startsWith("sk_test_")) return "test";
+
+  throw new Error("invalid_stripe_secret_key");
+}
+
+
 const db = require("../../../../config/db");
 const { normalizeRechargeCents, centsToMicroUsd } =
   require("./stripe.amount");
@@ -41,13 +52,12 @@ async function createStripeOrder({
         amount_microusd,
         currency,
         status,
-        client_request_id
+        client_request_id,
+        stripe_mode
       )
-      VALUES ($1, $2, $3, $4, 'usd', 'created', $5)
+      VALUES ($1, $2, $3, $4, 'usd', 'created', $5, $6)
 
-      ON CONFLICT (user_id, client_request_id)
-      WHERE client_request_id IS NOT NULL
-      DO NOTHING
+      ON CONFLICT DO NOTHING
 
       RETURNING
         id,
@@ -55,7 +65,8 @@ async function createStripeOrder({
         amount_cents,
         currency,
         status,
-        client_request_id
+        client_request_id,
+        stripe_mode
     `,
     [
       orderReference,
@@ -63,6 +74,7 @@ async function createStripeOrder({
       amountCents,
       amountMicroUsd,
       clientRequestId,
+      getStripeMode(),
     ]
   );
 
@@ -81,13 +93,15 @@ async function createStripeOrder({
         amount_cents,
         currency,
         status,
-        client_request_id
+        client_request_id,
+        stripe_mode
       FROM stripe_payment_orders
       WHERE user_id = $1
         AND client_request_id = $2
+        AND stripe_mode = $3
       LIMIT 1
     `,
-    [id, clientRequestId]
+    [id, clientRequestId, getStripeMode()]
   );
 
   const order = existing.rows[0];
@@ -134,26 +148,28 @@ async function linkStripePaymentIntent({
         stripe_payment_intent_id = $2,
         status = 'awaiting_payment',
         updated_at = NOW()
-      WHERE id = $1
-        AND status = 'creating_intent'
-        AND stripe_payment_intent_id IS NULL
-      RETURNING id, order_reference, status,
-                stripe_payment_intent_id
-    `,
-    [orderId, paymentIntentId]
+     WHERE id = $1
+  AND stripe_mode = $3
+  AND status IN ('created', 'creating_intent')
+  AND stripe_payment_intent_id IS NULL
+RETURNING id, order_reference, status,
+          stripe_payment_intent_id
+`,
+[orderId, paymentIntentId, getStripeMode()]
   );
 
   if (rows[0]) return rows[0];
 
   const existing = await getStripeOrderById(orderId);
 
-  if (
-    existing &&
-    existing.stripe_payment_intent_id === paymentIntentId &&
-    ["awaiting_payment", "paid", "credited"].includes(existing.status)
-  ) {
-    return existing;
-  }
+if (
+  existing &&
+  existing.stripe_mode === getStripeMode() &&
+  existing.stripe_payment_intent_id === paymentIntentId &&
+  ["awaiting_payment", "paid", "credited"].includes(existing.status)
+) {
+  return existing;
+}
 
   throw new Error("stripe_order_link_conflict");
 }
@@ -174,6 +190,7 @@ async function getStripeOrderById(orderId) {
         amount_cents,
         currency,
         stripe_payment_intent_id,
+        stripe_mode,
         status
       FROM stripe_payment_orders
       WHERE id = $1
@@ -191,11 +208,18 @@ async function recoverStripePaymentIntent({
   orderId,
   userId,
 }) {
-  const order = await getStripeOrderById(orderId);
 
-  if (!order || String(order.user_id) !== String(userId)) {
-    throw new Error("stripe_order_not_found");
-  }
+const order = await getStripeOrderById(orderId);
+
+if (!order || String(order.user_id) !== String(userId)) {
+  throw new Error("stripe_order_not_found");
+}
+
+if (order.stripe_mode !== getStripeMode()) {
+  throw new Error("stripe_payment_mode_mismatch");
+}
+
+  
 
   if (!["created", "creating_intent", "awaiting_payment"].includes(order.status)) {
     throw new Error("stripe_order_not_recoverable");
@@ -246,6 +270,10 @@ async function reconcileStripeOrder({ orderId, userId }) {
   if (!order || String(order.user_id) !== String(userId)) {
     throw new Error("stripe_order_not_found");
   }
+
+  if (order.stripe_mode !== getStripeMode()) {
+  throw new Error("stripe_payment_mode_mismatch");
+}
 
   if (order.stripe_payment_intent_id) {
     return recoverStripePaymentIntent({ orderId, userId });
@@ -298,9 +326,10 @@ async function lockStripeOrderForCreation(client, orderId) {
       SELECT *
       FROM stripe_payment_orders
       WHERE id = $1
+      AND stripe_mode = $2
       FOR UPDATE
     `,
-    [orderId]
+    [orderId, getStripeMode()]
   );
 
   return rows[0] || null;
@@ -323,11 +352,12 @@ async function claimStripeOrderCreation({ orderId, userId }) {
           updated_at = NOW()
       WHERE id = $1
         AND user_id = $2
+        AND stripe_mode = $3
         AND status = 'created'
         AND stripe_payment_intent_id IS NULL
       RETURNING id, order_reference, amount_cents, currency, status
     `,
-    [id, uid]
+    [id, uid, getStripeMode()]
   );
 
   if (!rows[0]) {

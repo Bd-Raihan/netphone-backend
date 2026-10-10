@@ -33,12 +33,13 @@ async function verifyStripePaymentIntent(paymentIntentId) {
     throw new Error("stripe_payment_not_verified");
   }
 
-  return {
-    paymentIntentId: intent.id,
-    amountCents: intent.amount_received,
-    currency: intent.currency,
-    status: intent.status,
-  };
+ return {
+  paymentIntentId: intent.id,
+  amountCents: intent.amount_received,
+  currency: intent.currency,
+  status: intent.status,
+  livemode: intent.livemode,
+};
 }
 
 module.exports = { verifyStripePaymentIntent };

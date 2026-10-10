@@ -89,6 +89,16 @@ async function creditVerifiedStripeOrder({
 
     if (!order) throw new Error("stripe_order_not_found");
 
+    const stripeMode = process.env.STRIPE_SECRET_KEY?.startsWith("sk_live_")
+  ? "live"
+  : process.env.STRIPE_SECRET_KEY?.startsWith("sk_test_")
+    ? "test"
+    : null;
+
+if (!stripeMode || order.stripe_mode !== stripeMode) {
+  throw new Error("stripe_payment_mode_mismatch");
+}
+
     if (order.status === "credited") {
       if (
         order.stripe_payment_intent_id !== paymentIntentId ||

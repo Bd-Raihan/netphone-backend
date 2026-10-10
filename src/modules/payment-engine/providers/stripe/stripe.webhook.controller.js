@@ -46,6 +46,14 @@ async function handleStripeWebhook(req, res) {
 
     const verified = await verifyStripePaymentIntent(intentId);
 
+    if (
+  typeof event.livemode !== "boolean" ||
+  typeof verified.livemode !== "boolean" ||
+  event.livemode !== verified.livemode
+) {
+  throw new Error("stripe_event_mode_mismatch");
+}
+
     const orderReference =
       event.data.object.metadata?.order_reference;
 
@@ -58,9 +66,24 @@ async function handleStripeWebhook(req, res) {
 
     const order = await getOrderByReference(orderReference);
 
-    if (!order) {
-      throw new Error("stripe_order_not_found");
-    }
+if (!order) {
+  throw new Error("stripe_order_not_found");
+}
+
+const stripeMode =
+  process.env.STRIPE_SECRET_KEY?.startsWith("sk_live_")
+    ? "live"
+    : process.env.STRIPE_SECRET_KEY?.startsWith("sk_test_")
+      ? "test"
+      : null;
+
+if (!stripeMode || order.stripe_mode !== stripeMode) {
+  throw new Error("stripe_payment_mode_mismatch");
+}
+
+if (verified.livemode !== (stripeMode === "live")) {
+  throw new Error("stripe_payment_mode_mismatch");
+}
 
     if (
       order.stripe_payment_intent_id !== verified.paymentIntentId ||
