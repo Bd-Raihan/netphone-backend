@@ -13,6 +13,13 @@ const {
   createNotification,
 } = require("../notifications/notification.service");
 
+const { refreshFaxStatus } = require("./telnyxWebhook.controller");
+
+// Limit provider lookups when many users keep Fax History open.
+const historyStatusChecks = new Map();
+const STATUS_CHECK_INTERVAL_MS = 30000;
+const FINAL_STATUSES = new Set(["delivered", "received", "failed"]);
+
 /**
  * Create and send outbound fax securely.
  *
@@ -25,6 +32,8 @@ const {
 async function createFax(req, res) {
   let faxRecord = null;
   let mediaTokenCreated = false;
+  let acceptedTelnyxFaxId = null;
+  let telnyxRequestCompleted = false;
 
   try {
     const userId = Number(req.user?.id);
@@ -181,6 +190,8 @@ async function createFax(req, res) {
         `netphone-fax-${faxRecord.id}`,
     });
 
+    telnyxRequestCompleted = true;
+
     const telnyxFaxId =
       telnyxResult?.data?.id || null;
 
@@ -193,6 +204,8 @@ async function createFax(req, res) {
       );
     }
 
+    acceptedTelnyxFaxId = telnyxFaxId;
+
     // Save Telnyx ID and mark upload as consumed.
     await db.query("BEGIN");
 
@@ -200,10 +213,11 @@ async function createFax(req, res) {
       const updateFaxResult = await db.query(
         `UPDATE netphone_faxes
          SET
-           telnyx_fax_id = $1,
-           status = $2,
+           telnyx_fax_id = COALESCE(telnyx_fax_id, $1),
+           status = CASE WHEN status = 'queued' THEN $2 ELSE status END,
            updated_at = NOW()
          WHERE id = $3
+           AND (telnyx_fax_id IS NULL OR telnyx_fax_id = $1)
          RETURNING *`,
         [
           telnyxFaxId,
@@ -211,6 +225,10 @@ async function createFax(req, res) {
           faxRecord.id,
         ]
       );
+
+      if (updateFaxResult.rowCount !== 1) {
+        throw new Error("Fax status could not be finalized");
+      }
 
       const uploadUpdate = await db.query(
         `UPDATE netphone_fax_uploads
@@ -240,14 +258,16 @@ async function createFax(req, res) {
     }
 
     try {
-      await createNotification({
-        userId,
-        faxId: faxRecord.id,
-        title: "Fax Submitted",
-        message:
-          `Your fax to ${toNumber} has been submitted.`,
-        notificationType: "fax_submitted",
-      });
+      if (!FINAL_STATUSES.has(String(faxRecord.status).toLowerCase())) {
+        await createNotification({
+          userId,
+          faxId: faxRecord.id,
+          title: "Fax Submitted",
+          message:
+            `Your fax to ${toNumber} has been submitted.`,
+          notificationType: "fax_submitted",
+        });
+      }
     } catch (notificationError) {
       console.error(
         "Fax Notification Error:",
@@ -266,6 +286,9 @@ async function createFax(req, res) {
         status: faxRecord.status,
         file_name: upload.original_file_name,
         created_at: faxRecord.created_at,
+        updated_at: faxRecord.updated_at,
+        pages: faxRecord.pages,
+        failure_reason: faxRecord.failure_reason,
         media_expires_at: expiresAt,
       },
     });
@@ -276,6 +299,43 @@ async function createFax(req, res) {
         error.message ||
         error
     );
+
+    // A timeout or local save error after acceptance does not prove that
+    // transmission failed. Keep media available for Telnyx and let the
+    // per-fax callback/history check confirm the actual result.
+    const submissionUnconfirmed = Boolean(error.request &&
+      (!error.response || Number(error.response.status) >= 500));
+    if (faxRecord?.id && (telnyxRequestCompleted || submissionUnconfirmed)) {
+      try {
+        await db.query(
+          `UPDATE netphone_faxes
+           SET
+             telnyx_fax_id = COALESCE(telnyx_fax_id, $1),
+             failure_reason = CASE
+               WHEN status = 'queued' THEN 'submission_unconfirmed'
+               ELSE failure_reason
+             END,
+             updated_at = NOW()
+           WHERE id = $2
+             AND direction = 'outbound'
+             AND (telnyx_fax_id IS NULL OR $1 IS NULL OR telnyx_fax_id = $1)`,
+          [acceptedTelnyxFaxId, faxRecord.id]
+        );
+        await db.query(
+          `UPDATE netphone_fax_uploads SET is_used = TRUE
+           WHERE id = $1 AND user_id = $2`,
+          [Number(req.body.upload_id), faxRecord.user_id]
+        );
+      } catch (saveError) {
+        console.error("Fax Pending Confirmation Save Error:", saveError.message);
+      }
+
+      return res.status(503).json({
+        success: false,
+        message: "Fax submission could not be confirmed. Check Fax History before trying again.",
+        fax_id: faxRecord.id,
+      });
+    }
 
     if (faxRecord?.id) {
       const failureReason =
@@ -337,7 +397,11 @@ async function createFax(req, res) {
       }
     }
 
-    return res.status(500).json({
+    const providerStatus = Number(error.response?.status);
+    const responseStatus = Number.isInteger(providerStatus) &&
+      providerStatus >= 400 && providerStatus < 500 ? providerStatus : 500;
+
+    return res.status(responseStatus).json({
       success: false,
       message: "Unable to send fax",
       fax_id: faxRecord?.id || null,
@@ -383,6 +447,41 @@ async function getFaxHistory(req, res) {
        ORDER BY created_at DESC`,
       [userId]
     );
+
+    const now = Date.now();
+    if (historyStatusChecks.size >= 1000) {
+      for (const [id, checkedAt] of historyStatusChecks) {
+        if (now - checkedAt > 300000) historyStatusChecks.delete(id);
+      }
+    }
+
+    const pending = result.rows.filter((fax) => {
+      if ((fax.direction !== "outbound" && fax.direction !== "inbound") || !fax.telnyx_fax_id ||
+          FINAL_STATUSES.has(String(fax.status).toLowerCase())) return false;
+      const lastCheck = historyStatusChecks.get(String(fax.id)) || 0;
+      return now - lastCheck >= STATUS_CHECK_INTERVAL_MS;
+    }).slice(0, 3);
+
+    // Missed older webhooks are repaired from the authenticated provider
+    // status. A provider/network error leaves the last known result intact.
+    await Promise.all(pending.map(async (fax) => {
+      if (historyStatusChecks.size >= 1000 && !historyStatusChecks.has(String(fax.id))) {
+        historyStatusChecks.delete(historyStatusChecks.keys().next().value);
+      }
+      historyStatusChecks.set(String(fax.id), now);
+      try {
+        const updated = await refreshFaxStatus({ ...fax, user_id: userId });
+        if (updated) {
+          // Preserve the original public response fields; never expose
+          // private storage columns returned by UPDATE ... RETURNING *.
+          for (const key of Object.keys(fax)) {
+            if (Object.prototype.hasOwnProperty.call(updated, key)) fax[key] = updated[key];
+          }
+        }
+      } catch (statusError) {
+        console.error("Fax History Status Check Error:", statusError.code || "lookup_failed");
+      }
+    }));
 
     return res.status(200).json({
       success: true,
