@@ -1,6 +1,7 @@
 const fs = require("fs");
 const path = require("path");
 const db = require("../database/db");
+const {loadIncomingDocument} = require("../services/faxPlatform.service");
 
 const UPLOAD_DIR = path.resolve(
   __dirname,
@@ -63,6 +64,16 @@ async function getDocument(req, res, download) {
       });
     }
 
+    res.set({"Cache-Control":"no-store, private","X-Content-Type-Options":"nosniff"});
+    if (fax.direction === "inbound") {
+      const bytes = await loadIncomingDocument(userId, faxId);
+      res.set({
+        "Content-Type":"application/pdf",
+        "Content-Disposition": `${download ? "attachment" : "inline"}; filename="NetPhone_Fax_${faxId}.pdf"`,
+      });
+      return res.send(bytes);
+    }
+
     const storedFileName =
       safeStoredFileName(fax.file_name);
 
@@ -113,9 +124,9 @@ async function getDocument(req, res, download) {
       error
     );
 
-    return res.status(500).json({
+    return res.status(error.status || 500).json({
       success: false,
-      message: "Unable to access fax document",
+      message: error.status ? error.message : "Unable to access fax document",
     });
   }
 }
