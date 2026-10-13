@@ -18,6 +18,9 @@
     "multer": "^2.4.0",
     "pg": "^8.23.0",
     "pdf-lib": "1.17.1",
-    "jsonwebtoken": "^9.0.2"
+    "jsonwebtoken": "^9.0.2",
+    "qrcode": "1.5.4",
+    "jsqr": "1.4.0",
+    "pngjs": "7.0.0"
   }
 }

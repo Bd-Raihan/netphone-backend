@@ -6,6 +6,7 @@ const crypto = require("crypto");
 const os = require("os");
 const {Worker} = require("worker_threads");
 const axios = require("axios");
+const cover = require("./faxCover.service");
 const db = require("../database/db");
 const provider = require("./telnyxFax.service");
 const {createMediaToken,revokeMediaTokens} = require("./mediaToken.service");
@@ -334,7 +335,7 @@ async function receiveProfile(req) {
   await db.query("INSERT INTO netphone_fax_receivers(user_id,receive_code) VALUES($1,$2) ON CONFLICT(user_id) DO NOTHING",
     [req.user.id,`NP-${crypto.randomBytes(8).toString("hex").toUpperCase()}`]);
   const result = await db.query("SELECT receive_code FROM netphone_fax_receivers WHERE user_id=$1",[req.user.id]);
-  return {receive_code:result.rows[0].receive_code,fax_number:process.env.TELNYX_FAX_PHONE_NUMBER || ""};
+  return {receive_code:result.rows[0].receive_code,fax_number:process.env.TELNYX_FAX_PHONE_NUMBER || "",is_admin:req.user.role === "admin"};
 }
 async function saveRate(req) {
   const body = req.body;
@@ -421,6 +422,39 @@ async function assignIncoming(req) {
   return {assigned:true};
 }
 
+const coverAttempts = new Map();
+async function routePendingCovers() {
+ const pending=await db.query(`SELECT f.*,i.vault_file_name,i.file_sha256,i.source FROM netphone_fax_incoming i
+ JOIN netphone_faxes f ON f.id=i.fax_id WHERE f.user_id IS NULL ORDER BY f.created_at DESC LIMIT 50`);
+ let scanned=0;
+ for(const fax of pending.rows){
+  if(fax.source!=="provider_media")continue;
+  if(Date.now()<(coverAttempts.get(String(fax.id))||0))continue;
+  if(scanned++>=2)break;
+  coverAttempts.set(String(fax.id),Date.now()+300000);
+  if(coverAttempts.size>1000)coverAttempts.delete(coverAttempts.keys().next().value);
+  try {
+   const codes=await cover.decodeCover(await privateBytes(fax.vault_file_name,fax.file_sha256));
+   const assigned=await transaction(async client=>{
+    const locked=await client.query('SELECT * FROM netphone_faxes WHERE id=$1 FOR UPDATE',[fax.id]);
+    const current=locked.rows[0];if(!current || current.user_id!=null)return null;
+    const code=await cover.resolveCode(client,codes,current);if(!code)return null;
+    const enabled=(await settings(client)).billing_enabled;
+    const rate=enabled?await resolveRate(current.to_number,'inbound',client):null;
+    const amount=rate?feeForPages(rate,Number(current.pages)):0n;
+    await client.query('UPDATE netphone_faxes SET user_id=$2,updated_at=NOW() WHERE id=$1',[fax.id,code.user_id]);
+    await client.query("UPDATE netphone_fax_incoming SET assigned_at=NOW(),verified_reference='Valid one-time cover QR' WHERE fax_id=$1",[fax.id]);
+    await client.query(`INSERT INTO netphone_fax_billing(fax_id,user_id,pages,amount_microusd,rate_snapshot,state)
+     VALUES($1,$2,$3,$4,$5::jsonb,$6)`,[fax.id,code.user_id,current.pages,amount.toString(),JSON.stringify(rate||{}),amount>0n?'payment_due':'free']);
+    await client.query('UPDATE netphone_fax_cover_codes SET consumed_fax_id=$2 WHERE id=$1',[code.id,fax.id]);
+    await audit(client,null,'cover_auto_assigned',fax.id,{user_id:code.user_id,cover_id:code.id});
+    return code.user_id;
+   });
+   if(assigned)await notify(assigned,fax.id,'Fax Received','A fax is available in your private Fax History.');
+  }catch(error){console.error('Cover routing pending admin review:',error.code || error.status || 'scan_or_pricing_unavailable');}
+ }
+}
+
 async function scanIncoming() {
   let names;
   try {names = await fsp.readdir(ARCHIVE);} catch (error) {if (error.code === "ENOENT") return 0; throw error;}
@@ -492,7 +526,8 @@ async function workCycle() {
       await settleFax(fax.id);
       } catch (_) {console.error("Fax settlement needs retry");}
     }
-    return scanIncoming();
+    await scanIncoming();
+    return routePendingCovers();
   })().finally(() => {cyclePromise=null;});
   return cyclePromise;
 }
@@ -512,6 +547,12 @@ function installRoutes(router) {
   const auth = faxAuthRequired, admin = [auth,faxAdminRequired];
   router.post("/quote",auth,endpoint(quote));
   router.get("/receive-profile",auth,endpoint(receiveProfile));
+  router.post("/receive-cover/revoke",auth,endpoint(async req=>{await cover.revoke(req.user.id);return {revoked:true};}));
+  router.post("/receive-cover",auth,async(req,res)=>{
+   try {const profile=await receiveProfile(req);const bytes=await cover.createCover(req.user.id,req.body.recipient_name,profile);
+    res.set({'Content-Type':'application/pdf','Content-Disposition':'attachment; filename="NetPhone_Receive_Cover.pdf"','Cache-Control':'no-store, private','X-Content-Type-Options':'nosniff'}).send(bytes);
+   }catch(error){res.status(error.status||503).json({success:false,message:error.status?error.message:'Cover page unavailable. Please try again.'});}
+  });
   router.get("/billing/:faxId",auth,endpoint(billingInfo));
   router.post("/billing/:faxId/pay",auth,endpoint(payIncoming));
   router.get("/admin/rates",...admin,endpoint(adminRates));
