@@ -8,8 +8,9 @@ const {PNG}=require('pngjs'),jsQR=require('jsqr');
  try {
   const input=path.join(dir,'input.pdf'),output=path.join(dir,'page');
   await fs.writeFile(input,Buffer.from(workerData.bytes),{mode:0o600});
-  await promisify(execFile)('pdftoppm',['-f','1','-l','3','-scale-to','1200','-png',input,output],{timeout:15000,maxBuffer:1024*1024});
   const codes=[];
+  for(const resolution of ['1200','1800']){
+  await promisify(execFile)('pdftoppm',['-f','1','-l','3','-scale-to',resolution,'-png',input,output],{timeout:15000,maxBuffer:1024*1024});
   const pages=(await fs.readdir(dir)).filter(name=>/^page-\d+\.png$/.test(name)).sort();
   if(!pages.length || pages.length>3)throw Error('Invalid rendered pages');
   for(const name of pages){
@@ -32,6 +33,8 @@ const {PNG}=require('pngjs'),jsQR=require('jsqr');
   const midX=Math.floor(png.width/2),midY=Math.floor(png.height/2);
   scanRegion(0,0,midX,png.height);scanRegion(midX,0,png.width-midX,png.height);
   scanRegion(0,0,png.width,midY);scanRegion(0,midY,png.width,png.height-midY);
+  }
+  for(const name of pages)await fs.unlink(path.join(dir,name));
   }
   parentPort.postMessage({codes:[...new Set(codes)]});
  } finally {await fs.rm(dir,{recursive:true,force:true});}
