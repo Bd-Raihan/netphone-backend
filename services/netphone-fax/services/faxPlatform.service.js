@@ -68,8 +68,8 @@ function ratePublic(rate) {
     provider_cost_usd_per_page:microToUsd(rate.provider_cost_microusd_per_page),
     sell_usd_per_page:microToUsd(sellRate(rate)),
     profit_usd_per_page:microToUsd(sellRate(rate)-BigInt(rate.provider_cost_microusd_per_page)),
-    markup_percent:Number(rate.markup_basis_points)/100,
-    manual_sell_usd_per_page:rate.manual_sell_microusd_per_page==null ? null : microToUsd(rate.manual_sell_microusd_per_page)};
+    markup_percent:40,
+    manual_sell_usd_per_page:null};
 }
 async function balance(userId,client=db) {
   const result = await client.query("SELECT balance_microusd,currency FROM wallets WHERE user_id=$1",[userId]);
@@ -345,11 +345,10 @@ async function saveRate(req) {
   if (!/^[1-9]\d{0,14}$/.test(prefix) || !/^[A-Z0-9-]{2,10}$/.test(countryCode) || !countryName || countryName.length > 120)
     throw fail("Enter a valid country/region and phone prefix");
   if (!["outbound","inbound"].includes(body.direction)) throw fail("Choose Send or Receive");
-  const cost = usdToMicro(body.provider_cost_usd_per_page);
-  const markup = Number(body.markup_percent);
-  if (!Number.isFinite(markup) || markup < 0 || markup > 1000 || Math.round(markup*100)/100 !== markup) throw fail("Invalid markup percent");
-  const manual = body.manual_sell_usd_per_page == null || body.manual_sell_usd_per_page === "" ? null : usdToMicro(body.manual_sell_usd_per_page);
-  if (manual !== null && manual < cost) throw fail("Manual price cannot be below provider cost");
+  let cost;
+  try {cost = usdToMicro(body.provider_cost_usd_per_page);} catch (error) {throw fail(error.message,400);}
+  const markup = 40;
+  const manual = null; // Fax prices are always derived from cost + 40%.
   if (body.is_active && body.cost_confirmed !== true) throw fail("Confirm the total cost before activating this rate");
   return transaction(async client => {
     const values = [countryCode,countryName,prefix,body.direction,cost.toString(),Math.round(markup*100),manual?.toString()||null,body.cost_confirmed === true,body.is_active === true];
@@ -374,8 +373,9 @@ async function updateSettings(req) {
   if (typeof req.body.billing_enabled !== "boolean") throw fail("Invalid charging setting");
   return transaction(async client => {
     if (req.body.billing_enabled) {
-      const rates = await client.query("SELECT id FROM netphone_fax_rates WHERE is_active=TRUE AND cost_confirmed=TRUE LIMIT 1");
-      if (!rates.rows[0]) throw fail("Configure verified rates before enabling charges");
+      const rates = await client.query("SELECT id FROM netphone_fax_rates WHERE direction='outbound' AND is_active=TRUE AND cost_confirmed=TRUE LIMIT 1");
+      if (!rates.rows[0]) throw fail("Configure at least one verified Send rate before enabling charges");
+      await resolveRate(String(process.env.TELNYX_FAX_PHONE_NUMBER || '').trim(),'inbound',client);
     }
     await client.query("UPDATE netphone_fax_settings SET billing_enabled=$1,updated_at=NOW() WHERE id=1",[req.body.billing_enabled]);
     await audit(client,req.user.id,"billing_setting",null,{billing_enabled:req.body.billing_enabled});
@@ -575,4 +575,4 @@ function installRoutes(router) {
   startWorker();
 }
 module.exports = {installRoutes,sendOrContinue,loadIncomingDocument,
-  _test:{transaction,ledger,privateBytes,storePrivate,ownedFax,settleFax,saveRate,assignIncoming,payIncoming,quote,readPdf}};
+  _test:{transaction,ledger,privateBytes,storePrivate,ownedFax,settleFax,saveRate,assignIncoming,payIncoming,quote,readPdf,updateSettings,installRoutes}};

@@ -15,14 +15,8 @@ function microToUsd(value) {
 function sellRate(rate) {
   const cost = BigInt(rate.provider_cost_microusd_per_page);
   if (cost <= 0n) throw new Error("Provider cost is not configured.");
-  if (rate.manual_sell_microusd_per_page != null) {
-    const manual = BigInt(rate.manual_sell_microusd_per_page);
-    if (manual < cost) throw new Error("Manual price cannot be below the configured provider cost.");
-    return manual;
-  }
-  const markup = Number(rate.markup_basis_points);
-  if (!Number.isInteger(markup) || markup < 0 || markup > 100000) throw new Error("Invalid markup.");
-  return (cost * BigInt(10000 + markup) + 9999n) / 10000n;
+  // Fixed 40% markup on the configured total provider cost. Round upward to micro-USD.
+  return (cost * 14000n + 9999n) / 10000n;
 }
 function matchRate(rates, phone, direction) {
   if (!/^\+[1-9]\d{7,14}$/.test(phone)) throw new Error("Use an international fax number.");
