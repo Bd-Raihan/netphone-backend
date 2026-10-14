@@ -22,14 +22,14 @@ const phone=v=>String(v).replace(/^\+/, '');
 function usage(row,kind){
  const cost=get(row,'cost');if(!cost)throw Error('Missing cost');
  const currency=get(row,'currency');if(kind==='fax'&&currency!=='USD')throw Error('USD Fax record required');if(currency&&currency!=='USD')throw Error('Non USD record');
- const session=get(row,'Telnyx call session id','Call UUID','call_session_id','call_session_uuid');
- const key=kind==='fax'?get(row,'fax id','fax_id','id'):get(row,'Unique CDR ID','uuid','id','call_leg_id');
+ const session=get(row,'Telnyx call session id','Call UUID','call_session_id','call_session_uuid','telnyx_session_id');
+ const key=kind==='fax'?get(row,'fax id','fax_id','fax_api_id','id'):get(row,'Unique CDR ID','uuid','id','call_leg_id');
  const direction=get(row,'direction');
  if(!/^[0-9a-f-]{36}$/i.test(session)||!key||!['inbound','outbound'].includes(direction))throw Error('Incomplete billing identity');
  const from=phone(get(row,'cli','Originating Number','originating_number','from'));
  const to=phone(get(row,'cld','Full Terminating number','Terminating number','destination_number','to'));
  if(!/^[1-9]\d{7,14}$/.test(from)||!/^[1-9]\d{7,14}$/.test(to))throw Error('Invalid billing numbers');
- return {kind,key,session,direction,from,to,cost:money(cost).toString(),connection:get(row,'connection id','Connection Id','connection_id'),fax_id:kind==='fax'?get(row,'fax id','fax_id','id'):null};
+ return {kind,key,session,direction,from,to,cost:money(cost).toString(),connection:get(row,'connection id','Connection Id','connection_id'),fax_id:kind==='fax'?get(row,'fax id','fax_id','fax_api_id','id'):null};
 }
 function deckRow(row){
  const prefix=row['Destination Prefixes'];if(!/^[1-9][0-9X]{0,14}$/.test(prefix||''))throw Error('Invalid destination prefix');
