@@ -6,6 +6,7 @@ const zlib=require('zlib');
 function csvText(file){return (file.originalname.endsWith('.gz') ? zlib.gunzipSync(file.buffer,{maxOutputLength:48*1024*1024}) : file.buffer).toString('utf8');}
 const db=require('../database/db');
 const math=require('./faxBillingMath');
+const control=require('./faxBillingControl');
 const {microToUsd}=require('./faxMoney');
 const fail=(m,s=422)=>Object.assign(new Error(m),{status:s});
 let syncPromise=null,lastAttempt=0;
@@ -13,14 +14,16 @@ const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:48*1024*102
 async function settings(client=db){return (await client.query('SELECT * FROM netphone_fax_settings WHERE id=1')).rows[0];}
 async function route(phone,direction,client=db){
  const s=await settings(client);
+ const manual=await control.policy(phone,direction,client);
+ const revision=s.deck_version+':'+(manual?manual.id+':'+manual.revision:'auto');
  if(!s.deck_version)throw fail('Import the Fax SIP rate deck first');
- if(direction==='inbound')return {id:'actual-inbound',revision:s.deck_version,country_code:'US',dynamic:true,provider_cost_microusd_per_page:s.fax_api_microusd,api:s.fax_api_microusd};
+ if(direction==='inbound')return {id:'actual-inbound',revision,country_code:'US',manual,dynamic:true,provider_cost_microusd_per_page:s.fax_api_microusd,api:s.fax_api_microusd};
  const digits=math.phone(phone);const prefixes=Array.from({length:digits.length},(_,i)=>digits.slice(0,i+1));
  const rows=(await client.query('SELECT route FROM netphone_fax_deck WHERE version=$1 AND prefix=ANY($2::text[])',[s.deck_version,prefixes])).rows.map(x=>x.route);
  let r;try{r=math.select(rows,phone,process.env.TELNYX_FAX_PHONE_NUMBER);}catch(e){throw fail(e.message);}
- return {id:'actual-send',revision:s.deck_version,country_code:r.iso.split('/')[0],dynamic:true,provider_cost_microusd_per_page:s.fax_api_microusd,api:s.fax_api_microusd,route:r,seconds:s.estimate_seconds_per_page};
+ return {id:'actual-send',revision,manual,country_code:r.iso.split('/')[0],dynamic:true,provider_cost_microusd_per_page:s.fax_api_microusd,api:s.fax_api_microusd,route:r,seconds:s.estimate_seconds_per_page};
 }
-function fee(rate,pages){return math.estimate(rate.route,pages,rate.seconds,rate.api);}
+function fee(rate,pages){return control.floor(rate.manual,pages,math.estimate(rate.route,pages,rate.seconds,rate.api));}
 async function importDeck(req,transaction,audit){
  if(!req.file)throw fail('Choose a CSV');
  let rows;try{rows=math.csv(csvText(req.file)).map(math.deckRow);}catch(e){throw fail(e.message);}
@@ -71,10 +74,11 @@ async function store(records,source,transaction){
    if(destination!==math.phone(process.env.TELNYX_FAX_PHONE_NUMBER)){unrelated++;continue;}
    const values=[r.kind,r.key,r.session,r.fax_id,r.direction,r.from,r.to,r.cost,r.connection,source];
    const old=(await c.query('SELECT * FROM netphone_fax_usage WHERE kind=$1 AND record_key=$2 FOR UPDATE',[r.kind,r.key])).rows[0];
-   if(old){if(await mergeUsage(c,old,r,source))corrected++;continue;}
+   if(old){if(await mergeUsage(c,old,r,source))corrected++;
+    if(source==='api'||old.source!=='api')await c.query('UPDATE netphone_fax_usage SET usage_details=$3::jsonb WHERE kind=$1 AND record_key=$2',[r.kind,r.key,JSON.stringify(r.details||{})]);continue;}
    const inserted=await c.query(`INSERT INTO netphone_fax_usage(kind,record_key,session_id,fax_provider_id,direction,from_number,to_number,cost_microusd,connection_id,source)
     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING RETURNING record_key`,values);
-   if(inserted.rows[0])accepted++;
+   if(inserted.rows[0]){accepted++;await c.query('UPDATE netphone_fax_usage SET usage_details=$3::jsonb WHERE kind=$1 AND record_key=$2',[r.kind,r.key,JSON.stringify(r.details||{})]);}
    else {
     const collision=(await c.query('SELECT * FROM netphone_fax_usage WHERE kind=$1 AND record_key=$2 FOR UPDATE',[r.kind,r.key])).rows[0];
     if(!collision)throw fail('Concurrent usage import conflict; admin review required',409);
@@ -89,7 +93,7 @@ async function importUsage(req,transaction,audit){
  let rows,kind;try{rows=math.csv(csvText(req.file),20000);kind=rows[0]&&Object.hasOwn(rows[0],'fax id')?'fax':'sip';}catch(e){throw fail(e.message);}
  if(!rows.length)throw fail('Empty usage report');
  const records=[];let rejected=0;
- for(const row of rows){try{records.push(math.usage(row,kind));}catch(_){rejected++;}}
+ for(const row of rows){try{records.push({...math.usage(row,kind),details:control.usageInfo(row,kind)});}catch(_){rejected++;}}
  const result=await store(records,'csv',transaction);
  await audit(db,req.user.id,'fax_usage_import',null,{...result,rejected,kind});
  return {...result,rejected,kind};
@@ -108,7 +112,7 @@ async function actualCost(fax,client=db){
 }
 async function settle(faxId,transaction,ledger){
  return transaction(async c=>{
-  const b=(await c.query(`SELECT b.*,f.status,f.direction,f.from_number,f.to_number,f.telnyx_fax_id
+  const b=(await c.query(`SELECT b.*,f.status,f.direction,f.from_number,f.to_number,f.telnyx_fax_id,f.created_at AS fax_created_at
    FROM netphone_fax_billing b JOIN netphone_faxes f ON f.id=b.fax_id WHERE b.fax_id=$1 FOR UPDATE OF b`,[faxId])).rows[0];
   if(!b||!b.rate_snapshot?.dynamic||b.actual_settled||['free','refunded'].includes(b.state))return false;
   if(b.direction==='outbound' && !b.submit_started_at && !b.telnyx_fax_id && b.status==='queued' && Date.now()-new Date(b.created_at).getTime()>120000){
@@ -121,16 +125,20 @@ async function settle(faxId,transaction,ledger){
    // Definitively rejected before Telnyx assigned an ID: no provider work to reconcile.
    if(b.status==='failed'&&!b.telnyx_fax_id)cost=0n;else return false;
   }
-  const target=math.markup(cost);let charge=target,shortfall=0n;
+  const details=await control.detail(b,c);
+  const delivered=details.delivered_pages??(b.status==='failed'?0:Number(b.pages));
+  const target=control.floor(b.rate_snapshot.manual,delivered,math.markup(cost));let charge=target,shortfall=0n;
   if(b.direction==='outbound'){
    const reserved=BigInt(b.amount_microusd);charge=target>reserved?reserved:target;
    shortfall=target-charge;
    if(reserved>charge)await ledger(c,b.user_id,reserved-charge,'fax_refund',`netphone-fax:${faxId}:actual-refund`,{fax_id:faxId,stage:'actual_settlement'});
   }
-  const state=b.direction==='outbound'?(charge===0n?'refunded':'paid'):(charge===0n?'free':'payment_due');
+  let state=b.direction==='outbound'?(charge===0n?'refunded':'paid'):(charge===0n?'free':'payment_due');
+  let chargedTx=null;
+  if(b.direction==='inbound'&&charge>0n){chargedTx=await control.autoPay(b,charge,c,ledger);if(chargedTx)state='paid';}
   await c.query(`UPDATE netphone_fax_billing SET amount_microusd=$2,provider_cost_microusd=$3,target_charge_microusd=$4,
-   operator_shortfall_microusd=$5,actual_settled=TRUE,state=$6,billing_note=$7,updated_at=NOW() WHERE fax_id=$1`,
-   [faxId,charge.toString(),cost.toString(),target.toString(),shortfall.toString(),state,shortfall>0n?'Quote ceiling exceeded: operator absorbs difference':'Actual Fax API + SIP cost, 40% markup']);
+   operator_shortfall_microusd=$5,actual_settled=TRUE,state=$6,charged_tx_id=COALESCE($10,charged_tx_id),billing_note=$7,billing_details=$8::jsonb,reserved_microusd=CASE WHEN $9 THEN COALESCE(reserved_microusd,amount_microusd) ELSE reserved_microusd END,updated_at=NOW() WHERE fax_id=$1`,
+   [faxId,charge.toString(),cost.toString(),target.toString(),shortfall.toString(),state,shortfall>0n?'Quote ceiling exceeded: operator absorbs difference':'Actual cost + 40%; manual page minimum if higher',JSON.stringify(details),b.direction==='outbound',chargedTx?.id||null]);
   return true;
  });
 }
@@ -150,7 +158,7 @@ async function sync(transaction){
      if(connection!==String(process.env.TELNYX_FAX_CONNECTION_ID||''))continue;
      const completed=math.get(row,'completed');
      if(['false','0'].includes(completed.toLowerCase()))continue;
-     try{records.push(math.usage(row,type==='fax'?'fax':'sip'));}
+     try{const kind=type==='fax'?'fax':'sip';records.push({...math.usage(row,kind),details:control.usageInfo(row,kind)});}
      catch(e){throw fail('Telnyx billing record: '+e.message+'. Admin review required',503);}
     }
     const last=Number(data.meta?.total_pages);
@@ -175,12 +183,13 @@ async function cycle(transaction,ledger){
  for(const x of pending)await settle(x.fax_id,transaction,ledger);
 }
 async function status(){
- const s=await settings();const bills=(await db.query(`SELECT b.fax_id,b.state,b.amount_microusd,b.provider_cost_microusd,b.operator_shortfall_microusd,b.actual_settled,f.direction
+ const s=await settings();const bills=(await db.query(`SELECT b.fax_id,b.state,b.amount_microusd,b.provider_cost_microusd,b.operator_shortfall_microusd,b.actual_settled,b.updated_at,b.pages,b.rate_snapshot,b.reserved_microusd,b.billing_details,f.direction
  FROM netphone_fax_billing b JOIN netphone_faxes f ON f.id=b.fax_id WHERE b.rate_snapshot->>'dynamic'='true' ORDER BY b.created_at DESC LIMIT 50`)).rows;
  return {deck_version:s.deck_version,adapter_verified:s.adapter_verified,last_usage_sync:s.last_usage_sync,usage_sync_error:s.usage_sync_error,
-  estimate_seconds_per_page:s.estimate_seconds_per_page,bills:bills.map(b=>({...b,amount_usd:microToUsd(b.amount_microusd),shortfall_usd:microToUsd(b.operator_shortfall_microusd)}))};
+  estimate_seconds_per_page:s.estimate_seconds_per_page,bills:bills.map(b=>({...b,...control.publicBill(b),provider_cost_usd:b.provider_cost_microusd==null?null:microToUsd(b.provider_cost_microusd),shortfall_usd:microToUsd(b.operator_shortfall_microusd)}))};
 }
-function install(router,admin,endpoint,transaction,audit,ledger){
+function install(router,admin,endpoint,transaction,audit,ledger,auth){
+ control.install(router,admin,endpoint,transaction,audit,auth);
  const multipart=(fn)=>(req,res,next)=>upload(req,res,e=>e?res.status(400).json({success:false,message:'Upload one CSV under 48 MB'}):endpoint(fn)(req,res,next));
  router.get('/admin/actual-billing',...admin,endpoint(status));
  router.post('/admin/fax-deck',...admin,multipart(req=>importDeck(req,transaction,audit)));

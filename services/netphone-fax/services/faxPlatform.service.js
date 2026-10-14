@@ -558,7 +558,7 @@ function endpoint(fn) {
 }
 function installRoutes(router) {
   const auth = faxAuthRequired, admin = [auth,faxAdminRequired];
-  actual.install(router,admin,endpoint,transaction,audit,ledger);
+  actual.install(router,admin,endpoint,transaction,audit,ledger,auth);
   router.post("/quote",auth,endpoint(quote));
   router.get("/receive-profile",auth,endpoint(receiveProfile));
   router.post("/receive-cover/revoke",auth,endpoint(async req=>{await cover.revoke(req.user.id);return {revoked:true};}));

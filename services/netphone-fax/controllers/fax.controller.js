@@ -1,4 +1,5 @@
 const db = require("../database/db");
+const billingControl = require("../services/faxBillingControl");
 
 const {
   sendFax,
@@ -483,6 +484,7 @@ async function getFaxHistory(req, res) {
       }
     }));
 
+    await billingControl.attach(result.rows, userId);
     return res.status(200).json({
       success: true,
       count: result.rows.length,
