@@ -38,8 +38,32 @@ async function importDeck(req,transaction,audit){
  });
  return {version,rows:rows.length};
 }
+function sameIdentity(old,r) {
+ return String(old.session_id).toLowerCase()===r.session.toLowerCase() && old.direction===r.direction &&
+  old.from_number===r.from && old.to_number===r.to && String(old.connection_id)===r.connection &&
+  (r.kind!=='fax' || String(old.fax_provider_id)===String(r.fax_id));
+}
+async function mergeUsage(c,old,r,source) {
+ if(!sameIdentity(old,r))throw fail('Billing identity changed: record/session/number mismatch. Admin review required',409);
+ if(String(old.cost_microusd)!==r.cost){
+  // A manual report must never replace authenticated API billing with older CSV costs.
+  if(source==='csv' && old.source==='api')return false;
+  // Serialize against settlement: it locks the same billing rows before reading costs.
+  const bills=(await c.query(`SELECT b.fax_id,b.actual_settled,b.state FROM netphone_fax_billing b
+   JOIN netphone_faxes f ON f.id=b.fax_id WHERE f.telnyx_fax_id=$1 OR f.telnyx_fax_id IN
+   (SELECT fax_provider_id FROM netphone_fax_usage WHERE kind='fax' AND session_id=$2) FOR UPDATE OF b`,
+   [r.kind==='fax'?r.fax_id:null,r.session])).rows;
+  if(bills.some(b=>b.actual_settled))throw fail('Provider cost changed after final billing. Admin review required; no extra charge was made',409);
+  await c.query(`UPDATE netphone_fax_usage SET cost_microusd=$3,source=$4 WHERE kind=$1 AND record_key=$2`,[r.kind,r.key,r.cost,source]);
+  await c.query(`INSERT INTO netphone_fax_audit(actor_user_id,action,fax_id,details)
+   VALUES(NULL,'fax_usage_corrected',NULL,$1::jsonb)`,[JSON.stringify({kind:r.kind,record_key:r.key,old_cost_microusd:String(old.cost_microusd),new_cost_microusd:r.cost,source})]);
+  return true;
+ }
+ if(source==='api')await c.query("UPDATE netphone_fax_usage SET source='api' WHERE kind=$1 AND record_key=$2",[r.kind,r.key]);
+ return false;
+}
 async function store(records,source,transaction){
- let accepted=0,unrelated=0;
+ let accepted=0,unrelated=0,corrected=0;
  await transaction(async c=>{
   for(const r of records){
    if(r.connection!==String(process.env.TELNYX_FAX_CONNECTION_ID||'')){unrelated++;continue;}
@@ -47,17 +71,19 @@ async function store(records,source,transaction){
    if(destination!==math.phone(process.env.TELNYX_FAX_PHONE_NUMBER)){unrelated++;continue;}
    const values=[r.kind,r.key,r.session,r.fax_id,r.direction,r.from,r.to,r.cost,r.connection,source];
    const old=(await c.query('SELECT * FROM netphone_fax_usage WHERE kind=$1 AND record_key=$2 FOR UPDATE',[r.kind,r.key])).rows[0];
-   if(old){if(String(old.cost_microusd)!==r.cost||String(old.session_id)!==r.session||old.direction!==r.direction||old.from_number!==r.from||old.to_number!==r.to||String(old.connection_id)!==r.connection)throw fail('Provider usage record changed. Admin review required',409);if(source==='api')await c.query("UPDATE netphone_fax_usage SET source='api' WHERE kind=$1 AND record_key=$2",[r.kind,r.key]);continue;}
+   if(old){if(await mergeUsage(c,old,r,source))corrected++;continue;}
    const inserted=await c.query(`INSERT INTO netphone_fax_usage(kind,record_key,session_id,fax_provider_id,direction,from_number,to_number,cost_microusd,connection_id,source)
     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING RETURNING record_key`,values);
    if(inserted.rows[0])accepted++;
    else {
     const collision=(await c.query('SELECT * FROM netphone_fax_usage WHERE kind=$1 AND record_key=$2 FOR UPDATE',[r.kind,r.key])).rows[0];
-    if(!collision || String(collision.cost_microusd)!==r.cost || String(collision.session_id)!==r.session || collision.direction!==r.direction || collision.from_number!==r.from || collision.to_number!==r.to || String(collision.connection_id)!==r.connection)throw fail('Concurrent usage import conflict; admin review required',409);
+    if(!collision)throw fail('Concurrent usage import conflict; admin review required',409);
+    if(await mergeUsage(c,collision,r,source))corrected++;
    }
   }
- });return {accepted,unrelated};
+ });return {accepted,unrelated,corrected};
 }
+
 async function importUsage(req,transaction,audit){
  if(!req.file)throw fail('Choose a CSV');
  let rows,kind;try{rows=math.csv(csvText(req.file),20000);kind=rows[0]&&Object.hasOwn(rows[0],'fax id')?'fax':'sip';}catch(e){throw fail(e.message);}
@@ -122,7 +148,10 @@ async function sync(transaction){
     for(const row of data.data){
      const connection=math.get(row,'connection_id','connection id');
      if(connection!==String(process.env.TELNYX_FAX_CONNECTION_ID||''))continue;
-     try{records.push(math.usage(row,type==='fax'?'fax':'sip'));}catch(_){throw fail('Telnyx billing fields need verification; upload Fax and Calls CSV reports',503);}
+     const completed=math.get(row,'completed');
+     if(['false','0'].includes(completed.toLowerCase()))continue;
+     try{records.push(math.usage(row,type==='fax'?'fax':'sip'));}
+     catch(e){throw fail('Telnyx billing record: '+e.message+'. Admin review required',503);}
     }
     const last=Number(data.meta?.total_pages);
     if(!Number.isInteger(last)||last<0)throw fail('Unverified billing pagination',503);
@@ -164,4 +193,4 @@ function install(router,admin,endpoint,transaction,audit,ledger){
   await audit(db,req.user.id,'fax_estimate_updated',null,{seconds});return {saved:true};
  }));
 }
-module.exports={route,fee,settle,cycle,install,settings,sync,actualCost,store};
+module.exports={route,fee,settle,cycle,install,settings,sync,actualCost,store,_test:{sameIdentity,mergeUsage}};
