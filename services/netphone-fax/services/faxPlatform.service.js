@@ -98,7 +98,7 @@ async function ledger(client,userId,amount,type,key,meta) {
     balance_after_microusd:after.toString(),balance_after_usd:microToUsd(after)}};
   const tx = await client.query(`INSERT INTO wallet_transactions
     (user_id,type,amount_cents,amount_microusd,reference,idempotency_key,status,balance_after_cents,balance_after_microusd,meta)
-    VALUES($1,$2,$3,$4,$5,$5,'posted',$6,$7,$8::jsonb) RETURNING *`,
+    VALUES($1,$2,$3,$4,$5::text,$5::text,'posted',$6,$7,$8::jsonb) RETURNING *`,
     [userId,type,cents(amount),amount.toString(),key,cents(after),after.toString(),JSON.stringify(exactMeta)]);
   await client.query("UPDATE wallets SET balance_microusd=$2,balance_cents=$3,updated_at=NOW() WHERE user_id=$1",
     [userId,after.toString(),cents(after)]);
