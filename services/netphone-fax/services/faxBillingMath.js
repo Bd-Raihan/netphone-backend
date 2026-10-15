@@ -1,7 +1,11 @@
 'use strict';
 const {usdToMicro}=require('./faxMoney');
 const money=v=>usdToMicro(v,true);
-const markup=v=>(BigInt(v)*140n+99n)/100n;
+const MARKUP_PERCENT=55;
+function markup(v,percent=MARKUP_PERCENT){
+ if(![40,55].includes(percent))throw Error('Invalid fax markup version');
+ return (BigInt(v)*BigInt(100+percent)+99n)/100n;
+}
 function csv(text,maxRows=300000){
  if(typeof text!=='string'||Buffer.byteLength(text)>48*1024*1024)throw Error('CSV too large');
  const rows=[];let row=[],field='',quoted=false;
@@ -29,7 +33,7 @@ function usage(row,kind){
  const from=phone(get(row,'cli','Originating Number','originating_number','from'));
  const to=phone(get(row,'cld','Full Terminating number','Terminating number','destination_number','to'));
  if(!/^[1-9]\d{7,14}$/.test(from)||!/^[1-9]\d{7,14}$/.test(to))throw Error('Invalid billing numbers');
- return {kind,key,session,direction,from,to,cost:money(cost).toString(),connection:get(row,'connection id','Connection Id','connection_id'),fax_id:kind==='fax'?get(row,'fax id','fax_id','fax_api_id','id'):null};
+ return {kind,key,session,direction,from,to,leg_id:get(row,'Telnyx call leg ID','call_leg_id'),success:get(row,'success'),cost:money(cost).toString(),connection:get(row,'connection id','Connection Id','connection_id'),fax_id:kind==='fax'?get(row,'fax id','fax_id','fax_api_id','id'):null};
 }
 function deckRow(row){
  const prefix=row['Destination Prefixes'];if(!/^[1-9][0-9X]{0,14}$/.test(prefix||''))throw Error('Invalid destination prefix');
@@ -49,11 +53,11 @@ function select(rows,to,from){
  if(peers.some(r=>r.rate!==first.rate||r.per_call!==first.per_call||r.first!==first.first||r.next!==first.next))throw Error('Ambiguous Fax route');
  return first;
 }
-function estimate(r,pages,secondsPerPage,api){
+function estimate(r,pages,secondsPerPage,api,percent=MARKUP_PERCENT){
  if(!Number.isInteger(pages)||pages<1||pages>350)throw Error('Invalid pages');
  const duration=pages*secondsPerPage;
  const seconds=duration<=r.first?r.first:r.first+Math.ceil((duration-r.first)/r.next)*r.next;
  const sip=(BigInt(r.rate)*BigInt(seconds)+59n)/60n+BigInt(r.per_call);
- return markup(BigInt(api)*BigInt(pages)+sip);
+ return markup(BigInt(api)*BigInt(pages)+sip,percent);
 }
-module.exports={csv,get,usage,deckRow,select,estimate,markup,money,phone};
+module.exports={MARKUP_PERCENT,csv,get,usage,deckRow,select,estimate,markup,money,phone};

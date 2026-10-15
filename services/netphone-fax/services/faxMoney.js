@@ -15,8 +15,8 @@ function microToUsd(value) {
 function sellRate(rate) {
   const cost = BigInt(rate.provider_cost_microusd_per_page);
   if (cost <= 0n) throw new Error("Provider cost is not configured.");
-  // Fixed 40% markup on the configured total provider cost. Round upward to micro-USD.
-  return (cost * 14000n + 9999n) / 10000n;
+  // Use the saved rate version; legacy snapshots retain 40%. Round upward to micro-USD.
+  return (cost * BigInt(10000 + (rate.markup_percent ?? 40) * 100) + 9999n) / 10000n;
 }
 function matchRate(rates, phone, direction) {
   if (!/^\+[1-9]\d{7,14}$/.test(phone)) throw new Error("Use an international fax number.");

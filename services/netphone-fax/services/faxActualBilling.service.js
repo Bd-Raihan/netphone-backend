@@ -15,15 +15,15 @@ async function settings(client=db){return (await client.query('SELECT * FROM net
 async function route(phone,direction,client=db){
  const s=await settings(client);
  const manual=await control.policy(phone,direction,client);
- const revision=s.deck_version+':'+(manual?manual.id+':'+manual.revision:'auto');
+ const revision=s.deck_version+':markup55:'+(manual?manual.id+':'+manual.revision:'auto');
  if(!s.deck_version)throw fail('Import the Fax SIP rate deck first');
- if(direction==='inbound')return {id:'actual-inbound',revision,country_code:'US',manual,dynamic:true,provider_cost_microusd_per_page:s.fax_api_microusd,api:s.fax_api_microusd};
+ if(direction==='inbound')return {id:'actual-inbound',revision,country_code:'US',manual,markup_percent:math.MARKUP_PERCENT,dynamic:true,provider_cost_microusd_per_page:s.fax_api_microusd,api:s.fax_api_microusd};
  const digits=math.phone(phone);const prefixes=Array.from({length:digits.length},(_,i)=>digits.slice(0,i+1));
  const rows=(await client.query('SELECT route FROM netphone_fax_deck WHERE version=$1 AND prefix=ANY($2::text[])',[s.deck_version,prefixes])).rows.map(x=>x.route);
  let r;try{r=math.select(rows,phone,process.env.TELNYX_FAX_PHONE_NUMBER);}catch(e){throw fail(e.message);}
- return {id:'actual-send',revision,manual,country_code:r.iso.split('/')[0],dynamic:true,provider_cost_microusd_per_page:s.fax_api_microusd,api:s.fax_api_microusd,route:r,seconds:s.estimate_seconds_per_page};
+ return {id:'actual-send',revision,manual,markup_percent:math.MARKUP_PERCENT,country_code:r.iso.split('/')[0],dynamic:true,provider_cost_microusd_per_page:s.fax_api_microusd,api:s.fax_api_microusd,route:r,seconds:s.estimate_seconds_per_page};
 }
-function fee(rate,pages){return control.floor(rate.manual,pages,math.estimate(rate.route,pages,rate.seconds,rate.api));}
+function fee(rate,pages){return control.floor(rate.manual,pages,math.estimate(rate.route,pages,rate.seconds,rate.api,rate.markup_percent??40));}
 async function importDeck(req,transaction,audit){
  if(!req.file)throw fail('Choose a CSV');
  let rows;try{rows=math.csv(csvText(req.file)).map(math.deckRow);}catch(e){throw fail(e.message);}
@@ -48,6 +48,7 @@ function sameIdentity(old,r) {
 }
 async function mergeUsage(c,old,r,source) {
  if(!sameIdentity(old,r))throw fail('Billing identity changed: record/session/number mismatch. Admin review required',409);
+ if(r.kind==='fax' && BigInt(old.cost_microusd)>0n && BigInt(r.cost)===0n && r.details?.delivered_pages===0 && ['false','0'].includes(String(r.success).toLowerCase()))return false;
  if(String(old.cost_microusd)!==r.cost){
   // A manual report must never replace authenticated API billing with older CSV costs.
   if(source==='csv' && old.source==='api')return false;
@@ -65,7 +66,30 @@ async function mergeUsage(c,old,r,source) {
  if(source==='api')await c.query("UPDATE netphone_fax_usage SET source='api' WHERE kind=$1 AND record_key=$2",[r.kind,r.key]);
  return false;
 }
+// A provider export may contain a zero-page failed progress row followed by
+// the final successful row for the same fax ID. Canonicalize before DB writes.
+function normalizeRecords(records){
+ const found=new Map();
+ for(const r of records){
+  const key=r.kind+':'+r.key,old=found.get(key);
+  if(!old){found.set(key,r);continue;}
+  if(['session','direction','from','to','connection','fax_id'].some(k=>old[k]!==r[k]))
+   throw fail('Conflicting duplicate billing identity',409);
+  if(r.kind!=='fax'){
+   if(old.cost!==r.cost)throw fail('Conflicting duplicate SIP cost',409);
+   continue;
+  }
+  const progress=x=>BigInt(x.cost)===0n && x.details?.delivered_pages===0 && ['false','0'].includes(String(x.success).toLowerCase());
+  if(progress(old)&&!progress(r)){found.set(key,r);continue;}
+  if(progress(r)&&!progress(old))continue;
+  if(old.cost!==r.cost || (old.leg_id && r.leg_id && old.leg_id!==r.leg_id && BigInt(r.cost)>0n))
+   throw fail('Multiple billed fax records require review; no cost was discarded',409);
+  if(old.details?.delivered_pages==null && r.details?.delivered_pages!=null)found.set(key,r);
+ }
+ return [...found.values()];
+}
 async function store(records,source,transaction){
+ records=normalizeRecords(records);
  let accepted=0,unrelated=0,corrected=0;
  await transaction(async c=>{
   for(const r of records){
@@ -74,8 +98,9 @@ async function store(records,source,transaction){
    if(destination!==math.phone(process.env.TELNYX_FAX_PHONE_NUMBER)){unrelated++;continue;}
    const values=[r.kind,r.key,r.session,r.fax_id,r.direction,r.from,r.to,r.cost,r.connection,source];
    const old=(await c.query('SELECT * FROM netphone_fax_usage WHERE kind=$1 AND record_key=$2 FOR UPDATE',[r.kind,r.key])).rows[0];
-   if(old){if(await mergeUsage(c,old,r,source))corrected++;
-    if(source==='api'||old.source!=='api')await c.query('UPDATE netphone_fax_usage SET usage_details=$3::jsonb WHERE kind=$1 AND record_key=$2',[r.kind,r.key,JSON.stringify(r.details||{})]);continue;}
+   if(old){const progress=r.kind==='fax' && BigInt(old.cost_microusd)>0n && BigInt(r.cost)===0n && r.details?.delivered_pages===0 && ['false','0'].includes(String(r.success).toLowerCase());
+    if(await mergeUsage(c,old,r,source))corrected++;
+    if(!progress && (source==='api'||old.source!=='api'))await c.query('UPDATE netphone_fax_usage SET usage_details=$3::jsonb WHERE kind=$1 AND record_key=$2',[r.kind,r.key,JSON.stringify(r.details||{})]);continue;}
    const inserted=await c.query(`INSERT INTO netphone_fax_usage(kind,record_key,session_id,fax_provider_id,direction,from_number,to_number,cost_microusd,connection_id,source)
     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING RETURNING record_key`,values);
    if(inserted.rows[0]){accepted++;await c.query('UPDATE netphone_fax_usage SET usage_details=$3::jsonb WHERE kind=$1 AND record_key=$2',[r.kind,r.key,JSON.stringify(r.details||{})]);}
@@ -134,7 +159,7 @@ async function settle(faxId,transaction,ledger){
   }
   const details=await control.detail(b,c);
   const delivered=details.delivered_pages??(b.status==='failed'?0:Number(b.pages));
-  const target=control.floor(b.rate_snapshot.manual,delivered,math.markup(cost));let charge=target,shortfall=0n;
+  const target=control.floor(b.rate_snapshot.manual,delivered,math.markup(cost,b.rate_snapshot.markup_percent??40));let charge=target,shortfall=0n;
   if(b.direction==='outbound'){
    const reserved=BigInt(b.amount_microusd);charge=target>reserved?reserved:target;
    shortfall=target-charge;
@@ -145,7 +170,7 @@ async function settle(faxId,transaction,ledger){
   if(b.direction==='inbound'&&charge>0n){chargedTx=await control.autoPay(b,charge,c,ledger);if(chargedTx)state='paid';}
   await c.query(`UPDATE netphone_fax_billing SET amount_microusd=$2,provider_cost_microusd=$3,target_charge_microusd=$4,
    operator_shortfall_microusd=$5,actual_settled=TRUE,state=$6,charged_tx_id=COALESCE($10,charged_tx_id),billing_note=$7,billing_details=$8::jsonb,reserved_microusd=CASE WHEN $9 THEN COALESCE(reserved_microusd,amount_microusd) ELSE reserved_microusd END,updated_at=NOW() WHERE fax_id=$1`,
-   [faxId,charge.toString(),cost.toString(),target.toString(),shortfall.toString(),state,shortfall>0n?'Quote ceiling exceeded: operator absorbs difference':'Actual cost + 40%; manual page minimum if higher',JSON.stringify(details),b.direction==='outbound',chargedTx?.id||null]);
+   [faxId,charge.toString(),cost.toString(),target.toString(),shortfall.toString(),state,shortfall>0n?'Quote ceiling exceeded: operator absorbs difference':`Actual cost + ${b.rate_snapshot.markup_percent??40}%; manual page minimum if higher`,JSON.stringify(details),b.direction==='outbound',chargedTx?.id||null]);
   return true;
  });
 }
@@ -213,4 +238,4 @@ function install(router,admin,endpoint,transaction,audit,ledger,auth){
   await audit(db,req.user.id,'fax_estimate_updated',null,{seconds});return {saved:true};
  }));
 }
-module.exports={route,fee,settle,cycle,install,settings,sync,actualCost,store,_test:{sameIdentity,mergeUsage}};
+module.exports={route,fee,settle,cycle,install,settings,sync,actualCost,store,_test:{sameIdentity,mergeUsage,normalizeRecords}};

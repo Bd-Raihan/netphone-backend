@@ -241,7 +241,7 @@ async function sendOrContinue(req,res,next) {
   try {
     if (!(await settings()).billing_enabled) return next();
     const quoteId = String(req.body.quote_id || "");
-    if (!UUID.test(quoteId)) throw fail("Update NetPhone and confirm the fax fee before sending",409);
+    if (!UUID.test(quoteId)) throw fail("Update NetPhone and try sending again",409);
     for (const name of ["TELNYX_FAX_API_KEY","TELNYX_FAX_CONNECTION_ID","TELNYX_FAX_PHONE_NUMBER","FAX_PUBLIC_BASE_URL"])
       if (!process.env[name]) throw fail("Fax configuration is unavailable",503);
     const base = new URL(process.env.FAX_PUBLIC_BASE_URL);
@@ -254,11 +254,11 @@ async function sendOrContinue(req,res,next) {
       if (!q) throw fail("Fax quote not found",404);
       if (q.state === "submitted") return {fax:await ownedFax(req.user.id,q.fax_id,client),duplicate:true};
       if (!q.valid || Number(req.body.upload_id) !== Number(q.upload_id) || String(req.body.to_number).trim() !== q.to_number)
-        throw fail("Review the fax fee again",409);
-      if (!(await settings(client)).billing_enabled) throw fail("Fax pricing changed. Review the fee again",409);
+        throw fail("Fax quote expired. Try sending again",409);
+      if (!(await settings(client)).billing_enabled) throw fail("Fax pricing changed. Try sending again",409);
       const current = await resolveRate(q.to_number,"outbound",client);
       if (String(current.id) !== String(q.rate_snapshot.id) || current.revision !== q.rate_snapshot.revision)
-        throw fail("Fax pricing changed. Review the fee again",409);
+        throw fail("Fax pricing changed. Try sending again",409);
       const bytes = await fsp.readFile(filePath(UPLOADS,q.prepared_file_name));
       if (sha256(bytes) !== q.file_sha256) throw fail("Document changed. Upload it again",409);
       const upload = await client.query("UPDATE netphone_fax_uploads SET is_used=TRUE WHERE id=$1 AND user_id=$2 AND is_used=FALSE RETURNING id",[q.upload_id,req.user.id]);
@@ -385,7 +385,7 @@ async function adminInbox() {
   const result = await db.query(`SELECT f.id,f.from_number,f.to_number,f.pages,f.status,f.created_at,
     f.user_id,i.source,i.assigned_at,u.phone_e164 AS assigned_phone FROM netphone_fax_incoming i
     JOIN netphone_faxes f ON f.id=i.fax_id LEFT JOIN users u ON u.id=f.user_id
-    ORDER BY f.created_at DESC LIMIT 100`);
+    WHERE f.user_id IS NULL ORDER BY f.created_at DESC LIMIT 100`);
   return {faxes:result.rows};
 }
 async function assignIncoming(req) {
@@ -428,7 +428,9 @@ async function routePendingCovers() {
  JOIN netphone_faxes f ON f.id=i.fax_id WHERE f.user_id IS NULL ORDER BY f.created_at DESC LIMIT 50`);
  let scanned=0;
  for(const fax of pending.rows){
-  if(fax.source!=="provider_media")continue;
+  // Both sources pass provider identity/status/page-count checks on import.
+  // A valid, unused account-bound QR remains mandatory for ownership.
+  if(!['provider_media','legacy_archive'].includes(fax.source))continue;
   if(Date.now()<(coverAttempts.get(String(fax.id))||0))continue;
   if(scanned++>=2)break;
   coverAttempts.set(String(fax.id),Date.now()+300000);
@@ -438,7 +440,8 @@ async function routePendingCovers() {
    const assigned=await transaction(async client=>{
     const locked=await client.query('SELECT * FROM netphone_faxes WHERE id=$1 FOR UPDATE',[fax.id]);
     const current=locked.rows[0];if(!current || current.user_id!=null)return null;
-    const code=await cover.resolveCode(client,codes,current);if(!code)return null;
+    const code=await cover.resolveCode(client,codes,current);
+    if(!code){console.error('Fax cover routing:',String(fax.id),'no_valid_unused_recipient_cover');return null;}
     const enabled=(await settings(client)).billing_enabled;
     const rate=enabled?await resolveRate(current.to_number,'inbound',client):null;
     const amount=rate?feeForPages(rate,Number(current.pages)):0n;
@@ -450,8 +453,13 @@ async function routePendingCovers() {
     await audit(client,null,'cover_auto_assigned',fax.id,{user_id:code.user_id,cover_id:code.id});
     return code.user_id;
    });
-   if(assigned)await notify(assigned,fax.id,'Fax Received','A fax is available in your private Fax History.');
-  }catch(error){console.error('Cover routing pending admin review:',error.code || error.status || 'scan_or_pricing_unavailable');}
+   if(assigned){
+    // Ownership is committed first. Payment failure must not undo routing.
+    try {await actual.settle(fax.id,transaction,ledger);}
+    catch(error){console.error('Fax receive billing retry:',String(fax.id),error.code||error.status||'review_required');}
+    await notify(assigned,fax.id,'Fax Received','A fax is available in your private Fax History.');
+   }
+  }catch(error){console.error('Cover routing pending admin review:',String(fax.id),error.code || error.status || 'scan_or_pricing_unavailable');}
  }
 }
 
@@ -515,6 +523,9 @@ async function scanIncoming() {
 async function workCycle() {
   if (cyclePromise) return cyclePromise;
   cyclePromise = (async () => {
+    // Route documents before slow reporting/network sync; failures stay isolated.
+    try {await scanIncoming();} catch (_) {console.error('Incoming fax scan needs retry');}
+    try {await routePendingCovers();} catch (_) {console.error('Fax cover routing needs retry');}
     const pending = await db.query(`SELECT f.*,b.submit_started_at FROM netphone_fax_billing b
       JOIN netphone_faxes f ON f.id=b.fax_id WHERE b.state='prepaid' ORDER BY b.created_at LIMIT 30`);
     let lookedUp = 0;
@@ -527,8 +538,7 @@ async function workCycle() {
       } catch (_) {console.error("Fax settlement needs retry");}
     }
     try {await actual.cycle(transaction,ledger);} catch (_) {console.error("Fax billing reconciliation needs review");}
-    await scanIncoming();
-    return routePendingCovers();
+    return true;
   })().finally(() => {cyclePromise=null;});
   return cyclePromise;
 }
@@ -579,4 +589,4 @@ function installRoutes(router) {
   startWorker();
 }
 module.exports = {installRoutes,sendOrContinue,loadIncomingDocument,
-  _test:{transaction,ledger,privateBytes,storePrivate,ownedFax,settleFax,saveRate,assignIncoming,payIncoming,quote,readPdf,updateSettings,installRoutes}};
+  _test:{adminInbox,routePendingCovers,workCycle,transaction,ledger,privateBytes,storePrivate,ownedFax,settleFax,saveRate,assignIncoming,payIncoming,quote,readPdf,updateSettings,installRoutes}};
