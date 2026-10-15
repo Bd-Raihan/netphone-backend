@@ -114,7 +114,14 @@ async function settle(faxId,transaction,ledger){
  return transaction(async c=>{
   const b=(await c.query(`SELECT b.*,f.status,f.direction,f.from_number,f.to_number,f.telnyx_fax_id,f.created_at AS fax_created_at
    FROM netphone_fax_billing b JOIN netphone_faxes f ON f.id=b.fax_id WHERE b.fax_id=$1 FOR UPDATE OF b`,[faxId])).rows[0];
-  if(!b||!b.rate_snapshot?.dynamic||b.actual_settled||['free','refunded'].includes(b.state))return false;
+  if(!b||!b.rate_snapshot?.dynamic||['free','refunded'].includes(b.state))return false;
+  if(b.actual_settled){
+   if(b.direction!=='inbound'||b.state!=='payment_due')return false;
+   const tx=await control.autoPay(b,BigInt(b.amount_microusd),c,ledger);
+   if(!tx)return false;
+   await c.query("UPDATE netphone_fax_billing SET state='paid',charged_tx_id=$2,updated_at=NOW() WHERE fax_id=$1",[faxId,tx.id]);
+   return true;
+  }
   if(b.direction==='outbound' && !b.submit_started_at && !b.telnyx_fax_id && b.status==='queued' && Date.now()-new Date(b.created_at).getTime()>120000){
    const expired=await c.query("UPDATE netphone_faxes SET status='failed',failure_reason='Submission did not start' WHERE id=$1 AND status='queued' AND telnyx_fax_id IS NULL RETURNING id",[faxId]);
    if(expired.rows[0])b.status='failed';
@@ -179,8 +186,12 @@ async function sync(transaction){
 }
 async function cycle(transaction,ledger){
  if(Date.now()-lastAttempt>300000){lastAttempt=Date.now();void sync(transaction).catch(()=>{}); /* Incoming routing is never blocked by reporting. */}
- const pending=(await db.query("SELECT fax_id FROM netphone_fax_billing WHERE rate_snapshot->>'dynamic'='true' AND actual_settled=FALSE AND state IN ('prepaid','payment_due') ORDER BY created_at LIMIT 50")).rows;
- for(const x of pending)await settle(x.fax_id,transaction,ledger);
+ const pending=(await db.query("SELECT fax_id FROM netphone_fax_billing WHERE rate_snapshot->>'dynamic'='true' AND (actual_settled=FALSE OR state='payment_due') AND state IN ('prepaid','payment_due') ORDER BY reconcile_attempted_at NULLS FIRST,created_at LIMIT 50")).rows;
+ for(const x of pending){
+  try {await settle(x.fax_id,transaction,ledger);}
+  catch(e){console.error("Fax invoice reconciliation:",e.code||e.status||"review_required");}
+  finally {await db.query("UPDATE netphone_fax_billing SET reconcile_attempted_at=NOW() WHERE fax_id=$1 AND state IN ('prepaid','payment_due')",[x.fax_id]);}
+ }
 }
 async function status(){
  const s=await settings();const bills=(await db.query(`SELECT b.fax_id,b.state,b.amount_microusd,b.provider_cost_microusd,b.operator_shortfall_microusd,b.actual_settled,b.updated_at,b.pages,b.rate_snapshot,b.reserved_microusd,b.billing_details,f.direction

@@ -8,6 +8,7 @@ const {Worker} = require("worker_threads");
 const axios = require("axios");
 const cover = require("./faxCover.service");
 const actual = require("./faxActualBilling.service");
+const billingControl = require("./faxBillingControl");
 const db = require("../database/db");
 const provider = require("./telnyxFax.service");
 const {createMediaToken,revokeMediaTokens} = require("./mediaToken.service");
@@ -58,7 +59,7 @@ async function audit(client,actor,action,faxId,details={}) {
 async function settings(client=db) {
   const result = await client.query("SELECT billing_enabled,actual_billing FROM netphone_fax_settings WHERE id=1");
   if (!result.rows[0]) throw fail("Fax setup is incomplete",503);
-  return result.rows[0];
+  return {...result.rows[0],billing_enabled:true,actual_billing:true};
 }
 async function resolveRate(phone,direction,client=db) {
   if ((await settings(client)).actual_billing) return actual.route(phone,direction,client);
@@ -93,7 +94,7 @@ async function ledger(client,userId,amount,type,key,meta) {
   if (after < 0n) throw fail("Insufficient wallet balance",402);
   // Round the compatibility cents fields exactly as the current Wallet service does.
   const cents = (value) => ((value + 5000n)/10000n).toString();
-  const exactMeta = {...meta,service:"fax",exact_wallet_amount:{
+  const exactMeta = {...meta,service:"fax",display_title:type === "fax_refund" ? "Fax Refund" : meta.direction === "inbound" ? "Fax Receive Charge" : "Fax Send Charge",flow:type === "fax_refund" ? "credit" : "debit",exact_wallet_amount:{
     amount_microusd:amount.toString(),amount_usd:microToUsd(amount),
     balance_after_microusd:after.toString(),balance_after_usd:microToUsd(after)}};
   const tx = await client.query(`INSERT INTO wallet_transactions
@@ -196,7 +197,7 @@ async function quote(req) {
   if (!upload) throw fail("Fax upload not found",404);
   if (!(await settings()).billing_enabled) return {billing_enabled:false,amount_usd:"0.000000",quote_id:null};
   const config=await actual.settings();
-  if(config.actual_billing && (!config.adapter_verified || config.usage_sync_error || !config.last_usage_sync || Date.now()-new Date(config.last_usage_sync).getTime()>900000))throw fail("Fax billing temporarily unavailable. Try again later",503);
+  if((!config.adapter_verified || config.usage_sync_error || !config.last_usage_sync || Date.now()-new Date(config.last_usage_sync).getTime()>900000))throw fail("Fax billing temporarily unavailable. Try again later",503);
   const rate = await resolveRate(to,"outbound");
   const count = await db.query("SELECT COUNT(*)::INTEGER AS count FROM netphone_fax_quotes WHERE user_id=$1 AND expires_at>NOW() AND state='quoted'",[req.user.id]);
   if (count.rows[0].count >= 20) throw fail("Too many pending quotes. Try again later",429);
@@ -317,7 +318,7 @@ async function billingInfo(req) {
   const result = await db.query("SELECT state,amount_microusd,pages,rate_snapshot,actual_settled FROM netphone_fax_billing WHERE fax_id=$1 AND user_id=$2",[faxId,req.user.id]);
   const bill = result.rows[0];
   return {billing_pending:bill?.rate_snapshot?.dynamic===true && !bill.actual_settled && !["free","refunded"].includes(bill.state),payment_required:bill?.state === "payment_due",state:bill?.state || "legacy",
-    amount_microusd:String(bill?.amount_microusd || 0),amount_usd:microToUsd(bill?.amount_microusd || 0),pages:bill?.pages || null};
+    amount_microusd:String(bill?.amount_microusd || 0),amount_usd:microToUsd(bill?.amount_microusd || 0),pages:bill?.pages || null,receive_billing:await billingControl.receiveBilling(req)};
 }
 async function payIncoming(req) {
   const faxId = id(req.params.faxId);
@@ -377,22 +378,8 @@ async function adminRates() {
   return {rates:rates.rows.map(ratePublic),...(await settings())};
 }
 async function updateSettings(req) {
-  if (typeof req.body.billing_enabled !== "boolean") throw fail("Invalid charging setting");
-  return transaction(async client => {
-    if (req.body.billing_enabled) {
-      const config=await actual.settings(client);
-      if(config.actual_billing) {
-        if(!config.deck_version)throw fail("Import Fax SIP rate deck first");
-        if(!config.adapter_verified || !config.last_usage_sync || Date.now()-new Date(config.last_usage_sync).getTime()>900000 || config.usage_sync_error)
-          throw fail("Run Sync Telnyx usage successfully before enabling billing. Reporting fields/permissions must be verified");
-      } else {
-        throw fail("Legacy per-page billing is disabled for new charges");
-      }
-    }
-    await client.query("UPDATE netphone_fax_settings SET billing_enabled=$1,updated_at=NOW() WHERE id=1",[req.body.billing_enabled]);
-    await audit(client,req.user.id,"billing_setting",null,{billing_enabled:req.body.billing_enabled});
-    return {billing_enabled:req.body.billing_enabled};
-  });
+  if (req.body.billing_enabled !== true) throw fail("Fax charging is always enabled",409);
+  return {billing_enabled:true};
 }
 async function adminInbox() {
   const result = await db.query(`SELECT f.id,f.from_number,f.to_number,f.pages,f.status,f.created_at,
@@ -420,7 +407,8 @@ async function assignIncoming(req) {
       return {user,fax,duplicate:true};
     }
     const enabled = (await settings(client)).billing_enabled;
-    const waived = req.body.waive_fee === true;
+    if (req.body.waive_fee === true) throw fail("New fax fees cannot be waived",409);
+    const waived = false;
     const rate = enabled && !waived ? await resolveRate(fax.to_number,"inbound",client) : null;
     const amount = rate ? feeForPages(rate,Number(fax.pages)) : 0n;
     await client.query("UPDATE netphone_faxes SET user_id=$2,updated_at=NOW() WHERE id=$1",[faxId,user.user_id]);
@@ -563,7 +551,9 @@ function installRoutes(router) {
   router.get("/receive-profile",auth,endpoint(receiveProfile));
   router.post("/receive-cover/revoke",auth,endpoint(async req=>{await cover.revoke(req.user.id);return {revoked:true};}));
   router.post("/receive-cover",auth,async(req,res)=>{
-   try {const profile=await receiveProfile(req);const bytes=await cover.createCover(req.user.id,req.body.recipient_name,profile);
+   try {
+    if (await balance(req.user.id) <= 0n) throw fail("Recharge your wallet before creating a Receive cover",402);
+    const profile=await receiveProfile(req);const bytes=await cover.createCover(req.user.id,req.body.recipient_name,profile);
     res.set({'Content-Type':'application/pdf','Content-Disposition':'attachment; filename="NetPhone_Receive_Cover.pdf"','Cache-Control':'no-store, private','X-Content-Type-Options':'nosniff'}).send(bytes);
    }catch(error){res.status(error.status||503).json({success:false,message:error.status?error.message:'Cover page unavailable. Please try again.'});}
   });

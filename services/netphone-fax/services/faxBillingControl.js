@@ -74,27 +74,21 @@ async function search(req){
  return {api_page_usd:microToUsd(version.fax_api_microusd),more:rows.length>50,routes:rows.slice(0,50).map(({route:x})=>({...x,
  sip_minute_usd:microToUsd(x.rate),sell_sip_minute_usd:microToUsd(math.markup(x.rate)),per_call_usd:microToUsd(x.per_call)}))};
 }
-async function receiveBilling(req){
- const row=(await db.query('SELECT enabled,limit_microusd FROM netphone_fax_autopay WHERE user_id=$1',[req.user.id])).rows[0];
- return {enabled:row?.enabled===true,limit_usd:microToUsd(row?.limit_microusd||500000)};
+// The deployment timestamp excludes historical faxes; no per-user opt-in or cap.
+async function receiveBilling(){
+ return {enabled:true,agreement_required:false,limit_usd:null};
 }
-async function saveReceiveBilling(req,transaction,audit){
- if(typeof req.body.enabled!=='boolean')throw fail('Invalid automatic payment setting');
- let limit;try{limit=math.money(String(req.body.limit_usd));}catch(_){throw fail('Enter a valid USD limit');}
- if(limit<10000n||limit>100000000n)throw fail('Receive auto-payment limit must be $0.01–$100 per fax');
- await transaction(async c=>{
-  await c.query(`INSERT INTO netphone_fax_autopay(user_id,enabled,limit_microusd,enabled_at)
-  VALUES($1,$2,$3,CASE WHEN $2 THEN clock_timestamp() ELSE NULL END) ON CONFLICT(user_id) DO UPDATE SET
-  enabled=EXCLUDED.enabled,limit_microusd=EXCLUDED.limit_microusd,
-  enabled_at=CASE WHEN EXCLUDED.enabled AND NOT netphone_fax_autopay.enabled THEN clock_timestamp()
-   WHEN EXCLUDED.enabled THEN netphone_fax_autopay.enabled_at ELSE NULL END,updated_at=NOW()`,[req.user.id,req.body.enabled,limit.toString()]);
-  await audit(c,req.user.id,'fax_receive_autopay_changed',null,{enabled:req.body.enabled,limit_microusd:limit.toString()});
- });return {saved:true};
+async function saveReceiveBilling(req){
+ if(req.body.enabled!==true)throw Object.assign(new Error('Receive charging is automatic and cannot be disabled'),{status:409});
+ return {saved:true,enabled:true};
 }
 async function autoPay(b,charge,client,ledger){
- const setting=(await client.query('SELECT * FROM netphone_fax_autopay WHERE user_id=$1 FOR SHARE',[b.user_id])).rows[0];
- if(!setting?.enabled||!setting.enabled_at||!b.fax_created_at||new Date(b.fax_created_at)<new Date(setting.enabled_at)||charge>BigInt(setting.limit_microusd))return null;
- try {return await ledger(client,b.user_id,charge,'fax_charge',`netphone-fax:${b.fax_id}:receive`,{fax_id:b.fax_id,direction:'inbound',stage:'automatic_receive',pages:b.pages});}
+ const setting=(await client.query('SELECT receive_auto_from FROM netphone_fax_settings WHERE id=1')).rows[0];
+ const start=new Date(setting?.receive_auto_from||'').getTime();
+ const received=new Date(b.fax_created_at||'').getTime();
+ if(!Number.isFinite(start)||!Number.isFinite(received)||received<start)return null;
+ try {return await ledger(client,b.user_id,charge,'fax_charge',`netphone-fax:${b.fax_id}:receive`,
+  {fax_id:b.fax_id,direction:'inbound',stage:'automatic_receive',pages:b.pages});}
  catch(e){if(e.status===402)return null;throw e;}
 }
 function install(router,admin,endpoint,transaction,audit,auth){
@@ -104,4 +98,4 @@ function install(router,admin,endpoint,transaction,audit,auth){
  router.post('/admin/price-controls',...admin,endpoint(req=>save(req,transaction,audit)));
  router.get('/admin/rate-browser',...admin,endpoint(search));
 }
-module.exports={floor,policy,usageInfo,detail,publicBill,attach,install,save,autoPay};
+module.exports={floor,policy,usageInfo,detail,publicBill,attach,install,save,autoPay,receiveBilling,saveReceiveBilling};
