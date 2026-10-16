@@ -429,7 +429,7 @@ async function routePendingCovers() {
  let scanned=0;
  for(const fax of pending.rows){
   // Both sources pass provider identity/status/page-count checks on import.
-  // A valid, unused account-bound QR remains mandatory for ownership.
+  // A valid, non-revoked account-bound QR remains mandatory for ownership.
   if(!['provider_media','legacy_archive'].includes(fax.source))continue;
   if(Date.now()<(coverAttempts.get(String(fax.id))||0))continue;
   if(scanned++>=2)break;
@@ -441,15 +441,15 @@ async function routePendingCovers() {
     const locked=await client.query('SELECT * FROM netphone_faxes WHERE id=$1 FOR UPDATE',[fax.id]);
     const current=locked.rows[0];if(!current || current.user_id!=null)return null;
     const code=await cover.resolveCode(client,codes,current);
-    if(!code){console.error('Fax cover routing:',String(fax.id),'no_valid_unused_recipient_cover');return null;}
+    if(!code){console.error('Fax cover routing:',String(fax.id),'no_valid_recipient_cover');return null;}
     const enabled=(await settings(client)).billing_enabled;
     const rate=enabled?await resolveRate(current.to_number,'inbound',client):null;
     const amount=rate?feeForPages(rate,Number(current.pages)):0n;
     await client.query('UPDATE netphone_faxes SET user_id=$2,updated_at=NOW() WHERE id=$1',[fax.id,code.user_id]);
-    await client.query("UPDATE netphone_fax_incoming SET assigned_at=NOW(),verified_reference='Valid one-time cover QR' WHERE fax_id=$1",[fax.id]);
+    await client.query("UPDATE netphone_fax_incoming SET assigned_at=NOW(),verified_reference='Valid reusable cover QR' WHERE fax_id=$1",[fax.id]);
     await client.query(`INSERT INTO netphone_fax_billing(fax_id,user_id,pages,amount_microusd,rate_snapshot,state)
      VALUES($1,$2,$3,$4,$5::jsonb,$6)`,[fax.id,code.user_id,current.pages,amount.toString(),JSON.stringify(rate||{}),amount>0n?'payment_due':'free']);
-    await client.query('UPDATE netphone_fax_cover_codes SET consumed_fax_id=$2 WHERE id=$1',[code.id,fax.id]);
+    await client.query('UPDATE netphone_fax_cover_codes SET consumed_fax_id=COALESCE(consumed_fax_id,$2) WHERE id=$1',[code.id,fax.id]);
     await audit(client,null,'cover_auto_assigned',fax.id,{user_id:code.user_id,cover_id:code.id});
     return code.user_id;
    });
