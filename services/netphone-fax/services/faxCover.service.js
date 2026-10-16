@@ -31,7 +31,7 @@ async function createCover(userId, recipientName, profile) {
  line('Put this page FIRST, followed by the complete document.',606,13,true);
  // Fixed QR location; renderer also checks the full first page for conflicting routing codes.
  page.drawImage(qr,{x:164,y:274,width:284,height:284});
- line('One-time routing code. Valid for 30 days. Do not reuse this page.',240,11,true);
+ line('One-time routing code. Valid for 60 days. Do not reuse this page.',240,11,true);
  line('Create a new cover for each new fax transmission.',220,11);
  line('Keep the QR large, upright, uncropped and clear. Do not write over it.',198,11);
  line('This extra cover page may incur a per-page fax charge.',176,11);
@@ -39,7 +39,7 @@ async function createCover(userId, recipientName, profile) {
  line('The code cannot open, download or sign in to an account.',132,11);
  const bytes=Buffer.from(await pdf.save());
  await db.query(`INSERT INTO netphone_fax_cover_codes(id,user_id,token_hash,destination,expires_at)
- VALUES($1,$2,$3,$4,NOW()+INTERVAL '30 days')`,[coverId,userId,hash(token),destination]);
+ VALUES($1,$2,$3,$4,NOW()+INTERVAL '60 days')`,[coverId,userId,hash(token),destination]);
  return bytes;
 }
 async function decodeCover(bytes) {
