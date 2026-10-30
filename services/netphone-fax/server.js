@@ -7,7 +7,9 @@ require("dotenv").config();
 const app = express();
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({verify:(req,res,bytes)=>{
+  if(req.originalUrl.split("?")[0] === "/api/fax/personal-numbers/webhook") req.rawBody=Buffer.from(bytes);
+}}));
 app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.FAX_PORT || 8787;

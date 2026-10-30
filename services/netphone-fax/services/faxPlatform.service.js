@@ -11,6 +11,7 @@ const receiveId = require("./faxReceiveId.service");
 const inboxArchive = require("./faxInboxArchive.service");
 const multiUpload = require("./faxMultiUpload.service");
 const actual = require("./faxActualBilling.service");
+const personal = require("./personalFaxNumbers.service");
 const billingControl = require("./faxBillingControl");
 const db = require("../database/db");
 const provider = require("./telnyxFax.service");
@@ -64,8 +65,8 @@ async function settings(client=db) {
   if (!result.rows[0]) throw fail("Fax setup is incomplete",503);
   return {...result.rows[0],billing_enabled:true,actual_billing:true};
 }
-async function resolveRate(phone,direction,client=db) {
-  if ((await settings(client)).actual_billing) return actual.route(phone,direction,client);
+async function resolveRate(phone,direction,client=db,fromNumber) {
+  if ((await settings(client)).actual_billing) return actual.route(phone,direction,client,fromNumber);
   const result = await client.query("SELECT * FROM netphone_fax_rates WHERE direction=$1",[direction]);
   try {return matchRate(result.rows,phone,direction);} catch (error) {throw fail(error.message,422);}
 }
@@ -201,7 +202,10 @@ async function quote(req) {
   if (!(await settings()).billing_enabled) return {billing_enabled:false,amount_usd:"0.000000",quote_id:null};
   const config=await actual.settings();
   if((!config.adapter_verified || config.usage_sync_error || !config.last_usage_sync || Date.now()-new Date(config.last_usage_sync).getTime()>900000))throw fail("Fax billing temporarily unavailable. Try again later",503);
-  const rate = await resolveRate(to,"outbound");
+  const personalSender=await personal.sender(req.user.id);
+  const rate = await resolveRate(to,"outbound",db,personalSender?.phone_number);
+  rate.sender_number=personalSender?.phone_number || process.env.TELNYX_FAX_PHONE_NUMBER.trim();
+  rate.sender_connection=personalSender?.connection_id || String(process.env.TELNYX_FAX_CONNECTION_ID);
   const count = await db.query("SELECT COUNT(*)::INTEGER AS count FROM netphone_fax_quotes WHERE user_id=$1 AND expires_at>NOW() AND state='quoted'",[req.user.id]);
   if (count.rows[0].count >= 20) throw fail("Too many pending quotes. Try again later",429);
   const input = await fsp.readFile(filePath(UPLOADS,upload.stored_file_name));
@@ -259,7 +263,12 @@ async function sendOrContinue(req,res,next) {
       if (!q.valid || Number(req.body.upload_id) !== Number(q.upload_id) || String(req.body.to_number).trim() !== q.to_number)
         throw fail("Fax quote expired. Try sending again",409);
       if (!(await settings(client)).billing_enabled) throw fail("Fax pricing changed. Try sending again",409);
-      const current = await resolveRate(q.to_number,"outbound",client);
+      const personalSender=await personal.sender(req.user.id,client);
+      const senderNumber=personalSender?.phone_number || from;
+      const senderConnection=personalSender?.connection_id || String(process.env.TELNYX_FAX_CONNECTION_ID);
+      if(q.rate_snapshot.sender_number && (q.rate_snapshot.sender_number!==senderNumber || q.rate_snapshot.sender_connection!==senderConnection))
+        throw fail("Your sending number changed. Try sending again",409);
+      const current = await resolveRate(q.to_number,"outbound",client,senderNumber);
       if (String(current.id) !== String(q.rate_snapshot.id) || current.revision !== q.rate_snapshot.revision)
         throw fail("Fax pricing changed. Try sending again",409);
       const bytes = await fsp.readFile(filePath(UPLOADS,q.prepared_file_name));
@@ -269,9 +278,13 @@ async function sendOrContinue(req,res,next) {
       const inserted = await client.query(`INSERT INTO netphone_faxes
         (user_id,sender_name,direction,from_number,to_number,status,file_name,pages,user_email,country_code)
         VALUES($1,$2,'outbound',$3,$4,'queued',$5,$6,$7,$8) RETURNING *`,
-        [req.user.id,String(req.body.sender_name || "").trim().slice(0,150)||null,from,q.to_number,q.prepared_file_name,q.pages,
+        [req.user.id,String(req.body.sender_name || "").trim().slice(0,150)||null,senderNumber,q.to_number,q.prepared_file_name,q.pages,
           String(req.body.user_email || "").trim().slice(0,255)||null,current.country_code]);
       const row = inserted.rows[0], amount = BigInt(q.amount_microusd);
+      if(personalSender){
+        await client.query("UPDATE netphone_faxes SET provider_connection_id=$2 WHERE id=$1",[row.id,senderConnection]);
+        row.provider_connection_id=senderConnection;
+      }
       const tx = await ledger(client,req.user.id,amount,"fax_charge",`netphone-fax:${row.id}:send`,
         {fax_id:row.id,direction:"outbound",pages:q.pages,to_phone_e164:q.to_number,stage:"prepaid",sell_usd_per_page:microToUsd(sellRate(q.rate_snapshot))});
       await client.query(`INSERT INTO netphone_fax_billing(fax_id,user_id,pages,amount_microusd,rate_snapshot,state,charged_tx_id)
@@ -285,7 +298,7 @@ async function sendOrContinue(req,res,next) {
     const started = await db.query("UPDATE netphone_fax_billing SET submit_started_at=NOW() WHERE fax_id=$1 AND state='prepaid' RETURNING fax_id",[fax.id]);
     if (!started.rows[0]) throw fail("Fax submission is unavailable",409);
     networkStarted = true;
-    const sent = await provider.sendFax({to:fax.to_number,
+    const sent = await provider.sendFax({to:fax.to_number,fromNumber:fax.from_number,connectionOverride:fax.provider_connection_id,
       mediaUrl:`${process.env.FAX_PUBLIC_BASE_URL.replace(/\/+$/,"")}/api/fax/media/${encodeURIComponent(token.token)}`,
       clientState:`netphone-fax-${fax.id}`});
     acceptedId = sent?.data?.id;
@@ -472,6 +485,46 @@ async function routePendingCovers() {
  }
 }
 
+async function importPersonalFax(faxId,signedMediaUrl) {
+  const fax=await provider.getFax(faxId);
+  if(fax.direction!=='inbound'||provider.normalizeFaxStatus(fax.status)!=='received'||
+    String(fax.connection_id)!==String(process.env.TELNYX_PERSONAL_FAX_CONNECTION_ID))throw fail('Personal fax identity unavailable',503);
+  const exists=await db.query('SELECT id FROM netphone_faxes WHERE telnyx_fax_id=$1',[faxId]);
+  if(exists.rows[0])return;
+  const owner=await personal.incomingOwner(db,fax);
+  if(!owner)throw fail('Personal fax recipient needs review',503);
+  const url=new URL(fax.stored_media_url||fax.media_url||signedMediaUrl||'');
+  if(url.protocol!=='https:'||!/(^|\.)(amazonaws\.com|telnyx\.com|telnyxcloudstorage\.com)$/.test(url.hostname))throw fail('Personal fax media unavailable',503);
+  const response=await axios.get(url.toString(),{responseType:'arraybuffer',timeout:15000,maxContentLength:30*1024*1024,maxRedirects:0,proxy:false});
+  const parsed=await readPdf(Buffer.from(response.data));
+  if(fax.page_count==null||Number(fax.page_count)!==parsed.pages)throw fail('Fax page count needs review',503);
+  const vaultName=await storePrivate(parsed.bytes);
+  let inserted=false;
+  try {
+    inserted=await transaction(async client=>{
+      // Recheck ownership inside the transaction, never read an account from the webhook body.
+      const verified=await personal.incomingOwner(client,fax);
+      if(!verified||String(verified.user_id)!==String(owner.user_id))throw fail('Fax recipient changed',409);
+      const rate=await resolveRate(fax.to,'inbound',client),amount=feeForPages(rate,parsed.pages);
+      const row=(await client.query(`INSERT INTO netphone_faxes(user_id,direction,from_number,to_number,telnyx_fax_id,status,file_name,pages,created_at,provider_connection_id)
+        VALUES($1,'inbound',$2,$3,$4,'received',$5,$6,$7,$8) ON CONFLICT(telnyx_fax_id) DO NOTHING RETURNING id`,
+        [owner.user_id,fax.from,fax.to,faxId,vaultName,parsed.pages,fax.created_at,String(fax.connection_id)])).rows[0];
+      if(!row)return false;
+      await client.query("INSERT INTO netphone_fax_incoming(fax_id,vault_file_name,file_sha256,source,assigned_at,verified_reference) VALUES($1,$2,$3,'provider_media',NOW(),'Dedicated personal fax number')",[row.id,vaultName,sha256(parsed.bytes)]);
+      await client.query(`INSERT INTO netphone_fax_billing(fax_id,user_id,pages,amount_microusd,rate_snapshot,state)
+        VALUES($1,$2,$3,$4,$5::jsonb,'payment_due')`,[row.id,owner.user_id,parsed.pages,amount.toString(),JSON.stringify(rate)]);
+      await audit(client,null,'personal_number_auto_assigned',row.id,{user_id:owner.user_id,number_id:owner.id});
+      return row.id;
+    });
+  } finally {
+    if(!inserted)await fsp.unlink(filePath(VAULT,vaultName)).catch(()=>{});
+  }
+  if(inserted) {
+    try{await actual.settle(inserted,transaction,ledger);}catch(_){console.error('Personal fax receive billing pending:',inserted);}
+    await notify(owner.user_id,inserted,'Fax Received','A fax is available in your private Fax History.');
+  }
+}
+
 async function scanIncoming() {
   let names;
   try {names = await fsp.readdir(ARCHIVE);} catch (error) {if (error.code === "ENOENT") return 0; throw error;}
@@ -568,6 +621,7 @@ function installRoutes(router) {
   actual.install(router,admin,endpoint,transaction,audit,ledger,auth);
   multiUpload.install(router,auth,endpoint,db,UPLOADS);
   inboxArchive.install(router,admin,endpoint,db,transaction,audit);
+  personal.install(router,auth,admin,endpoint,{db,transaction,notify,importPersonal:importPersonalFax});
   router.post("/quote",auth,endpoint(quote));
   router.get("/receive-profile",auth,endpoint(receiveProfile));
   router.post("/receive-cover/revoke",auth,endpoint(async req=>{await cover.revoke(req.user.id);return {revoked:true};}));

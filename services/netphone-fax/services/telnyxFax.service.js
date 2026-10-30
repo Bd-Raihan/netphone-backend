@@ -99,11 +99,13 @@ async function sendFax({
   mediaUrl,
   mediaName,
   clientState,
+  fromNumber,
+  connectionOverride,
 }) {
   const apiKey = requireEnv("TELNYX_FAX_API_KEY");
-  const connectionId = requireEnv("TELNYX_FAX_CONNECTION_ID");
+  const connectionId = connectionOverride || requireEnv("TELNYX_FAX_CONNECTION_ID");
   const from = normalizePhone(
-    requireEnv("TELNYX_FAX_PHONE_NUMBER")
+    fromNumber || requireEnv("TELNYX_FAX_PHONE_NUMBER")
   );
 
   to = normalizePhone(to);
