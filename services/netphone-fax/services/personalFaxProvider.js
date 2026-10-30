@@ -27,7 +27,7 @@ async function ready() {
 }
 async function available(phone) {
   const params={'filter[country_code]':'US','filter[phone_number_type]':'local','filter[features][]':'fax',
-    'filter[quickship]':true,'filter[best_effort]':false,'filter[limit]':phone?10:20};
+    'filter[best_effort]':false,'filter[limit]':phone?10:20};
   if(phone)params['filter[phone_number][contains]']=phone.replace(/^\+/,'');
   try {return (await api('GET','/available_phone_numbers',undefined,params)).data||[];}
   catch(e){if(e.response?.status===400&&e.response.data?.errors?.some(x=>String(x.code)==='10031'))return [];throw e;}

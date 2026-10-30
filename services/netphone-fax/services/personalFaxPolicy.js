@@ -21,9 +21,11 @@ function initialPeriods(now=new Date()) {
   if(now.getTime()>=end.getTime()-LEAD_MS) periods.push({start:end.toISOString(),end:nextMonth(end).toISOString(),amount:MONTHLY.toString()});
   return periods;
 }
+// Both quickship values are valid: activation is independently verified by the worker.
+// Keep rejecting missing flags and best-effort inventory.
 function available(row) {
   const c=row?.cost_information;
-  if(!/^\+1\d{10}$/.test(row?.phone_number||'') || c?.currency!=='USD' || row.quickship!==true || row.best_effort===true) return null;
+  if(!/^\+1\d{10}$/.test(row?.phone_number||'') || c?.currency!=='USD' || typeof row.quickship!=='boolean' || row.best_effort!==false) return null;
   if(!(row.features||[]).some(f=>f.name==='fax'))return null;
   if(!(row.region_information||[]).some(r=>r.region_type==='country_code'&&r.region_name==='US'))return null;
   try {if(micro(c.monthly_cost)!==MONTHLY||micro(c.upfront_cost)>MONTHLY)return null;}
