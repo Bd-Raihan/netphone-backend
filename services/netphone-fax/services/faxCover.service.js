@@ -22,8 +22,7 @@ async function createCover(userId, recipientName, profile) {
  if (count.rows[0].n >= 20) throw Object.assign(new Error('Too many cover pages. Try again later.'),{status:429});
  const pdf = await PDFDocument.create(), page = pdf.addPage([612,792]);
  const font = await pdf.embedFont(StandardFonts.Helvetica), bold = await pdf.embedFont(StandardFonts.HelveticaBold);
- const png = await QRCode.toBuffer(`NPFX1:${token}`,{errorCorrectionLevel:'H',margin:4,width:700});
- const qr = await pdf.embedPng(png);
+ const qr = QRCode.create(`NPFX1:${token}`,{errorCorrectionLevel:'H'});
  const line=(text,y,size=12,strong=false)=>page.drawText(text,{x:48,y,size,font:strong?bold:font,color:rgb(0,0,0)});
  line('NETPHONE - RECEIVE FAX COVER PAGE',738,20,true);
  const red=rgb(0.76,0.05,0.08);
@@ -35,9 +34,22 @@ async function createCover(userId, recipientName, profile) {
  const nameSize=Math.min(14,516/bold.widthOfTextAtSize(label,1));
  line(label,628,nameSize,true);
  line(`Send fax to: ${destination}`,604,16,true);
- line(`Receive ID: ${profile.receive_code}`,580);
+ line(`NetPhone Receive ID: ${profile.receive_code}`,580,16,true);
  // Fixed QR location; renderer also checks the full first page for conflicting routing codes.
- page.drawImage(qr,{x:164,y:274,width:284,height:284});
+ // True PDF vectors: no embedded bitmap, JPEG compression or image interpolation.
+ // Keep the existing physical size and four-module white quiet zone.
+ const qrX=164,qrY=274,qrSize=284,margin=4,modules=qr.modules.size;
+ const unit=qrSize/(modules+2*margin);
+ page.drawRectangle({x:qrX,y:qrY,width:qrSize,height:qrSize,color:rgb(1,1,1)});
+ // Draw horizontal black runs to keep the PDF compact and edges shared exactly.
+ for(let row=0;row<modules;row++){
+  for(let col=0;col<modules;){
+   if(!qr.modules.get(row,col)){col++;continue;}
+   const start=col;while(col<modules&&qr.modules.get(row,col))col++;
+   page.drawRectangle({x:qrX+(margin+start)*unit,
+    y:qrY+(margin+modules-row-1)*unit,width:(col-start)*unit,height:unit,color:rgb(0,0,0)});
+  }
+ }
  line('Reusable cover. No fixed expiry while your account remains active.',240,11,true);
  line('Valid until revoked. A new download does not cancel previous covers.',220,11);
  line('Keep the QR large, upright, uncropped and clear. Do not write over it.',198,11);

@@ -9,7 +9,7 @@ const {PNG}=require('pngjs'),jsQR=require('jsqr');
   const input=path.join(dir,'input.pdf'),output=path.join(dir,'page');
   await fs.writeFile(input,Buffer.from(workerData.bytes),{mode:0o600});
   const codes=[];
-  for(const resolution of ['1200','1800']){
+  for(const resolution of ['1200','1800','2200']){
   await promisify(execFile)('pdftoppm',['-f','1','-l','3','-scale-to',resolution,'-png',input,output],{timeout:15000,maxBuffer:1024*1024});
   const pages=(await fs.readdir(dir)).filter(name=>/^page-\d+\.png$/.test(name)).sort();
   if(!pages.length || pages.length>3)throw Error('Invalid rendered pages');
@@ -21,7 +21,7 @@ const {PNG}=require('pngjs'),jsQR=require('jsqr');
    for(let y=0;y<height;y++)pixels.set(png.data.subarray(((top+y)*png.width+left)*4,((top+y)*png.width+left+width)*4),y*width*4);
    for(let i=0;i<6;i++){
     const found=jsQR(pixels,width,height,{inversionAttempts:'attemptBoth'});
-    if(!found)break;codes.push(found.data);
+    if(!found)break;if(found.data)codes.push(found.data);
     const pts=Object.values(found.location);
     const minX=Math.max(0,Math.floor(Math.min(...pts.map(p=>p.x)))-12),maxX=Math.min(width-1,Math.ceil(Math.max(...pts.map(p=>p.x)))+12);
     const minY=Math.max(0,Math.floor(Math.min(...pts.map(p=>p.y)))-12),maxY=Math.min(height-1,Math.ceil(Math.max(...pts.map(p=>p.y)))+12);
@@ -29,6 +29,9 @@ const {PNG}=require('pngjs'),jsQR=require('jsqr');
     if(i===5)throw Error('Too many QR codes');
    }
   };
+  // Fax-service covers can shrink the NetPhone cover into part of a page.
+  // Scan its central QR region with quiet-zone padding as well as the whole page.
+  scanRegion(Math.floor(png.width*.28),Math.floor(png.height*.30),Math.floor(png.width*.40),Math.floor(png.height*.27));
   scanRegion(0,0,png.width,png.height);
   const midX=Math.floor(png.width/2),midY=Math.floor(png.height/2);
   scanRegion(0,0,midX,png.height);scanRegion(midX,0,png.width-midX,png.height);
