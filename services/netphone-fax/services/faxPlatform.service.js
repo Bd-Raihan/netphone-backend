@@ -7,6 +7,9 @@ const os = require("os");
 const {Worker} = require("worker_threads");
 const axios = require("axios");
 const cover = require("./faxCover.service");
+const receiveId = require("./faxReceiveId.service");
+const inboxArchive = require("./faxInboxArchive.service");
+const multiUpload = require("./faxMultiUpload.service");
 const actual = require("./faxActualBilling.service");
 const billingControl = require("./faxBillingControl");
 const db = require("../database/db");
@@ -383,9 +386,9 @@ async function updateSettings(req) {
 }
 async function adminInbox() {
   const result = await db.query(`SELECT f.id,f.from_number,f.to_number,f.pages,f.status,f.created_at,
-    f.user_id,i.source,i.assigned_at,u.phone_e164 AS assigned_phone FROM netphone_fax_incoming i
+    f.user_id,f.file_name,i.source,i.assigned_at,u.phone_e164 AS assigned_phone FROM netphone_fax_incoming i
     JOIN netphone_faxes f ON f.id=i.fax_id LEFT JOIN users u ON u.id=f.user_id
-    WHERE f.user_id IS NULL ORDER BY f.created_at DESC LIMIT 100`);
+    WHERE f.user_id IS NULL AND NOT EXISTS (SELECT 1 FROM netphone_fax_inbox_archives a WHERE a.fax_id=f.id) ORDER BY f.created_at DESC LIMIT 100`);
   return {faxes:result.rows};
 }
 async function assignIncoming(req) {
@@ -402,6 +405,7 @@ async function assignIncoming(req) {
       JOIN netphone_fax_incoming i ON i.fax_id=f.id WHERE f.id=$1 FOR UPDATE OF f,i`,[faxId]);
     const fax = found.rows[0];
     if (!fax) throw fail("Incoming fax not found",404);
+    if ((await client.query("SELECT fax_id FROM netphone_fax_inbox_archives WHERE fax_id=$1",[faxId])).rows[0]) throw fail("Restore this fax before assigning it",409);
     if (fax.user_id != null) {
       if (String(fax.user_id) !== String(user.user_id)) throw fail("Already assigned. Recipient cannot be changed",409);
       return {user,fax,duplicate:true};
@@ -425,32 +429,37 @@ async function assignIncoming(req) {
 const coverAttempts = new Map();
 async function routePendingCovers() {
  const pending=await db.query(`SELECT f.*,i.vault_file_name,i.file_sha256,i.source FROM netphone_fax_incoming i
- JOIN netphone_faxes f ON f.id=i.fax_id WHERE f.user_id IS NULL ORDER BY f.created_at DESC LIMIT 50`);
+ JOIN netphone_faxes f ON f.id=i.fax_id WHERE f.user_id IS NULL AND NOT EXISTS (SELECT 1 FROM netphone_fax_inbox_archives a WHERE a.fax_id=f.id) ORDER BY f.created_at DESC LIMIT 50`);
  let scanned=0;
  for(const fax of pending.rows){
   // Both sources pass provider identity/status/page-count checks on import.
-  // A valid, non-revoked account-bound QR remains mandatory for ownership.
+  // QR remains the primary route; an explicit exact Receive ID is an additional fallback.
   if(!['provider_media','legacy_archive'].includes(fax.source))continue;
   if(Date.now()<(coverAttempts.get(String(fax.id))||0))continue;
   if(scanned++>=2)break;
   coverAttempts.set(String(fax.id),Date.now()+300000);
   if(coverAttempts.size>1000)coverAttempts.delete(coverAttempts.keys().next().value);
   try {
-   const codes=await cover.decodeCover(await privateBytes(fax.vault_file_name,fax.file_sha256));
+   const bytes=await privateBytes(fax.vault_file_name,fax.file_sha256);
+   const codes=await cover.decodeCover(bytes);
+   // A revoked, unknown or conflicting NetPhone QR must not fall back to a printed ID.
+   const hasQr=codes.some(c=>String(c).startsWith('NPFX1:'));
+   const textCodes=hasQr?[]:await receiveId.decode(bytes);
    const assigned=await transaction(async client=>{
     const locked=await client.query('SELECT * FROM netphone_faxes WHERE id=$1 FOR UPDATE',[fax.id]);
     const current=locked.rows[0];if(!current || current.user_id!=null)return null;
-    const code=await cover.resolveCode(client,codes,current);
+    if((await client.query('SELECT fax_id FROM netphone_fax_inbox_archives WHERE fax_id=$1',[fax.id])).rows[0])return null;
+    const code=hasQr?await cover.resolveCode(client,codes,current):await receiveId.resolve(client,textCodes,current);
     if(!code){console.error('Fax cover routing:',String(fax.id),'no_valid_recipient_cover');return null;}
     const enabled=(await settings(client)).billing_enabled;
     const rate=enabled?await resolveRate(current.to_number,'inbound',client):null;
     const amount=rate?feeForPages(rate,Number(current.pages)):0n;
     await client.query('UPDATE netphone_faxes SET user_id=$2,updated_at=NOW() WHERE id=$1',[fax.id,code.user_id]);
-    await client.query("UPDATE netphone_fax_incoming SET assigned_at=NOW(),verified_reference='Valid reusable cover QR' WHERE fax_id=$1",[fax.id]);
+    await client.query("UPDATE netphone_fax_incoming SET assigned_at=NOW(),verified_reference=$2 WHERE fax_id=$1",[fax.id,code.via_receive_id?'Exact NetPhone Receive ID':'Valid reusable cover QR']);
     await client.query(`INSERT INTO netphone_fax_billing(fax_id,user_id,pages,amount_microusd,rate_snapshot,state)
      VALUES($1,$2,$3,$4,$5::jsonb,$6)`,[fax.id,code.user_id,current.pages,amount.toString(),JSON.stringify(rate||{}),amount>0n?'payment_due':'free']);
-    await client.query('UPDATE netphone_fax_cover_codes SET consumed_fax_id=COALESCE(consumed_fax_id,$2) WHERE id=$1',[code.id,fax.id]);
-    await audit(client,null,'cover_auto_assigned',fax.id,{user_id:code.user_id,cover_id:code.id});
+    if(!code.via_receive_id)await client.query('UPDATE netphone_fax_cover_codes SET consumed_fax_id=COALESCE(consumed_fax_id,$2) WHERE id=$1',[code.id,fax.id]);
+    await audit(client,null,code.via_receive_id?'receive_id_auto_assigned':'cover_auto_assigned',fax.id,{user_id:code.user_id,cover_id:code.id,receive_code:code.receive_code});
     return code.user_id;
    });
    if(assigned){
@@ -557,6 +566,8 @@ function endpoint(fn) {
 function installRoutes(router) {
   const auth = faxAuthRequired, admin = [auth,faxAdminRequired];
   actual.install(router,admin,endpoint,transaction,audit,ledger,auth);
+  multiUpload.install(router,auth,endpoint,db,UPLOADS);
+  inboxArchive.install(router,admin,endpoint,db,transaction,audit);
   router.post("/quote",auth,endpoint(quote));
   router.get("/receive-profile",auth,endpoint(receiveProfile));
   router.post("/receive-cover/revoke",auth,endpoint(async req=>{await cover.revoke(req.user.id);return {revoked:true};}));

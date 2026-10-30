@@ -15,7 +15,7 @@ async function settings(client=db){return (await client.query('SELECT * FROM net
 async function route(phone,direction,client=db){
  const s=await settings(client);
  const manual=await control.policy(phone,direction,client);
- const revision=s.deck_version+':markup55:'+(manual?manual.id+':'+manual.revision:'auto');
+ const revision=s.deck_version+':markup'+math.MARKUP_PERCENT+':'+(manual?manual.id+':'+manual.revision:'auto');
  if(!s.deck_version)throw fail('Import the Fax SIP rate deck first');
  if(direction==='inbound')return {id:'actual-inbound',revision,country_code:'US',manual,markup_percent:math.MARKUP_PERCENT,dynamic:true,provider_cost_microusd_per_page:s.fax_api_microusd,api:s.fax_api_microusd};
  const digits=math.phone(phone);const prefixes=Array.from({length:digits.length},(_,i)=>digits.slice(0,i+1));

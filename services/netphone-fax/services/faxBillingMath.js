@@ -1,9 +1,9 @@
 'use strict';
 const {usdToMicro}=require('./faxMoney');
 const money=v=>usdToMicro(v,true);
-const MARKUP_PERCENT=55;
+const MARKUP_PERCENT=150;
 function markup(v,percent=MARKUP_PERCENT){
- if(![40,55].includes(percent))throw Error('Invalid fax markup version');
+ if(![40,55,150].includes(percent))throw Error('Invalid fax markup version');
  return (BigInt(v)*BigInt(100+percent)+99n)/100n;
 }
 function csv(text,maxRows=300000){
