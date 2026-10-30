@@ -4,6 +4,34 @@ const db=require('../database/db');
 const provider=require('../services/personalFaxProvider');
 async function main() {
   const mode=process.argv[2];
+  if(mode==='--inventory') {
+    await provider.ready();
+    const strict=await provider.available();
+    let raw;
+    try {
+      raw=await provider.api('GET','/available_phone_numbers',undefined,{
+        'filter[country_code]':'US','filter[phone_number_type]':'local','filter[features][]':'fax','filter[limit]':20});
+    } catch(e) {
+      if(e.response?.status===400&&e.response.data?.errors?.some(x=>String(x.code)==='10031'))raw={data:[]};
+      else throw e;
+    }
+    if(!Array.isArray(raw.data))throw Error('Unexpected inventory format; no purchase was made.');
+    const policy=require('../services/personalFaxPolicy');
+    const rows=raw.data;
+    console.log('READ ONLY inventory diagnostic: no number purchase or release.');
+    console.log('Current app search: '+strict.length+' provider rows; '+strict.filter(policy.available).length+' eligible.');
+    console.log('Provider rows: '+rows.length+'; matched current safety/price rules: '+rows.filter(policy.available).length);
+    console.table(rows.slice(0,10).map(r=>({
+      phone:r.phone_number,currency:r.cost_information?.currency||'missing',
+      monthly:r.cost_information?.monthly_cost??'missing',setup:r.cost_information?.upfront_cost??'missing',
+      quickship:r.quickship??'missing',best_effort:r.best_effort??'missing',
+      fax:(r.features||[]).some(f=>f.name==='fax'),
+      country:(r.region_information||[]).filter(x=>x.region_type==='country_code').map(x=>x.region_name).join(',')||'missing',
+      eligible:!!policy.available(r)
+    })));
+    console.log('Missing/zero/unverified prices are never converted to a paid $1 order. Share this diagnostic output, not .env or API secrets.');
+    return;
+  }
   if(mode==='--create-application') {
     const base=new URL(process.env.FAX_PUBLIC_BASE_URL||'');
     if(base.protocol!=='https:'||!process.env.TELNYX_PUBLIC_KEY)throw Error('Set FAX_PUBLIC_BASE_URL (HTTPS) and TELNYX_PUBLIC_KEY first.');
@@ -37,7 +65,7 @@ async function main() {
       WHERE completed_at IS NULL AND attempts>2 ORDER BY created_at LIMIT 100`);
     console.table(events.rows);return;
   }
-  if(mode!=='--check')throw Error('Use --check (read only), --review (read only), or --create-application (creates a new independent Fax Application).');
+  if(mode!=='--check')throw Error('Use --check, --review, --inventory (read only), or --create-application.');
   await provider.ready();
   const result=await db.query(`SELECT
     (has_table_privilege(current_user,'netphone_personal_fax_numbers','SELECT') AND has_table_privilege(current_user,'netphone_personal_fax_numbers','INSERT') AND has_table_privilege(current_user,'netphone_personal_fax_numbers','UPDATE')) AS numbers,

@@ -15,20 +15,27 @@ function routingToken(value) {
 async function createCover(userId, recipientName, profile) {
  const destination = String(process.env.TELNYX_FAX_PHONE_NUMBER || '').trim();
  if (!/^\+[1-9]\d{7,14}$/.test(destination)) throw new Error('Fax number unavailable');
+ const name=String(recipientName||'').trim();
+ if(!/^[\x20-\x7e]{1,60}$/.test(name))throw Object.assign(new Error('Enter your recipient name in English (1–60 characters).'),{status:422});
  const token = crypto.randomBytes(32).toString('hex'), coverId = crypto.randomUUID();
  const count = await db.query('SELECT COUNT(*)::int AS n FROM netphone_fax_cover_codes WHERE user_id=$1 AND created_at>NOW()-INTERVAL \'1 hour\'',[userId]);
  if (count.rows[0].n >= 20) throw Object.assign(new Error('Too many cover pages. Try again later.'),{status:429});
  const pdf = await PDFDocument.create(), page = pdf.addPage([612,792]);
  const font = await pdf.embedFont(StandardFonts.Helvetica), bold = await pdf.embedFont(StandardFonts.HelveticaBold);
- const name = String(recipientName||'NetPhone recipient').replace(/[^\x20-\x7e]/g,' ').trim().slice(0,60) || 'NetPhone recipient';
  const png = await QRCode.toBuffer(`NPFX1:${token}`,{errorCorrectionLevel:'H',margin:4,width:700});
  const qr = await pdf.embedPng(png);
  const line=(text,y,size=12,strong=false)=>page.drawText(text,{x:48,y,size,font:strong?bold:font,color:rgb(0,0,0)});
  line('NETPHONE - RECEIVE FAX COVER PAGE',738,20,true);
- line(`Recipient: ${name}`,694,14,true);
- line(`Send fax to: ${destination}`,666,16,true);
- line(`Receive ID: ${profile.receive_code}`,640);
- line('Put this page FIRST, followed by the complete document.',606,13,true);
+ const red=rgb(0.76,0.05,0.08);
+ page.drawRectangle({x:48,y:650,width:516,height:68,borderColor:red,borderWidth:1.8});
+ page.drawText('IMPORTANT: ATTACH THIS COVER PAGE FIRST.',{x:60,y:697,size:16,font:bold,color:red});
+ page.drawText('Without it, your fax cannot be automatically delivered',{x:60,y:678,size:13,font:bold,color:red});
+ page.drawText('to my NetPhone account.',{x:60,y:660,size:13,font:bold,color:red});
+ const label=`Recipient: ${name}`;
+ const nameSize=Math.min(14,516/bold.widthOfTextAtSize(label,1));
+ line(label,628,nameSize,true);
+ line(`Send fax to: ${destination}`,604,16,true);
+ line(`Receive ID: ${profile.receive_code}`,580);
  // Fixed QR location; renderer also checks the full first page for conflicting routing codes.
  page.drawImage(qr,{x:164,y:274,width:284,height:284});
  line('Reusable cover. No fixed expiry while your account remains active.',240,11,true);

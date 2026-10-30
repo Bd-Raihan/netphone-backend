@@ -122,10 +122,23 @@ async function cancel(req) {
     const row=await one(c,'SELECT * FROM netphone_personal_fax_numbers WHERE id=$1 AND user_id=$2 FOR UPDATE',[id,req.user.id]);
     if(!row)throw fail('Number not found',404);
     if(['released','failed'].includes(row.state)||row.cancel_requested_at)return row;
-    await audit(c,row,req.user.id,'release_requested');
+    const reason=String(req.body.reason||'').trim();
+    if(reason.length<3||reason.length>300)throw fail('Enter a release reason (3–300 characters)');
+    await audit(c,row,req.user.id,'release_requested',{reason});
     return one(c,`UPDATE netphone_personal_fax_numbers SET cancel_requested_at=NOW(),state=CASE WHEN state='active' THEN 'release_pending' ELSE state END,updated_at=NOW(),last_checked_at=NULL WHERE id=$1 RETURNING *`,[id]);
   });
   return {number:publicNumber(n),message:'Release requested. Completion will be shown after provider confirmation.'};
+}
+async function history(req) {
+  if(!await hasSchema(context.db))return {history:[],next_before:null};
+  const before=req.query?.before==null?null:String(req.query.before);
+  if(before!==null&&(!/^[1-9]\d{0,18}$/.test(before)||BigInt(before)>9223372036854775807n))throw fail('Invalid history cursor');
+  const rows=(await context.db.query(`SELECT a.id,a.number_id,n.phone_number,a.action,a.actor_user_id,a.details,a.created_at
+    FROM netphone_personal_fax_audit a JOIN netphone_personal_fax_numbers n ON n.id=a.number_id
+    WHERE n.user_id=$1 AND ($2::bigint IS NULL OR a.id<$2::bigint)
+    ORDER BY a.id DESC LIMIT 51`,[req.user.id,before])).rows;
+  const items=rows.slice(0,50);
+  return {history:items,next_before:rows.length>50?String(items.at(-1).id):null};
 }
 async function refund(c,n,all) {
   if(all)await money(c,n.user_id,n.upfront_microusd,true,`pfn:${n.id}:setup-refund`,'Fax Number Setup Refund',{number:n.phone_number});
@@ -328,6 +341,7 @@ function install(router,auth,admin,endpoint,dependencies) {
   context=dependencies;
   router.post('/personal-numbers/webhook',webhook);
   router.get('/personal-numbers',auth,endpoint(status));
+  router.get('/personal-numbers/history',auth,endpoint(history));
   router.get('/personal-numbers/available',auth,rateLimit,endpoint(search));
   router.post('/personal-numbers/buy',auth,rateLimit,endpoint(buy));
   router.post('/personal-numbers/:numberId/release',auth,rateLimit,endpoint(cancel));
@@ -335,4 +349,4 @@ function install(router,auth,admin,endpoint,dependencies) {
     WHERE review_reason IS NOT NULL OR state='release_pending' ORDER BY updated_at DESC LIMIT 100`)).rows})));
   if(!timer){timer=setInterval(()=>void cycle().catch(()=>console.error('Personal fax worker needs review')),15000);timer.unref();}
 }
-module.exports={install,incomingOwner,sender,ownsUsage,publicNumber,_test:{money,readQuote,signQuote,chargePeriod,buy,cancel,refund,finish,order,release,renew,cycle,webhook,setContext:c=>{context=c;schemaUntil=0;},status,search}};
+module.exports={install,incomingOwner,sender,ownsUsage,publicNumber,_test:{money,readQuote,signQuote,chargePeriod,buy,cancel,history,refund,finish,order,release,renew,cycle,webhook,setContext:c=>{context=c;schemaUntil=0;},status,search}};
