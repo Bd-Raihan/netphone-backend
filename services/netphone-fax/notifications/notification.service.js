@@ -51,8 +51,9 @@ async function getUserNotifications(userId) {
        notification_type,
        is_read,
        created_at
-     FROM netphone_fax_notifications
+     FROM netphone_fax_notifications n
      WHERE user_id = $1
+       AND NOT EXISTS (SELECT 1 FROM netphone_fax_notification_hides h WHERE h.user_id=$1 AND h.notification_id=n.id)
      ORDER BY created_at DESC`,
     [userId]
   );

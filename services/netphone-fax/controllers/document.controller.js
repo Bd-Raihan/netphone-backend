@@ -1,4 +1,5 @@
 const fs = require("fs");
+const crypto = require("crypto");
 const path = require("path");
 const db = require("../database/db");
 const {loadIncomingDocument} = require("../services/faxPlatform.service");
@@ -69,6 +70,8 @@ async function getDocument(req, res, download) {
       const bytes = await loadIncomingDocument(userId, faxId);
       res.set({
         "Content-Type":"application/pdf",
+        "X-NetPhone-Document-Bytes":String(bytes.length),
+        "X-NetPhone-Document-SHA256":crypto.createHash("sha256").update(bytes).digest("hex"),
         "Content-Disposition": `${download ? "attachment" : "inline"}; filename="NetPhone_Fax_${faxId}.pdf"`,
       });
       return res.send(bytes);

@@ -8,5 +8,6 @@ const router = express.Router();
 // Charging ON requires a server-generated, owner-bound quote.
 router.post("/send",faxAuthRequired,platform.sendOrContinue,createFax);
 router.get("/history",faxAuthRequired,getFaxHistory);
+require('../services/faxListCleanup.service').installFax(router,faxAuthRequired,require('../database/db'));
 platform.installRoutes(router);
 module.exports = router;

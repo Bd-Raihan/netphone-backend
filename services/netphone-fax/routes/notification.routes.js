@@ -23,4 +23,5 @@ router.patch(
   markAsRead
 );
 
+require('../services/faxListCleanup.service').installNotifications(router,faxAuthRequired,require('../database/db'));
 module.exports = router;

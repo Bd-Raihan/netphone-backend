@@ -443,8 +443,9 @@ async function getFaxHistory(req, res) {
          failure_reason,
          created_at,
          updated_at
-       FROM netphone_faxes
-       WHERE user_id = $1
+       FROM netphone_faxes f
+       WHERE f.user_id = $1
+       AND NOT EXISTS (SELECT 1 FROM netphone_fax_history_hides h WHERE h.user_id=$1 AND h.fax_id=f.id)
        ORDER BY created_at DESC`,
       [userId]
     );
