@@ -24,6 +24,7 @@
  */
 
 const fs = require("fs");
+const callingGuard = require("../calling-guard/guard.service");
 const path = require("path");
 
 const providerRateImporter = require(
@@ -493,6 +494,10 @@ async function validateProviderRateDeck({
       resolved.absoluteFilePath
     );
 
+  if (resolved.provider === "telnyx") {
+    const result = await callingGuard.validateDeck({filePath: resolved.absoluteFilePath, sampleLimit});
+    return {...result, provider_code: resolved.provider, requested_file: resolved.file, file_info: fileInfo};
+  }
   const validationResult =
     await providerRateImporter
       .validateProviderRateDeckFile({
@@ -556,6 +561,12 @@ async function importProviderRateDeck({
       resolved.absoluteFilePath
     );
 
+  if (resolved.provider === "telnyx") {
+    const result = await callingGuard.importDeck({filePath: resolved.absoluteFilePath,
+      providerCode: resolved.provider, planCode: normalizedPlan, adminUserId, allowDuplicateChecksum});
+    return {...result, requested_by_admin_user_id: adminUserId, requested_provider: resolved.provider,
+      requested_plan: normalizedPlan, requested_file: resolved.file, file_info: fileInfo};
+  }
   const result =
     await providerRateImporter
       .importAndActivateProviderRateDeck({

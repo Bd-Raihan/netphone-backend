@@ -1,129 +1,56 @@
+"use strict";
 const db = require("../../config/db");
-
-const averageSellRateSql = `
-  COALESCE(
-    ROUND(
-      SUM(
-        COALESCE(
-          sell_rate_usd_per_min,
-          CASE
-            WHEN charged_minutes > 0
-            THEN charged_amount_usd / charged_minutes
-            ELSE 0
-          END
-        ) * charged_minutes
-      ) / NULLIF(SUM(charged_minutes), 0),
-      7
-    ),
-    0
-  )
-`;
-
-async function getProfitSummary({ todayOnly = false } = {}) {
-  const dateFilter = todayOnly
-    ? "AND COALESCE(answered_at, started_at) >= CURRENT_DATE"
-    : "";
-
-  const result = await db.query(`
-    SELECT
-      COUNT(*)::int AS total_calls,
-      COALESCE(SUM(charged_minutes), 0)::int AS total_minutes,
-      COALESCE(SUM(charged_amount_usd), 0)::numeric(14,7) AS total_charge,
-      COALESCE(SUM(provider_cost_usd), 0)::numeric(14,7) AS total_provider_cost,
-      COALESCE(SUM(profit_usd), 0)::numeric(14,7) AS total_net_profit,
-      ${averageSellRateSql} AS avg_sell_rate_usd_per_min,
-      COALESCE(
-        ROUND(
-          SUM(profit_usd) / NULLIF(SUM(charged_amount_usd), 0) * 100,
-          2
-        ),
-        0
-      ) AS profit_percent,
-      COUNT(DISTINCT COALESCE(
-        NULLIF(meta #>> '{pricing_snapshot,country_name}', ''),
-        to_phone_e164
-      ))::int AS destination_groups
-    FROM call_sessions
-    WHERE status = 'charged'
-      ${dateFilter}
-  `);
-
-  return result.rows[0];
+// Read-only reconciliation. Never debit/refund or rewrite historical calls.
+// Financial totals include calls with a wallet entry or a provider actual, even if not 'charged'.
+const reportSql = `WITH report AS (
+ SELECT cs.id AS call_id, cs.status,
+ COALESCE(NULLIF(cs.meta #>> '{pricing_snapshot,country_name}',''),NULLIF(vpr.country_name,''),NULLIF(cr.country_name,''),'Unknown') AS country_name,
+ COALESCE(NULLIF(cs.meta #>> '{pricing_snapshot,country_code}',''),vpr.country_code,cr.country_code) AS country_code,
+ cs.to_phone_e164 AS mobile_number, cs.started_at AS called_at,
+ COALESCE(cs.charged_minutes,0) AS minutes,
+ COALESCE(cs.sell_rate_usd_per_min,0) AS pm_rate,
+ ledger.net / 1000000::numeric AS total_charge,
+ CASE WHEN ledger.entries>0 THEN 'Posted entries matched' ELSE 'No posted wallet entry' END AS wallet_status,
+ a.provider_microusd / 1000000::numeric AS provider_cost,
+ CASE WHEN a.cost_status='sip_and_webrtc' THEN (ledger.net-a.provider_microusd)/1000000::numeric END AS net_profit,
+ CASE WHEN a.cost_status='sip_and_webrtc' THEN 'Verified' ELSE 'Pending' END AS cost_status,
+ CASE WHEN a.cost_status='sip_and_webrtc' AND ledger.net<>0 THEN ROUND((ledger.net-a.provider_microusd)*100::numeric/ledger.net,2) END AS profit_percent,
+ a.updated_at AS cost_updated_at, COALESCE(vp.code,cs.provider,'unknown') AS provider
+ FROM call_sessions cs
+ LEFT JOIN voice_guard_actuals a ON a.session_id=cs.id
+ LEFT JOIN voice_provider_rates vpr ON vpr.id=cs.provider_rate_id
+ LEFT JOIN call_rates cr ON cr.id=cs.rate_id
+ LEFT JOIN voice_providers vp ON vp.id=cs.provider_id
+ LEFT JOIN LATERAL (
+  SELECT COUNT(*) AS entries, COALESCE(SUM(CASE WHEN w.type='call_charge' THEN w.amount_microusd ELSE -w.amount_microusd END),0) AS net
+  FROM wallet_transactions w WHERE w.user_id=cs.user_id AND w.status='posted'
+  AND w.type IN ('call_charge','call_refund','refund')
+  AND (w.idempotency_key='call_charge:'||cs.id::text OR w.meta->>'session_id'=cs.id::text)
+ ) ledger ON TRUE
+ WHERE cs.status='charged' OR a.session_id IS NOT NULL OR ledger.entries>0
+)`;
+const summarySql = `COUNT(*)::int AS total_calls,
+ COALESCE(SUM(minutes),0) AS total_minutes,
+ COALESCE(SUM(total_charge),0) AS total_charge,
+ COALESCE(SUM(total_charge) FILTER(WHERE cost_status='Verified'),0) AS verified_wallet_net,
+ COALESCE(SUM(total_charge) FILTER(WHERE cost_status<>'Verified'),0) AS pending_wallet_net,
+ COALESCE(SUM(provider_cost) FILTER(WHERE cost_status='Verified'),0) AS total_provider_cost,
+ COALESCE(SUM(net_profit),0) AS total_net_profit,
+ COUNT(*) FILTER(WHERE cost_status='Verified')::int AS verified_calls,
+ COUNT(*) FILTER(WHERE cost_status<>'Verified')::int AS pending_calls,
+ COALESCE(SUM(provider_cost) FILTER(WHERE cost_status<>'Verified'),0) AS pending_known_cost,
+ COALESCE(ROUND(SUM(total_charge)/NULLIF(SUM(minutes),0),7),0) AS avg_sell_rate_usd_per_min,
+ ROUND(SUM(net_profit)/NULLIF(SUM(total_charge) FILTER(WHERE cost_status='Verified'),0)*100,2) AS profit_percent,
+ COUNT(DISTINCT country_name)::int AS destination_groups`;
+async function getProfitSummary({todayOnly=false}={}) {
+ const result=await db.query(reportSql+` SELECT ${summarySql} FROM report ${todayOnly ? 'WHERE called_at >= CURRENT_DATE' : ''}`);
+ return {...result.rows[0],report_basis:'Posted wallet charges less refunds; profit only for matched SIP + WebRTC costs. Pending calls are excluded from verified cost/profit. Today uses database server date.'};
 }
-
 async function getCallWiseProfitDetails() {
-  const result = await db.query(`
-    SELECT
-      cs.id AS call_id,
-      COALESCE(
-        NULLIF(vpr.country_name, ''),
-        NULLIF(cr.country_name, ''),
-        NULLIF(cs.meta #>> '{pricing_snapshot,country_name}', ''),
-        'Unknown'
-      ) AS country_name,
-      COALESCE(vpr.country_code, cr.country_code) AS country_code,
-      cs.to_phone_e164 AS mobile_number,
-      COALESCE(cs.answered_at, cs.started_at) AS called_at,
-      COALESCE(cs.charged_minutes, 0)::int AS minutes,
-      COALESCE(
-        cs.sell_rate_usd_per_min,
-        CASE
-          WHEN cs.charged_minutes > 0
-          THEN cs.charged_amount_usd / cs.charged_minutes
-          ELSE 0
-        END,
-        0
-      )::numeric(14,7) AS pm_rate,
-      COALESCE(cs.charged_amount_usd, 0)::numeric(14,7) AS total_charge,
-      COALESCE(cs.provider_cost_usd, 0)::numeric(14,7) AS provider_cost,
-      COALESCE(cs.profit_usd, 0)::numeric(14,7) AS net_profit,
-      COALESCE(
-        ROUND(
-          cs.profit_usd / NULLIF(cs.charged_amount_usd, 0) * 100,
-          2
-        ),
-        0
-      ) AS profit_percent,
-      COALESCE(vp.code, cs.provider, 'unknown') AS provider
-    FROM call_sessions cs
-    LEFT JOIN voice_provider_rates vpr
-      ON vpr.id = cs.provider_rate_id
-    LEFT JOIN call_rates cr
-      ON cr.id = cs.rate_id
-    LEFT JOIN voice_providers vp
-      ON vp.id = cs.provider_id
-    WHERE cs.status = 'charged'
-    ORDER BY COALESCE(cs.answered_at, cs.started_at) DESC, cs.id DESC
-  `);
-
-  return result.rows;
+ return (await db.query(reportSql+` SELECT * FROM report ORDER BY called_at DESC,call_id DESC`)).rows;
 }
-
 async function getCallCountrySummary() {
-  const result = await db.query(`
-    SELECT
-      COALESCE(
-        NULLIF(vpr.country_name, ''),
-        NULLIF(cr.country_name, ''),
-        NULLIF(cs.meta #>> '{pricing_snapshot,country_name}', ''),
-        'Unknown'
-      ) AS country_name,
-      COUNT(*)::int AS total_calls,
-      COALESCE(SUM(cs.charged_minutes), 0)::int AS total_minutes,
-      COALESCE(SUM(cs.charged_amount_usd), 0)::numeric(14,7) AS total_charge,
-      COALESCE(SUM(cs.provider_cost_usd), 0)::numeric(14,7) AS total_provider_cost,
-      COALESCE(SUM(cs.profit_usd), 0)::numeric(14,7) AS total_net_profit
-    FROM call_sessions cs
-    LEFT JOIN voice_provider_rates vpr
-      ON vpr.id = cs.provider_rate_id
-    LEFT JOIN call_rates cr
-      ON cr.id = cs.rate_id
-    WHERE cs.status = 'charged'
-    GROUP BY 1
-    ORDER BY total_net_profit DESC, country_name ASC
-  `);
-
-  return result.rows;
+ return (await db.query(reportSql+` SELECT country_name,${summarySql} FROM report GROUP BY country_name ORDER BY total_net_profit DESC,country_name`)).rows;
 }
 
 async function getRegisteredUserSummary() {

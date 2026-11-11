@@ -1,4 +1,6 @@
 const db = require("../../config/db");
+const callingGuard = require("../calling-guard/guard.service");
+const guardMoney = require("../calling-guard/money-routes");
 const walletService = require("../wallet/wallet.service");
 const providerRouter = require("./provider-router.service");
 
@@ -138,12 +140,9 @@ function calculateBillableSeconds({
     minimumSeconds
   );
 
-  return (
-    Math.ceil(
-      minimumAppliedSeconds /
-        incrementSeconds
-    ) * incrementSeconds
-  );
+  return actualSeconds <= minimumSeconds
+    ? minimumSeconds
+    : minimumSeconds + Math.ceil((actualSeconds - minimumSeconds) / incrementSeconds) * incrementSeconds;
 }
 
 /**
@@ -602,6 +601,9 @@ async function startCallSession({
     };
   }
 
+  if (routerResult.guard_snapshot && meta?.initiation_type !== 'flutter_webrtc') {
+    return {ok:false,reason:'calling_guard_sdk_only',message:'Safe Calling is configured for the app WebRTC flow. API test calls need separate verified Voice API pricing.'};
+  }
   await walletService.ensureWallet(userId);
 
   const wallet =
@@ -624,7 +626,7 @@ async function startCallSession({
    * এটি শুধু call eligibility check।
    * Final charge provider webhook-এর actual duration দিয়ে হবে।
    */
-  const minimumBillableSeconds =
+  let minimumBillableSeconds =
     calculateBillableSeconds({
       actualDurationSeconds: 1,
 
@@ -634,6 +636,8 @@ async function startCallSession({
       billingIncrementSeconds:
         rate.billing_increment_seconds,
     });
+
+  if (routerResult.guard_snapshot) minimumBillableSeconds = Math.max(60, minimumBillableSeconds);
 
   const minimumUsageChargeUsd =
     sellRate *
@@ -653,8 +657,8 @@ async function startCallSession({
     );
 
   if (
-    Number(wallet.balance_cents || 0) <
-    minimumCallChargeCents
+    Number(wallet.balance_microusd ?? Number(wallet.balance_cents || 0) * 10000) <
+    usdTotalToMicroUsd(minimumCallChargeUsd)
   ) {
     return {
       ok: false,
@@ -680,6 +684,7 @@ async function startCallSession({
 
   const sessionMeta = {
     ...(meta || {}),
+    calling_rate_guard: routerResult.guard_snapshot ? {...routerResult.guard_snapshot, country_code: rate.country_code} : null,
 
     provider_phone_number:
     providerCode === "telnyx"
@@ -860,6 +865,14 @@ async function startCallSession({
       JSON.stringify(sessionMeta),
     ]
   );
+  if (routerResult.guard_snapshot && rows[0]) {
+    try {rows[0] = await callingGuard.admit(rows[0], rate);}
+    catch (e) {
+      await db.query("UPDATE call_sessions SET status='failed',ended_at=NOW() WHERE id=$1",[rows[0].id]);
+      return {ok:false,reason:'calling_wallet_safety',message:e.message};
+    }
+  }
+
 
   return {
     ok: true,
@@ -1213,7 +1226,7 @@ async function billCompletedCallByProvider({
     /*
      * Telnyx CSV/native provider billing interval।
      */
-    const billableSeconds =
+    let billableSeconds =
       calculateBillableSeconds({
         actualDurationSeconds,
 
@@ -1221,6 +1234,12 @@ async function billCompletedCallByProvider({
 
         billingIncrementSeconds,
       });
+
+    // SIP and WebRTC are billed separately. Cover both intervals; never assume a
+    // one-second SIP route means the SDK leg also has one-second billing.
+    if (session.meta?.calling_rate_guard && actualDurationSeconds > 0) {
+      billableSeconds = Math.max(billableSeconds, Math.ceil(actualDurationSeconds / 60) * 60);
+    }
 
     if (billableSeconds <= 0) {
       await client.query("ROLLBACK");
@@ -1232,7 +1251,17 @@ async function billCompletedCallByProvider({
       };
     }
 
-    const customerUsageChargeUsd =
+    const guardSnapshot = session.meta?.calling_rate_guard;
+    const guardedUsage = guardSnapshot ? guardMoney.billUsage({
+      rate: guardMoney.micro(String(pricingSnapshot.raw_provider_rate_usd_per_min)).toString(),
+      fee: '0',first: minimumDurationSeconds,next: billingIncrementSeconds,
+    }, {
+      pricing_mode: guardSnapshot.pricing_mode,
+      markup_percent: guardSnapshot.markup_percent,
+      manual_sell_rate_usd_per_min: sellRateUsdPerMinute,
+    }, guardSnapshot.sdk_microusd, actualDurationSeconds) : null;
+
+    const customerUsageChargeUsd = guardedUsage ? guardMoney.usd(guardedUsage.sellUsage) :
       round7(
         sellRateUsdPerMinute *
           (billableSeconds / 60)
@@ -1243,7 +1272,7 @@ async function billCompletedCallByProvider({
         customerConnectionFeeUsd
     );
 
-    const providerUsageCostUsd =
+    const providerUsageCostUsd = guardedUsage ? guardMoney.usd(guardedUsage.providerUsage) :
       round7(
         providerCostRateUsdPerMinute *
           (billableSeconds / 60)

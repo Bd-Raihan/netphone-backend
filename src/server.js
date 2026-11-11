@@ -13,6 +13,7 @@
 require("dotenv").config();
 
 const app = require("./app");
+const callingCostMonitor = require("./modules/calling-guard/cost-monitor");
 
 const ratesService = require(
   "./modules/rates/rates.service"
@@ -41,6 +42,7 @@ const server = app.listen(
       `🚀 AlHawari Call API running on port ${PORT}`
     );
 
+    callingCostMonitor.start();
     try {
       const workerResult =
         await binanceReconciliationWorker.start();
@@ -152,6 +154,7 @@ async function shutdown(signal) {
     );
   }
 
+  callingCostMonitor.stop();
   server.close((error) => {
     clearTimeout(forceExitTimer);
 

@@ -19,6 +19,20 @@ const router =
 
 router.use(authRequired);
 router.use(requireAdmin);
+const callingGuard = require('../calling-guard/guard.service');
+const costMonitor = require('../calling-guard/cost-monitor');
+const guarded = fn => async (req,res) => {
+ try {res.json({ok:true,data:await fn(req)});} catch(e) {res.status(e.statusCode||503).json({ok:false,message:e.message});}
+};
+// These literal paths must precede /:prefix. Both JWT and Admin checks remain above.
+router.get('/guard/status',guarded(()=>callingGuard.health()));
+router.post('/guard/sync',guarded(()=>costMonitor.sync()));
+router.patch('/guard/enabled',guarded(req=>callingGuard.enable(req.body.enabled,req.user.id)));
+router.post('/guard/resolve-alert',guarded(req=>callingGuard.resolveAlert(String(req.body.alert_key||''),req.user.id)));
+router.patch('/guard/config',guarded(req=>callingGuard.configure(req.body,req.user.id)));
+router.put('/:prefix/route-policy',guarded(req=>callingGuard.saveRoutePolicy({prefix:req.params.prefix,adminUserId:req.user.id,payload:req.body})));
+router.get('/:prefix/routes',guarded(req=>callingGuard.routeRows(req.params.prefix,req.query)));
+
 
 /*
  * GET /api/admin/country-pricing

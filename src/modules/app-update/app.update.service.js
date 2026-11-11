@@ -24,12 +24,10 @@ function normalizePlatform(value) {
 }
 
 function normalizePositiveInt(value, fieldName) {
-  const number = Number.parseInt(
-    String(value ?? ""),
-    10,
-  );
+  const text = String(value ?? "").trim();
+  const number = /^\d+$/.test(text) ? Number(text) : NaN;
 
-  if (!Number.isInteger(number) || number <= 0) {
+  if (!Number.isSafeInteger(number) || number <= 0) {
     throw new Error(`${fieldName}_invalid`);
   }
 
@@ -147,10 +145,27 @@ async function publishUpdate({
     throw new Error("message_required");
   }
 
+  if (normalizedMinBuild !== null && normalizedMinBuild > normalizedBuildNumber) {
+    throw new Error("minimum_supported_build_exceeds_latest");
+  }
+  let normalizedForceUpdate;
+  if (forceUpdate === true || forceUpdate === "true" || forceUpdate === 1) normalizedForceUpdate = true;
+  else if (forceUpdate === false || forceUpdate === "false" || forceUpdate === 0) normalizedForceUpdate = false;
+  else throw new Error("force_update_invalid");
+  if (normalizedPlayStoreUrl) {
+    let storeUrl;
+    try { storeUrl = new URL(normalizedPlayStoreUrl); } catch (_) { throw new Error("play_store_url_invalid"); }
+    if (storeUrl.protocol !== "https:" || storeUrl.hostname !== "play.google.com" || storeUrl.pathname !== "/store/apps/details" || !storeUrl.searchParams.get("id")) {
+      throw new Error("play_store_url_invalid");
+    }
+  }
+  if (normalizedForceUpdate && !normalizedPlayStoreUrl) throw new Error("force_update_requires_play_store_url");
+
   const client = await db.getClient();
 
   try {
     await client.query("BEGIN");
+    await client.query("SELECT pg_advisory_xact_lock(73423,1)");
 
     await client.query(
       `
@@ -211,7 +226,7 @@ async function publishUpdate({
           normalizedTitle,
           normalizedMessage,
           normalizedPlayStoreUrl,
-          Boolean(forceUpdate),
+          normalizedForceUpdate,
         ],
       );
 

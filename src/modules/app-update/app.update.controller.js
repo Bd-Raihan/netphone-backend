@@ -23,6 +23,7 @@ async function getLatestUpdate(req, res, next) {
         platform,
       });
 
+    res.set("Cache-Control", "no-store");
     return res.status(200).json({
       ok: true,
       update,

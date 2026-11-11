@@ -1275,9 +1275,11 @@ async function disableManualOverride({
   };
 }
 
+// Guarded Calling uses the full origin-aware CSV; the legacy functions above are retained for rollback.
+const callingGuard = require('../calling-guard/guard.service');
 module.exports = {
-  listCountryPricing,
-  getCountryPricingByPrefix,
-  updateCountryPricing,
-  disableManualOverride,
+ listCountryPricing: callingGuard.countries,
+ getCountryPricingByPrefix: callingGuard.getCountry,
+ updateCountryPricing: callingGuard.saveCountry,
+ disableManualOverride: callingGuard.resetCountry,
 };

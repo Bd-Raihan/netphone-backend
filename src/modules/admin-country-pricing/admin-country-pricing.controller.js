@@ -59,7 +59,7 @@ async function getOne(req, res) {
     const item =
       await service
         .getCountryPricingByPrefix(
-          prefix
+          prefix, req.query.country_code
         );
 
     if (!item) {
@@ -250,6 +250,7 @@ async function disableOverride(
     const result =
       await service
         .disableManualOverride({
+          countryCode: req.query.country_code,
           prefix,
           adminUserId,
         });
