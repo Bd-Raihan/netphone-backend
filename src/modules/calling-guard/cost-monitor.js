@@ -6,12 +6,16 @@ let promise = null,
   timer = null,
   watchTimer = null,
   watchBusy = false;
-const connections = () =>
-  new Set(
-    [process.env.TELNYX_SIP_CONNECTION_ID, process.env.TELNYX_CONNECTION_ID]
-      .filter(Boolean)
-      .map(String),
-  );
+const connections = () => {
+  const extra = String(process.env.TELNYX_CALLING_REPORT_CONNECTION_IDS || '')
+    .split(',').map(x => x.trim()).filter(Boolean);
+  if (extra.some(id => !/^\d{10,25}$/.test(id))) {
+    throw Error('Calling report connection IDs must be explicit numeric voice connection IDs');
+  }
+  return new Set([
+    process.env.TELNYX_SIP_CONNECTION_ID, process.env.TELNYX_CONNECTION_ID, ...extra,
+  ].filter(Boolean).map(String));
+};
 async function store(records, c) {
   let accepted = 0;
   for (const r of records) {
@@ -531,11 +535,13 @@ async function flagMissingReports() {
       row.country,
       row.prefix,
       "warning",
-      "Actual Calling cost has not been fully matched after 15 minutes. Review reporting before further calls.",
-      { session_id: row.id, rate_update_required: true },
+      "Cost report pending for this prefix. Profit is not yet verified. Changing markup will not match the missing report.",
+      { session_id: row.id, cost_report_required: true },
     );
   await db.query(`UPDATE voice_guard_alerts a SET active=FALSE,resolved_at=NOW()
  WHERE a.alert_key LIKE 'missing:%' AND EXISTS(SELECT 1 FROM voice_guard_actuals x
  WHERE a.details->>'session_id'=x.session_id::text AND x.cost_status='sip_and_webrtc')`);
 }
 module.exports.stopProviderCall = stopProviderCall;
+
+module.exports.reportingConnections = connections;

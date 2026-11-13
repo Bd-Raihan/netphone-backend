@@ -27,7 +27,8 @@ const reportSql = `WITH report AS (
   AND w.type IN ('call_charge','call_refund','refund')
   AND (w.idempotency_key='call_charge:'||cs.id::text OR w.meta->>'session_id'=cs.id::text)
  ) ledger ON TRUE
- WHERE cs.status='charged' OR a.session_id IS NOT NULL OR ledger.entries>0
+ WHERE (cs.status='charged' OR a.session_id IS NOT NULL OR ledger.entries>0)
+ AND cs.started_at >= COALESCE((SELECT reporting_started_at FROM voice_guard_settings WHERE id=1),'-infinity'::timestamptz)
 )`;
 const summarySql = `COUNT(*)::int AS total_calls,
  COALESCE(SUM(minutes),0) AS total_minutes,

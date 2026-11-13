@@ -1,5 +1,4 @@
 const repository = require("./provider-router.repository");
-const callingGuard = require("../calling-guard/guard.service");
 
 const DEFAULT_MARKUP_PERCENT = 25;
 const DEFAULT_MIN_PROFIT_USD_PER_MIN = 0.002;
@@ -1047,8 +1046,14 @@ async function resolveLegacyRate(
 async function resolveDestination(
   toPhoneE164
 ) {
-  const guarded = await callingGuard.tryResolve(toPhoneE164);
-  if (guarded) return guarded;
+  // The same CSV/policy resolver used by Rate Management and public quotes.
+  // Do not fall back to an obsolete legacy rate when admission is blocked.
+  return require('../calling-guard/guard.service').tryResolve(toPhoneE164);
+}
+
+async function resolveLegacyDestination(
+  toPhoneE164
+) {
   const phone =
     repository.cleanPhone(
       toPhoneE164

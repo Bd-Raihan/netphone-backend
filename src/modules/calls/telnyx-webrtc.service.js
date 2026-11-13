@@ -54,6 +54,10 @@ function isCredentialReusable(row) {
     return false;
   }
 
+  if (String(row.connection_id || '') !== getSipConnectionId()) {
+    return false;
+  }
+
   if (row.status !== "active") {
     return false;
   }

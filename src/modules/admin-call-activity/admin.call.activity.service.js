@@ -85,7 +85,7 @@ function normalizeDate(value) {
  * ============================================================
  */
 function buildFilters(filters = {}) {
-  const conditions = [];
+  const conditions = ["cs.started_at >= COALESCE((SELECT reporting_started_at FROM voice_guard_settings WHERE id=1),'-infinity'::timestamptz)"];
   const values = [];
 
   const addValue = (value) => {

@@ -27,6 +27,14 @@ async function settings(c = db) {
   return row;
 }
 const caller = () => String(process.env.TELNYX_PHONE_NUMBER || "").trim();
+// Missing historical cost is not evidence of an unsafe current price.
+// Real losses, changed provider rates and readiness failures still block calls.
+function isRateBlockingAlert(a) {
+  if (a.severity === 'loss') return true;
+  const missingCost = a.severity === 'warning' && String(a.alert_key || '').startsWith('missing:');
+  return !missingCost && a.details?.rate_update_required === true;
+}
+
 async function audit(c, actor, action, details) {
   await c.query(
     "INSERT INTO voice_guard_audit(actor_user_id,action,details) VALUES($1,$2,$3::jsonb)",
@@ -281,10 +289,10 @@ async function resolve(phone, config) {
     };
   const losses = (
     await db.query(
-      "SELECT message FROM voice_guard_alerts WHERE active AND (severity='loss' OR details->>'rate_update_required'='true') AND (country_code=$1 OR country_code='') LIMIT 1",
-      [r.iso.split("/")[0]],
+      "SELECT alert_key,severity,details FROM voice_guard_alerts WHERE active AND (severity='loss' OR details->>'rate_update_required'='true') AND (country_code=$1 OR country_code='') AND (prefix='' OR $2 LIKE prefix||'%')",
+      [r.iso.split("/")[0], m.digits(phone)],
     )
-  ).rows;
+  ).rows.filter(isRateBlockingAlert);
   if (losses.length)
     return {
       ok: false,
@@ -428,7 +436,7 @@ async function countries({ search = "" } = {}) {
       ],
     )
   ).rows;
-  const policies = (await db.query("SELECT * FROM voice_guard_policies")).rows;
+  const policies = (await db.query("SELECT * FROM voice_guard_policies ORDER BY updated_at DESC")).rows;
   const activeAlerts = (
     await db.query(
       "SELECT * FROM voice_guard_alerts WHERE active ORDER BY updated_at DESC",
@@ -453,11 +461,11 @@ async function countries({ search = "" } = {}) {
     const blocked =
       countryAlerts.some(
         (a) =>
-          a.severity === "loss" || a.details?.rate_update_required === true,
-      ) || row.unsafe;
+          isRateBlockingAlert(a) && (!a.prefix || a.prefix === row.prefix),
+      ) || (row.unsafe && pp.pricing_mode === "manual_rate");
     const enabled =
-      allowed.some((x) => x.country_code === iso && x.is_active) &&
-      pp.is_active !== false;
+      typeof pp.is_active === "boolean" ? pp.is_active :
+      allowed.some((x) => x.country_code === iso && x.is_active);
     return {
       country_code: iso,
       country_name: row.country,
@@ -495,6 +503,8 @@ async function countries({ search = "" } = {}) {
       is_active: enabled,
       publish_rate: enabled && !blocked,
       has_loss: blocked,
+      partial_review: Boolean(row.unsafe && pp.pricing_mode !== 'manual_rate') || countryAlerts.some(a => a.prefix && a.prefix !== row.prefix && isRateBlockingAlert(a)),
+      prefix_override_count: policies.filter(p => p.scope === 'prefix' && p.country_code === iso).length,
       alerts: countryAlerts,
       guard_enabled: s.enabled,
       guard_ready: !readiness(s),
@@ -513,6 +523,41 @@ async function getCountry(prefix, country) {
       (x) => x.prefix === prefix && (!country || x.country_code === country),
     ) || null
   );
+}
+async function refreshManualAlert(countryCode) {
+  const items = await countries({search:countryCode});
+  if (items.length && items.every(item => item.profit_usd_per_min > 0)) {
+    await db.query("UPDATE voice_guard_alerts SET active=FALSE,resolved_at=NOW() WHERE country_code=$1 AND active AND alert_key LIKE 'manual:%' AND details->>'estimated'='true'", [countryCode]);
+  }
+}
+async function ensureCountrySetup(c, current, prefix, actor) {
+  const provider = (await c.query("SELECT id FROM voice_providers WHERE code='telnyx' AND status='active' AND supports_voice=TRUE")).rows[0];
+  if (!provider) throw fail('Active Telnyx provider is missing; country was not enabled', 409);
+  const plan = (await c.query("SELECT id FROM voice_provider_plans WHERE provider_id=$1 AND code='payg' AND is_active=TRUE AND (valid_from IS NULL OR valid_from<=NOW()) AND (valid_until IS NULL OR valid_until>NOW())", [provider.id])).rows[0];
+  if (!plan) throw fail('Active Telnyx PAYG plan is missing; country was not enabled', 409);
+  // Missing legacy route rows must be created, not silently ignored by UPDATE.
+  const existing = (await c.query('SELECT id,country_code FROM voice_routes WHERE prefix=$1 FOR UPDATE',[prefix])).rows[0];
+  if (existing && existing.country_code !== current.country_code) throw fail('Shared prefix route requires review; country was not enabled',409);
+  if (!existing) await c.query("INSERT INTO voice_routes(code,name,country_code,prefix,is_active) VALUES($1,$2,$3,$4,TRUE)", ['csv-'+current.country_code.toLowerCase()+'-'+prefix,current.country_name,current.country_code,prefix]);
+  const dest = (await c.query('SELECT country_code FROM voice_destination_policies WHERE prefix=$1 FOR UPDATE',[prefix])).rows[0];
+  if (dest && dest.country_code !== current.country_code) throw fail('Shared destination prefix requires review; country was not enabled',409);
+  if (!dest) await c.query('INSERT INTO voice_destination_policies(country_code,prefix,destination_name,is_enabled) VALUES($1,$2,$3,TRUE)',[current.country_code,prefix,current.country_name]);
+  const routes = (await c.query('SELECT id FROM voice_routes WHERE country_code=$1',[current.country_code])).rows;
+  for (const route of routes) {
+    const link = (await c.query('SELECT id FROM voice_route_providers WHERE route_id=$1 AND provider_id=$2',[route.id,provider.id])).rows[0];
+    if (!link) await c.query('INSERT INTO voice_route_providers(route_id,provider_id,provider_plan_id,is_active) VALUES($1,$2,$3,TRUE)',[route.id,provider.id,plan.id]);
+    // Existing provider limits, validity windows and disabled links remain explicit controls.
+  }
+  await audit(c,actor,'calling_country_setup_ensured',{country_code:current.country_code,prefix});
+}
+async function reviewSavedPricing(countryCode, prefix, actor) {
+  const { rows } = await db.query("SELECT alert_key,prefix FROM voice_guard_alerts WHERE active AND country_code=$1 AND severity='loss' AND ($2::text IS NULL OR prefix=$2) ORDER BY updated_at DESC", [countryCode,prefix]);
+  const failures = [];
+  for (const a of rows) {
+    try { await resolveAlert(a.alert_key, actor); }
+    catch (e) { failures.push(String(e.message)); }
+  }
+  return {review_message: failures.length ? 'Price saved. Review still required: ' + [...new Set(failures)].join('; ') : 'Price saved. Current rates verified; historical losses remain recorded.'};
 }
 async function saveCountry({ prefix, adminUserId, payload }) {
   const current = await getCountry(prefix, payload.country_code);
@@ -540,14 +585,31 @@ async function saveCountry({ prefix, adminUserId, payload }) {
         adminUserId,
       ],
     );
+    if (typeof payload.is_active === 'boolean') {
+      // A country may have several stored policies: never leave an older disabled country row behind.
+      await c.query("UPDATE voice_guard_policies SET is_active=$2,updated_at=NOW() WHERE country_code=$1 AND scope='country'", [current.country_code,payload.is_active]);
+      if (payload.is_active) await ensureCountrySetup(c, current, prefix, adminUserId);
+
+      const routes = (await c.query("SELECT id,is_active FROM voice_routes WHERE country_code=$1", [current.country_code])).rows;
+      const destinations = (await c.query("SELECT id,is_enabled FROM voice_destination_policies WHERE country_code=$1", [current.country_code])).rows;
+      await audit(c, adminUserId, "calling_country_enabled_changed", {country_code:current.country_code, routes, destinations, enabled:payload.is_active});
+      await c.query("UPDATE voice_routes SET is_active=$2 WHERE country_code=$1", [current.country_code,payload.is_active]);
+      await c.query("UPDATE voice_destination_policies SET is_enabled=$2,disabled_reason=CASE WHEN $2 THEN NULL ELSE 'Disabled by Admin' END WHERE country_code=$1", [current.country_code,payload.is_active]);
+    }
+    if (payload.apply_to_all_prefixes === true) {
+      const old = (await c.query("SELECT * FROM voice_guard_policies WHERE country_code=$1 AND scope='prefix'", [current.country_code])).rows;
+      await audit(c, adminUserId, "calling_prefix_prices_replaced", {country_code:current.country_code, previous:old});
+      await c.query("UPDATE voice_guard_policies SET pricing_mode=$2,markup_percent=$3,manual_sell_rate_usd_per_min=$4,updated_by=$5,updated_at=NOW() WHERE country_code=$1 AND scope='prefix'", [current.country_code,mode,percent,mode==='manual_rate'?payload.manual_sell_rate_usd_per_min:null,adminUserId]);
+    }
     await audit(c, adminUserId, "calling_country_policy_saved", {
       prefix,
       payload,
     });
   });
+  await refreshManualAlert(current.country_code);
   // Below-cost manual choices are saved visibly, but unsafe new calls are blocked.
   const item = await getCountry(prefix, current.country_code);
-  if (item.has_loss && !item.alerts.some((x) => x.severity === "loss"))
+  if (item.profit_usd_per_min <= 0 && !item.alerts.some((x) => x.severity === "loss"))
     await alert(
       "manual:" + current.country_code,
       current.country_code,
@@ -556,6 +618,7 @@ async function saveCountry({ prefix, adminUserId, payload }) {
       "Manual rate does not cover every route. Raise the rate or use Auto 30%.",
       { estimated: true },
     );
+  await reviewSavedPricing(current.country_code, null, adminUserId);
   return { ok: true, data: await getCountry(prefix, current.country_code) };
 }
 async function resetCountry({ prefix, adminUserId, countryCode }) {
@@ -595,7 +658,7 @@ async function routeRows(
       ],
     )
   ).rows;
-  const rules = (await db.query("SELECT * FROM voice_guard_policies")).rows;
+  const rules = (await db.query("SELECT * FROM voice_guard_policies ORDER BY updated_at DESC")).rows;
   return {
     more: rows.length > 50,
     items: await Promise.all(
@@ -668,7 +731,7 @@ async function health() {
     alerts,
     actuals: (
       await db.query(
-        "SELECT * FROM voice_guard_actuals ORDER BY updated_at DESC LIMIT 50",
+        "SELECT a.* FROM voice_guard_actuals a JOIN call_sessions cs ON cs.id=a.session_id WHERE cs.started_at >= COALESCE((SELECT reporting_started_at FROM voice_guard_settings WHERE id=1),'-infinity'::timestamptz) ORDER BY a.updated_at DESC LIMIT 50",
       )
     ).rows,
   };
@@ -830,10 +893,10 @@ async function admit(session, rate) {
       throw fail("Calling rates changed. Please start the call again");
     const blocked = (
       await c.query(
-        "SELECT 1 FROM voice_guard_alerts WHERE active AND (severity='loss' OR details->>'rate_update_required'='true') AND (country_code='' OR country_code=$1) LIMIT 1",
-        [quoted.country_code || ""],
+        "SELECT alert_key,severity,details FROM voice_guard_alerts WHERE active AND (severity='loss' OR details->>'rate_update_required'='true') AND (country_code='' OR country_code=$1) AND (prefix='' OR $2 LIKE prefix||'%')",
+        [quoted.country_code || "", m.digits(session.to_phone_e164)],
       )
-    ).rows;
+    ).rows.filter(isRateBlockingAlert);
     if (blocked.length) throw fail("Calling rate review required");
     await c.query("SELECT pg_advisory_xact_lock(73421,$1::integer)", [
       session.user_id,
@@ -928,7 +991,9 @@ async function saveRoutePolicy({ prefix, adminUserId, payload }) {
       "Below-cost manual prefix rate: new calls are paused until review.",
       { estimated: true },
     );
-  return { ok: true };
+  await refreshManualAlert(r.iso.split("/")[0]);
+  const review = await reviewSavedPricing(r.iso.split("/")[0], prefix, adminUserId);
+  return { ok: true, data: review };
 }
 async function configure(body, actor) {
   const days = Number(body.max_deck_age_days),
@@ -954,3 +1019,5 @@ module.exports.budgetSeconds = budgetSeconds;
 module.exports.admit = admit;
 module.exports.saveRoutePolicy = saveRoutePolicy;
 module.exports.configure = configure;
+
+module.exports.isRateBlockingAlert = isRateBlockingAlert;

@@ -27,6 +27,8 @@ const {
 } = require("./telnyx.service");
 
 const db = require("../../config/db");
+const { eventTimes } = require("./provider-duration");
+const walletService = require("../wallet/wallet.service");
 
 const {
   issueWebrtcToken,
@@ -390,10 +392,10 @@ async function startCall(req, res) {
      * Telnyx webhook returns it so the Backend can
      * correlate the provider call with call_sessions.id.
      */
-const clientState = JSON.stringify({
+const clientState = Buffer.from(JSON.stringify({
   session_id: sessionId,
   user_id: userId,
-});
+})).toString("base64");
 
     await db.query(
       `
@@ -1045,6 +1047,7 @@ async function telnyxStatusCallback(req, res) {
      * Telnyx webhook request payload audit-এর জন্য
      * সম্পূর্ণ body save করা হবে।
      */
+    const times = eventTimes(eventType, event, payload);
     const serializedWebhookBody =
       JSON.stringify(req.body || {});
 
@@ -1082,8 +1085,8 @@ async function telnyxStatusCallback(req, res) {
                 WHEN $4::text =
                      'call.answered'
                 THEN COALESCE(
-                  answered_at,
-                  NOW()
+                  $10::timestamptz,
+                  answered_at
                 )
                 ELSE answered_at
               END,
@@ -1093,8 +1096,8 @@ async function telnyxStatusCallback(req, res) {
                 WHEN $4::text =
                      'call.hangup'
                 THEN COALESCE(
-                  ended_at,
-                  NOW()
+                  $11::timestamptz,
+                  ended_at
                 )
                 ELSE ended_at
               END,
@@ -1106,6 +1109,9 @@ async function telnyxStatusCallback(req, res) {
                  * আবার ended বা started বানাবে না।
                  */
                 WHEN status = 'charged'
+                THEN status
+
+                WHEN ended_at IS NOT NULL AND $4::text <> 'call.hangup'
                 THEN status
 
                 WHEN $9::text IS NOT NULL
@@ -1182,6 +1188,8 @@ async function telnyxStatusCallback(req, res) {
             providerCallSessionId,
             hangupCause,
             internalStatus,
+            times.answeredAt,
+            times.endedAt,
           ]
         );
 
@@ -1281,7 +1289,8 @@ async function telnyxStatusCallback(req, res) {
      * initiated/ringing/answered events শুধু lifecycle update।
      * Wallet billing কেবল final call.hangup event-এ হবে।
      */
-    if (eventType !== "call.hangup") {
+    if (eventType !== "call.hangup" &&
+        !(eventType === "call.answered" && updatedSession.ended_at)) {
       return res.status(200).json({
         ok: true,
 
@@ -1349,8 +1358,8 @@ async function telnyxStatusCallback(req, res) {
        * Webhook lifecycle update ইতোমধ্যে save হয়েছে।
        *
        * Billing exception log এবং session meta-তে রাখা হচ্ছে।
-       * Telnyx-কে 200 দেওয়া হবে, যাতে repeated provider
-       * webhook accidental duplicate processing না ঘটায়।
+       * Return 503 for transient billing errors so Telnyx can retry.
+       * The existing call_charge:<session_id> key prevents duplicate debits.
        */
       console.error(
         "❌ TELNYX HANGUP BILLING EXCEPTION:",
@@ -1416,25 +1425,13 @@ async function telnyxStatusCallback(req, res) {
         ]
       );
 
-      return res.status(200).json({
-        ok: true,
-
-        event_type:
-          eventType,
-
-        session_id:
-          updatedSession.id,
-
-        provider_call_id:
-          updatedSession
-            .provider_call_id ||
-          callControlId,
-
-        billing_triggered:
-          true,
-
-        billing_completed:
-          false,
+      return res.status(503).json({
+        ok: false,
+        event_type: eventType,
+        session_id: updatedSession.id,
+        provider_call_id: updatedSession.provider_call_id || callControlId,
+        billing_triggered: true,
+        billing_completed: false,
 
         billing_reason:
           "billing_exception",
@@ -1641,6 +1638,7 @@ async function getCallStatus(req, res) {
           charged_amount_cents,
           charged_amount_usd,
           billing_source,
+          tx_id,
           price_per_min_cents,
           provider_rate_usd_per_min,
           sell_rate_usd_per_min
@@ -1662,6 +1660,7 @@ async function getCallStatus(req, res) {
     return res.status(200).json({
       ok: true,
       call: rows[0],
+      wallet: await walletService.getWalletByUserId(userId),
     });
   } catch (error) {
     console.error("❌ GET CALL STATUS ERROR:", {

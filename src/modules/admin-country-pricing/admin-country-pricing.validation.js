@@ -155,6 +155,7 @@ function validatePricingUpdate(input) {
       ok: true,
 
       value: {
+        apply_to_all_prefixes: body.apply_to_all_prefixes === true,
         pricing_mode:
           pricingMode,
 
@@ -190,6 +191,7 @@ function validatePricingUpdate(input) {
     ok: true,
 
     value: {
+        apply_to_all_prefixes: body.apply_to_all_prefixes === true,
       pricing_mode:
         pricingMode,
 
