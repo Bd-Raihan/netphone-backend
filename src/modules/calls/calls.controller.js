@@ -42,93 +42,29 @@ const {
  * This helper also supports plain JSON for backward compatibility.
  */
 function decodeTelnyxClientState(rawClientState) {
-  if (rawClientState === null || rawClientState === undefined) {
-    return null;
-  }
-
-  const rawValue = String(rawClientState).trim();
-
-  if (!rawValue) {
-    return null;
-  }
-
-  const candidates = [rawValue];
-
-  // Preferred decoding for URL-safe Base64 strings such as eyJ...
-  try {
-    const decodedBase64Url = Buffer.from(
-      rawValue,
-      "base64url",
-    )
-      .toString("utf8")
-      .trim();
-
-    if (decodedBase64Url) {
-      candidates.push(decodedBase64Url);
-    }
-  } catch (error) {
-    console.warn(
-      "⚠️ TELNYX CLIENT STATE BASE64URL DECODE WARNING:",
-      error.message,
-    );
-  }
-
-  // Compatibility fallback for standard Base64.
-  try {
-    const normalizedBase64 = rawValue
-      .replace(/-/g, "+")
-      .replace(/_/g, "/");
-
-    const paddedBase64 = normalizedBase64.padEnd(
-      Math.ceil(normalizedBase64.length / 4) * 4,
-      "=",
-    );
-
-    const decodedBase64 = Buffer.from(
-      paddedBase64,
-      "base64",
-    )
-      .toString("utf8")
-      .trim();
-
-    if (decodedBase64) {
-      candidates.push(decodedBase64);
-    }
-  } catch (error) {
-    console.warn(
-      "⚠️ TELNYX CLIENT STATE BASE64 DECODE WARNING:",
-      error.message,
-    );
-  }
-
-  for (const candidate of candidates) {
+  if (typeof rawClientState !== 'string') return null;
+  let value = rawClientState.trim();
+  if (!value || value.length > 8192) return null;
+  // The WebRTC transport can wrap an already encoded state again.
+  // Keep a strict bound; signature verification still occurs before this helper.
+  for (let depth = 0; depth < 5; depth++) {
     try {
-      let parsed = JSON.parse(candidate);
-
-      // Also support a JSON string containing another JSON object.
-      if (typeof parsed === "string") {
-        parsed = JSON.parse(parsed);
+      const parsed = JSON.parse(value);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+      if (typeof parsed === 'string' && parsed !== value) {
+        value = parsed.trim();
+        continue;
       }
-
-      if (
-        parsed &&
-        typeof parsed === "object" &&
-        !Array.isArray(parsed)
-      ) {
-        return parsed;
-      }
-    } catch (_) {
-      // Try the next candidate.
-    }
+      return null;
+    } catch (_) {}
+    if (!/^[A-Za-z0-9+/_-]+={0,2}$/.test(value)) return null;
+    const decoded = Buffer.from(value, 'base64url').toString('utf8').trim();
+    if (!decoded || decoded === value) return null;
+    value = decoded;
   }
-
   return null;
 }
 
-
-/**
- * Mark a created session as failed.
- */
 async function markSessionFailed({
   sessionId,
   errorKey,
