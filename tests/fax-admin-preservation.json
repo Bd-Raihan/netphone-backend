@@ -1,0 +1,178 @@
+{
+  "services/netphone-fax/package.json": {
+    "sha256": "89737d81b81e52acb6ba9ef6256ed3d4d66efbb9dec9e459a2f618e999e6207d",
+    "lf_sha256": "89737d81b81e52acb6ba9ef6256ed3d4d66efbb9dec9e459a2f618e999e6207d"
+  },
+  "services/netphone-fax/server.js": {
+    "sha256": "a822ce29fe8056ae9f6167f8c1f1bf4f10dd6df81ca11aa0459341ed9d8193fe",
+    "lf_sha256": "a822ce29fe8056ae9f6167f8c1f1bf4f10dd6df81ca11aa0459341ed9d8193fe"
+  },
+  "services/netphone-fax/scripts/personal-fax-setup.js": {
+    "sha256": "2b857d7436a61ba9737ad5d301996f095f925472746dd4db877f4bf42860a173",
+    "lf_sha256": "2b857d7436a61ba9737ad5d301996f095f925472746dd4db877f4bf42860a173"
+  },
+  "services/netphone-fax/scripts/fax-setup.js": {
+    "sha256": "931743dc53d33472f0e21ad4fe609b0b7808f5a52f8f704433528fab605f606f",
+    "lf_sha256": "931743dc53d33472f0e21ad4fe609b0b7808f5a52f8f704433528fab605f606f"
+  },
+  "services/netphone-fax/scripts/fax-document-quality-check.js": {
+    "sha256": "b2a1a436cc91b853cfd2ab23769692f8db58b07aa39f0319d84f1f9cd6161278",
+    "lf_sha256": "b2a1a436cc91b853cfd2ab23769692f8db58b07aa39f0319d84f1f9cd6161278"
+  },
+  "services/netphone-fax/routes/fax.routes.js": {
+    "sha256": "969de02f4839472b0bcbb31fd6effd489be8053f2944524ebbc1ce69065d2de9",
+    "lf_sha256": "969de02f4839472b0bcbb31fd6effd489be8053f2944524ebbc1ce69065d2de9"
+  },
+  "services/netphone-fax/routes/document.routes.js": {
+    "sha256": "8c0c78cb114689e9968160eeda6cdae1e40306c9a10d2565c25fe279c07cd1ce",
+    "lf_sha256": "1cd90966600659c01ef02b2713ef785e18a1c2fea34c161287826c9dda08d5c7"
+  },
+  "services/netphone-fax/routes/telnyxWebhook.routes.js": {
+    "sha256": "422ebeb96645033beee81305dad22b7b59e3b543098bea88b468449745de2e6f",
+    "lf_sha256": "6e90bd8696f29b236280a2cdc5007925e099eb6e6509f3d290661e2a06b583e9"
+  },
+  "services/netphone-fax/routes/notification.routes.js": {
+    "sha256": "8743b4adc7b359bb1d6da64f68cc11fc6d1534866a97a9c55f4110fa49d79a76",
+    "lf_sha256": "8743b4adc7b359bb1d6da64f68cc11fc6d1534866a97a9c55f4110fa49d79a76"
+  },
+  "services/netphone-fax/routes/upload.routes.js": {
+    "sha256": "f6be3ed1b82ceb6ba2fad1c53baad8151f87e3160a4eaf3d2ee0d4e29933ab1d",
+    "lf_sha256": "bc3d4f045de6f0b2406ae4bc6ac9d0af2607ccb86bf11a3157c8b84140c01021"
+  },
+  "services/netphone-fax/routes/media.routes.js": {
+    "sha256": "7aff83d745941c26823fcbb58b38b075d529c74dc1c015b85586b82d56704f81",
+    "lf_sha256": "f2c4bee821179ccecbef950474d4d9cf47f1a58bb62446cd855b9ca14d7518ff"
+  },
+  "services/netphone-fax/controllers/telnyxWebhook.controller.js": {
+    "sha256": "53aefe7287a0c335d51b1c82f7e0fa8df38327a9a9fa9185254fd5428b3764e3",
+    "lf_sha256": "0da004ae4ee764af5f34f426355054e7adca8c41ad0d42cde2750f4a6b67077a"
+  },
+  "services/netphone-fax/controllers/fax.controller.js": {
+    "sha256": "598f2e786ffa828704bd8131f63cbf44f2325fc4d2bf04ef875c0704b618d884",
+    "lf_sha256": "598f2e786ffa828704bd8131f63cbf44f2325fc4d2bf04ef875c0704b618d884"
+  },
+  "services/netphone-fax/controllers/upload.controller.js": {
+    "sha256": "21d234510cb4aa6b587963959736bee1c9aa56638ab0a2a25e5d4b5ad06fb13b",
+    "lf_sha256": "ceb3c0bb2f2d122503ddfb83d9989c55a66789867d2bca3405f27537a2826aba"
+  },
+  "services/netphone-fax/controllers/document.controller.js": {
+    "sha256": "a89fd3d86a37bff1939cd6f7ee61b34522c2f2841583aba4fa09b1a2f62007a5",
+    "lf_sha256": "a89fd3d86a37bff1939cd6f7ee61b34522c2f2841583aba4fa09b1a2f62007a5"
+  },
+  "services/netphone-fax/controllers/notification.controller.js": {
+    "sha256": "64d029804da3f2d13fd5b3aa9594b3729ee72d4809315a8ea1d4c25ad934dee3",
+    "lf_sha256": "56d2418fce03585b8b66c7ae80d3d0ac0e2f5dd3b34b389f64d649be5b21119b"
+  },
+  "services/netphone-fax/controllers/media.controller.js": {
+    "sha256": "cd0774b8e22d172b157b158d5ba7dbbd8f43d6a507255274de8ad186086f6e31",
+    "lf_sha256": "07f5de1228a93d50cf5b89369afaa08f6876c35e7c245f2ee4d2cc4c7c9555d8"
+  },
+  "services/netphone-fax/notifications/notification.service.js": {
+    "sha256": "dc1bdf30210884ab4871e0fbfcd274bd17ffec92bab25ef95c61db03152dd8eb",
+    "lf_sha256": "dc1bdf30210884ab4871e0fbfcd274bd17ffec92bab25ef95c61db03152dd8eb"
+  },
+  "services/netphone-fax/middlewares/faxAuth.middleware.js": {
+    "sha256": "8703c2265cbe6f4d0716d385aa39fd94f84addf012004900acf2c73e45098f6b",
+    "lf_sha256": "8703c2265cbe6f4d0716d385aa39fd94f84addf012004900acf2c73e45098f6b"
+  },
+  "services/netphone-fax/services/faxListCleanup.service.js": {
+    "sha256": "fdfe971cd5538c046bb43f21f3ff13cf736ae07858f3c3ad9a0ad11813b878f5",
+    "lf_sha256": "fdfe971cd5538c046bb43f21f3ff13cf736ae07858f3c3ad9a0ad11813b878f5"
+  },
+  "services/netphone-fax/services/faxMultiUpload.service.js": {
+    "sha256": "343e3f8b52ce8daeb7e3d7561b5ecc33167947f54cc7e810607d61129bb8f37a",
+    "lf_sha256": "343e3f8b52ce8daeb7e3d7561b5ecc33167947f54cc7e810607d61129bb8f37a"
+  },
+  "services/netphone-fax/services/personalFaxProvider.js": {
+    "sha256": "a14608e170acfa85a9c74ae6961188a14a909c4168e48368ae9fa5730d331bde",
+    "lf_sha256": "a14608e170acfa85a9c74ae6961188a14a909c4168e48368ae9fa5730d331bde"
+  },
+  "services/netphone-fax/services/faxReceiveId.service.js": {
+    "sha256": "218b6b8fd135150a228001dc7e0ff435f69ab49abff90e2ce638b7daec0e389f",
+    "lf_sha256": "218b6b8fd135150a228001dc7e0ff435f69ab49abff90e2ce638b7daec0e389f"
+  },
+  "services/netphone-fax/services/personal-fax-setup.js": {
+    "sha256": "2b857d7436a61ba9737ad5d301996f095f925472746dd4db877f4bf42860a173",
+    "lf_sha256": "2b857d7436a61ba9737ad5d301996f095f925472746dd4db877f4bf42860a173"
+  },
+  "services/netphone-fax/services/faxCover.worker.js": {
+    "sha256": "c120bcf6476dc1f5383247dd25a9f98e89aa994c3ada4e1e8bbf08328fb642bb",
+    "lf_sha256": "c120bcf6476dc1f5383247dd25a9f98e89aa994c3ada4e1e8bbf08328fb642bb"
+  },
+  "services/netphone-fax/services/faxPlatform.service.js": {
+    "sha256": "5938775fb234b61b7f6d7b019ad24d9771d9aadb5dc4d19c39cc21de31aaf00d",
+    "lf_sha256": "5938775fb234b61b7f6d7b019ad24d9771d9aadb5dc4d19c39cc21de31aaf00d"
+  },
+  "services/netphone-fax/services/faxBillingMath.js": {
+    "sha256": "5c7954b967bbe869df8258dc8c982816e5156abbf62ffab231aaab27cf62eff2",
+    "lf_sha256": "5c7954b967bbe869df8258dc8c982816e5156abbf62ffab231aaab27cf62eff2"
+  },
+  "services/netphone-fax/services/faxInboxArchive.service.js": {
+    "sha256": "bac5fd2b04b2e1751e608ffafcd30122aec68ef5d63b0375d276a62264b21667",
+    "lf_sha256": "bac5fd2b04b2e1751e608ffafcd30122aec68ef5d63b0375d276a62264b21667"
+  },
+  "services/netphone-fax/services/personalFaxPolicy.js": {
+    "sha256": "f84de90ada18beac812cd4077692330e682e4c6547e17eaa74b955fb56e84eed",
+    "lf_sha256": "f84de90ada18beac812cd4077692330e682e4c6547e17eaa74b955fb56e84eed"
+  },
+  "services/netphone-fax/services/personalFaxNumbers.service.js": {
+    "sha256": "ce33fc1828750db0a511ef4724d01b702207fbb9a3732316906d22e625b8bf31",
+    "lf_sha256": "ce33fc1828750db0a511ef4724d01b702207fbb9a3732316906d22e625b8bf31"
+  },
+  "services/netphone-fax/services/faxBillingControl.js": {
+    "sha256": "4f4c487ee1df76cfff234e7c9d4ff07921848e61f72a6b96da92eb2b9879af09",
+    "lf_sha256": "4f4c487ee1df76cfff234e7c9d4ff07921848e61f72a6b96da92eb2b9879af09"
+  },
+  "services/netphone-fax/services/faxPdf.worker.js": {
+    "sha256": "0eb466a13e81fd6a9b8a60e481e695492c7da8a898d341d5e66ec8e0625b71bc",
+    "lf_sha256": "0eb466a13e81fd6a9b8a60e481e695492c7da8a898d341d5e66ec8e0625b71bc"
+  },
+  "services/netphone-fax/services/telnyxFax.service.js": {
+    "sha256": "c00aab5e53d6412a00738c01c1f1aa5786ea6d6103d4be5aac5c184e8bfc8406",
+    "lf_sha256": "c00aab5e53d6412a00738c01c1f1aa5786ea6d6103d4be5aac5c184e8bfc8406"
+  },
+  "services/netphone-fax/services/faxActualBilling.service.js": {
+    "sha256": "8b94bcfeebd67b8a905433b182fa5d32ef228ab29219156f0423dbfaef33efde",
+    "lf_sha256": "8b94bcfeebd67b8a905433b182fa5d32ef228ab29219156f0423dbfaef33efde"
+  },
+  "services/netphone-fax/services/faxMoney.js": {
+    "sha256": "854055183a5e0178a2a7e1e3dd353c6161c92a60510098ab5b087604f8792f8d",
+    "lf_sha256": "854055183a5e0178a2a7e1e3dd353c6161c92a60510098ab5b087604f8792f8d"
+  },
+  "services/netphone-fax/services/faxCover.service.js": {
+    "sha256": "026b53113a6116a409981d9c61cb667b8f0fd35d4f9ebeb25ce17033fac223d5",
+    "lf_sha256": "026b53113a6116a409981d9c61cb667b8f0fd35d4f9ebeb25ce17033fac223d5"
+  },
+  "services/netphone-fax/services/faxReceiveId.worker.js": {
+    "sha256": "4718c0d659983d2db4d3dfd3b96290f98156ca9479363bacdc69f89962d7ea55",
+    "lf_sha256": "4718c0d659983d2db4d3dfd3b96290f98156ca9479363bacdc69f89962d7ea55"
+  },
+  "services/netphone-fax/services/faxMerge.worker.js": {
+    "sha256": "fea29dd133d4aa45c7be49977ff85812956c1ddaea016694ec9b346707bfb281",
+    "lf_sha256": "fea29dd133d4aa45c7be49977ff85812956c1ddaea016694ec9b346707bfb281"
+  },
+  "services/netphone-fax/services/mediaToken.service.js": {
+    "sha256": "27599f6e7372b857a198de6aee188c0db755c1caf5c99b5633c9b2dfbeba3ce7",
+    "lf_sha256": "8cde61736411fe7e461c15cba7387abe6b72252e4aefb33101ffb60813ca51ea"
+  },
+  "services/netphone-fax/database/db.js": {
+    "sha256": "c8f800326917fbac6e4167f0b4863e6788d417244d8c70b72814c2561885b960",
+    "lf_sha256": "69bc9a48c14a6dc41ae51cb5696b0303e74972b0723fdc2a1b1990c09e6e465d"
+  },
+  "services/fax-receiver/package.json": {
+    "sha256": "de3a7f1ec4bb99e4b2a90ce08a968e3a8d6e7dd5af302b768d76f549bf64391b",
+    "lf_sha256": "de3a7f1ec4bb99e4b2a90ce08a968e3a8d6e7dd5af302b768d76f549bf64391b"
+  },
+  "services/fax-receiver/server.js": {
+    "sha256": "a7699cfec7d0e6e2702c14e22a3e69461cecb70e00275fdf2b8aec5119bd459e",
+    "lf_sha256": "a7699cfec7d0e6e2702c14e22a3e69461cecb70e00275fdf2b8aec5119bd459e"
+  },
+  "services/fax-sender/package.json": {
+    "sha256": "d02dd8238714fd0c9d2cb15d7194feb10b3a7ecb947b001db8629676b58ddbe3",
+    "lf_sha256": "855a2a0cd391b27be6ce1205bc82bada8f00e273b1867efd472fc23f21ea4843"
+  },
+  "services/fax-sender/send-fax.js": {
+    "sha256": "356c3140b0c7686b2dd1e14646e054b3153bb8b39220d7aee4c373606ef337ad",
+    "lf_sha256": "02f3329e10b42b29315a4976fe2879e7a236368db837b359ae84c38b77a21cca"
+  }
+}
