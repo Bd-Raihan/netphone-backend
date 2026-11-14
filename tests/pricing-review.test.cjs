@@ -148,12 +148,12 @@ test('activate-all reports route setup failure and never claims that country was
  assert.ok(result.failed[0].message.includes('provider'));
  assert.ok(!f.state.sql.some(x=>x.sql.startsWith('UPDATE voice_routes')));
 });
-test('registration reports use reset cutoff without changing user records',async()=>{
+test('registration reports retain all verified accounts regardless of the reporting cutoff',async()=>{
  const queries=[];const mod={exports:{}};
  const src=fs.readFileSync(path.join(__dirname,'../src/modules/admin-profit/admin.profit.service.js'),'utf8');
  vm.runInNewContext(src,{module:mod,exports:mod.exports,require:()=>({query:async sql=>{queries.push(sql);return {rows:[{}]}}})});
  await mod.exports.getRegisteredUserSummary();await mod.exports.getRegisteredUsers();
  assert.equal(queries.length,2);
- assert.ok(queries.every(q=>q.includes('u.created_at >= COALESCE((SELECT reporting_started_at')));
+ assert.ok(queries.every(q=>!q.includes('u.created_at >=') && q.includes('u.phone_verified_at IS NOT NULL')));
  assert.ok(queries.every(q=>!/(DELETE|UPDATE|ALTER)\s/i.test(q)));
 });
