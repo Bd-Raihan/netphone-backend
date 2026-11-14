@@ -26,6 +26,8 @@ const guarded = fn => async (req,res) => {
 };
 // These literal paths must precede /:prefix. Both JWT and Admin checks remain above.
 router.post('/guard/reporting-period',guarded(req=>require('../calling-guard/reporting-period').start(req.user.id,req.body.confirmation)));
+router.post('/guard/repair-open-pricing',guarded(req=>callingGuard.repairOpenPricing(req.user.id)));
+router.post('/guard/activate-all-countries',guarded(req=>callingGuard.activateAllCountries(req.user.id)));
 router.get('/guard/status',guarded(()=>callingGuard.health()));
 router.post('/guard/sync',guarded(()=>costMonitor.sync()));
 router.patch('/guard/enabled',guarded(req=>callingGuard.enable(req.body.enabled,req.user.id)));

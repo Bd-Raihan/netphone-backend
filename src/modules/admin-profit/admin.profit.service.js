@@ -82,6 +82,7 @@ async function getRegisteredUserSummary() {
       ) vpr ON TRUE
 
       WHERE u.phone_verified_at IS NOT NULL
+      AND u.created_at >= COALESCE((SELECT reporting_started_at FROM voice_guard_settings WHERE id=1),'-infinity'::timestamptz)
     )
 
     SELECT
@@ -137,6 +138,7 @@ async function getRegisteredUsers() {
       LIMIT 1
     ) vpr ON TRUE
      WHERE u.phone_verified_at IS NOT NULL
+      AND u.created_at >= COALESCE((SELECT reporting_started_at FROM voice_guard_settings WHERE id=1),'-infinity'::timestamptz)
     ORDER BY u.created_at DESC, u.id DESC
   `);
 

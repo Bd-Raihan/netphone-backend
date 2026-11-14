@@ -98,9 +98,9 @@ async function importDeck({
   const sha = crypto.createHash("sha256");
   for await (const chunk of fs.createReadStream(filePath)) sha.update(chunk);
   const checksum = sha.digest("hex");
-  return transaction(async (c) => {
-    const old = await settings(c);
+  const result = await transaction(async (c) => {
     await c.query("SELECT id FROM voice_guard_settings WHERE id=1 FOR UPDATE");
+    const old = await settings(c);
     if (
       old.source_sha256 === checksum &&
       old.caller_number === caller() &&
@@ -162,6 +162,10 @@ async function importDeck({
       rows_skipped: 0,
     };
   });
+  // Auto policies read the active deck on every new quote. Recheck old alerts
+  // against that same deck before the import response reaches the app.
+  await reconcilePricingAlerts(adminUserId);
+  return result;
 }
 async function validateDeck({ filePath, sampleLimit = 10 }) {
   const sample = [],
@@ -454,9 +458,9 @@ async function countries({ search = "" } = {}) {
       {};
     const lo = prices(r, pp, s),
       high = prices(hi, pp, s);
-    const countryAlerts = activeAlerts.filter(
-      (a) => !a.country_code || a.country_code === iso,
-    );
+    const countryAlerts = require('./pricing-review').groupAlerts(activeAlerts.filter(
+      a => (!a.country_code || a.country_code === iso) && !require('./pricing-review').isReportNotice(a),
+    ));
     const blocked =
       countryAlerts.some(
         (a) =>
@@ -549,14 +553,36 @@ async function ensureCountrySetup(c, current, prefix, actor) {
   }
   await audit(c,actor,'calling_country_setup_ensured',{country_code:current.country_code,prefix});
 }
+async function reconcilePricingAlerts(actor = null) {
+  return require('./pricing-review').reconcile({
+    db, transaction, settings, selectRoute, policy, prices, countries, audit,
+  }, actor);
+}
 async function reviewSavedPricing(countryCode, prefix, actor) {
-  const { rows } = await db.query("SELECT alert_key,prefix FROM voice_guard_alerts WHERE active AND country_code=$1 AND severity='loss' AND ($2::text IS NULL OR prefix=$2) ORDER BY updated_at DESC", [countryCode,prefix]);
-  const failures = [];
-  for (const a of rows) {
-    try { await resolveAlert(a.alert_key, actor); }
-    catch (e) { failures.push(String(e.message)); }
-  }
-  return {review_message: failures.length ? 'Price saved. Review still required: ' + [...new Set(failures)].join('; ') : 'Price saved. Current rates verified; historical losses remain recorded.'};
+  const result = await reconcilePricingAlerts(actor);
+  return {review_message: 'Current pricing rechecked. Historical call records are retained.', ...result};
+}
+async function repairOpenPricing(actor) {
+  // Only existing open countries are changed. No route is enabled by this action.
+  const open = (await countries()).filter(x => x.is_active).map(x => x.country_code);
+  await transaction(async c => {
+    await c.query('SELECT id FROM voice_guard_settings WHERE id=1 FOR UPDATE');
+    const previous = (await c.query('SELECT * FROM voice_guard_policies WHERE country_code=ANY($1::text[]) FOR UPDATE', [open])).rows;
+    await c.query("UPDATE voice_guard_policies SET pricing_mode='auto_markup',markup_percent=30,manual_sell_rate_usd_per_min=NULL,updated_by=$2,updated_at=NOW() WHERE country_code=ANY($1::text[])", [open,actor]);
+    // The SIP CSV does not contain WebRTC rates. Use only authenticated recent
+    // observed WebRTC usage, never a guessed replacement rate.
+    const observed = (await c.query("SELECT MAX(rate_microusd) AS rate FROM voice_guard_usage WHERE kind='webrtc' AND billed_seconds>0 AND updated_at>NOW()-INTERVAL '7 days' AND rate_microusd IS NOT NULL")).rows[0]?.rate;
+    const config = await settings(c);
+    if (observed != null && BigInt(observed) > BigInt(config.sdk_microusd) && BigInt(observed) <= 1000000n) {
+      await c.query('UPDATE voice_guard_settings SET sdk_microusd=$1 WHERE id=1', [String(observed)]);
+    }
+    await c.query('UPDATE voice_guard_settings SET default_markup=30 WHERE id=1');
+    await audit(c, actor, 'calling_open_prices_auto_30', {countries:open,previous,previous_sdk_microusd:config.sdk_microusd,observed_sdk_microusd:observed});
+  });
+  await reconcilePricingAlerts(actor);
+  const status = await health();
+  return {ok:true,countries_updated:open.length,remaining_alerts:status.alerts.length,
+    message: status.alerts.length ? 'Auto 30% saved. Remaining issues need provider/report review.' : 'Auto 30% saved. No current pricing alerts.',status};
 }
 async function saveCountry({ prefix, adminUserId, payload }) {
   const current = await getCountry(prefix, payload.country_code);
@@ -691,6 +717,7 @@ async function routeRows(
   };
 }
 async function health() {
+  await reconcilePricingAlerts();
   const s = await settings();
   const issue = readiness(s);
   if (
@@ -721,14 +748,15 @@ async function health() {
     );
   const alerts = (
     await db.query(
-      "SELECT * FROM voice_guard_alerts WHERE active ORDER BY updated_at DESC LIMIT 100",
+      "SELECT * FROM voice_guard_alerts WHERE active ORDER BY updated_at DESC",
     )
   ).rows;
   return {
     ...s,
     readiness_error: readiness(s),
     monitor_warning: s.monitor_error || null,
-    alerts,
+    alerts: require('./pricing-review').groupAlerts(alerts.filter(a => !require('./pricing-review').isReportNotice(a))),
+    report_notices: alerts.filter(require('./pricing-review').isReportNotice),
     actuals: (
       await db.query(
         "SELECT a.* FROM voice_guard_actuals a JOIN call_sessions cs ON cs.id=a.session_id WHERE cs.started_at >= COALESCE((SELECT reporting_started_at FROM voice_guard_settings WHERE id=1),'-infinity'::timestamptz) ORDER BY a.updated_at DESC LIMIT 50",
@@ -1021,3 +1049,43 @@ module.exports.saveRoutePolicy = saveRoutePolicy;
 module.exports.configure = configure;
 
 module.exports.isRateBlockingAlert = isRateBlockingAlert;
+
+module.exports.reconcilePricingAlerts = reconcilePricingAlerts;
+module.exports.repairOpenPricing = repairOpenPricing;
+
+// Explicit Admin bulk action. Each country commits atomically; failures are
+// returned by country, never reported as successfully enabled.
+async function activateAllCountries(actor) {
+  const config = await settings();
+  if (!config.deck_version) throw fail('Import the Telnyx CSV first', 409);
+  const items = await countries();
+  const activated = [], failed = [];
+  for (const item of items) {
+    try {
+      await transaction(async c => {
+        await c.query('SELECT id FROM voice_guard_settings WHERE id=1 FOR UPDATE');
+        const current = await settings(c);
+        if (current.deck_version !== config.deck_version) throw fail('CSV changed during activation. Retry after import finishes.');
+        await ensureCountrySetup(c, item, item.prefix, actor);
+        // Existing prices, markup, notes and overrides are preserved.
+        await c.query(`INSERT INTO voice_guard_policies
+          (prefix,country_code,scope,pricing_mode,markup_percent,is_active,updated_by)
+          VALUES($1,$2,'country','auto_markup',$3,TRUE,$4)
+          ON CONFLICT(prefix,country_code,scope) DO UPDATE
+          SET is_active=TRUE,updated_by=EXCLUDED.updated_by,updated_at=NOW()`,
+          [item.prefix,item.country_code,current.default_markup,actor]);
+        await c.query('UPDATE voice_guard_policies SET is_active=TRUE,updated_by=$2,updated_at=NOW() WHERE country_code=$1', [item.country_code,actor]);
+        await c.query('UPDATE voice_routes SET is_active=TRUE WHERE country_code=$1', [item.country_code]);
+        await c.query('UPDATE voice_destination_policies SET is_enabled=TRUE,disabled_reason=NULL WHERE country_code=$1', [item.country_code]);
+        await audit(c,actor,'calling_country_bulk_activated',{country_code:item.country_code});
+      });
+      activated.push(item.country_code);
+    } catch (e) {
+      failed.push({country_code:item.country_code,message:String(e.message)});
+    }
+  }
+  await reconcilePricingAlerts(actor);
+  return {ok:true,activated:activated.length,total:items.length,failed,
+    message:failed.length ? `${activated.length}/${items.length} countries activated. ${failed.length} need route review.` : `All ${activated.length} countries activated.`};
+}
+module.exports.activateAllCountries = activateAllCountries;

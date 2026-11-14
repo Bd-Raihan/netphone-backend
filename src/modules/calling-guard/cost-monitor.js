@@ -208,7 +208,8 @@ async function reconcile() {
           if (result.profit < 0n) await c.query(
             "UPDATE voice_guard_alerts SET details=details||$2::jsonb WHERE alert_key=$1 AND active",
             ['actual:' + call.id, JSON.stringify(rateAdvice)]);
-          if (result.complete && result.cost > 0n && result.wallet < m.markup(result.cost, targetMarkup)) {
+          if (result.complete && result.cost > 0n && result.wallet < m.markup(result.cost, targetMarkup) &&
+              (!guard.prices(current, effectivePolicy, config).safe || observedSip > BigInt(current.rate) || observedWeb > BigInt(config.sdk_microusd))) {
             await guard.alert('markup:' + call.id, country, prefix, 'warning',
               'Actual call revenue is below the configured markup target. Review this prefix and provider costs.',
               { ...rateAdvice, provider_usd: m.usd(result.cost), wallet_usd: m.usd(result.wallet),
