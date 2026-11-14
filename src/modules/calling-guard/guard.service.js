@@ -76,7 +76,6 @@ function readiness(s) {
     return "Rate deck is stale: import the current Telnyx CSV";
   if (
     !s.monitor_verified ||
-    s.monitor_error ||
     !s.last_monitor_sync ||
     Date.now() - new Date(s.last_monitor_sync).getTime() > 15 * 60000
   )
@@ -728,6 +727,7 @@ async function health() {
   return {
     ...s,
     readiness_error: readiness(s),
+    monitor_warning: s.monitor_error || null,
     alerts,
     actuals: (
       await db.query(

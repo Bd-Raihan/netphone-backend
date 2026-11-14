@@ -1,7 +1,8 @@
 "use strict";
 const db = require("../../config/db"),
   guard = require("./guard.service"),
-  m = require("./money-routes");
+  m = require("./money-routes"),
+  reports = require("./report-client");
 let promise = null,
   timer = null,
   watchTimer = null,
@@ -190,6 +191,31 @@ async function reconcile() {
             config,
             c,
           );
+          const effectivePolicy = await guard.policy(call.to_phone_e164, country, c);
+          const targetMarkup = effectivePolicy.markup_percent ?? config.default_markup;
+          const observedSip = usage.filter(x => x.kind === 'sip-trunking' && x.direction === 'outbound' && x.rate_microusd != null)
+            .reduce((v, x) => BigInt(x.rate_microusd) > v ? BigInt(x.rate_microusd) : v, BigInt(current.rate));
+          const observedWeb = usage.filter(x => x.kind === 'webrtc' && x.rate_microusd != null)
+            .reduce((v, x) => BigInt(x.rate_microusd) > v ? BigInt(x.rate_microusd) : v, BigInt(config.sdk_microusd));
+          const rateAdvice = {
+            session_id: call.id,
+            current_sell_usd_per_min: m.usd(guard.prices(current, effectivePolicy, config).sell),
+            suggested_sell_usd_per_min: m.usd(m.markup(observedSip + observedWeb, targetMarkup)),
+            csv_update_required: observedSip > BigInt(current.rate),
+            sdk_update_required: observedWeb > BigInt(config.sdk_microusd),
+            markup_percent: Number(targetMarkup),
+          };
+          if (result.profit < 0n) await c.query(
+            "UPDATE voice_guard_alerts SET details=details||$2::jsonb WHERE alert_key=$1 AND active",
+            ['actual:' + call.id, JSON.stringify(rateAdvice)]);
+          if (result.complete && result.cost > 0n && result.wallet < m.markup(result.cost, targetMarkup)) {
+            await guard.alert('markup:' + call.id, country, prefix, 'warning',
+              'Actual call revenue is below the configured markup target. Review this prefix and provider costs.',
+              { ...rateAdvice, provider_usd: m.usd(result.cost), wallet_usd: m.usd(result.wallet),
+                target_charge_usd: m.usd(m.markup(result.cost, targetMarkup)) }, c);
+          } else if (result.complete) {
+            await c.query("UPDATE voice_guard_alerts SET active=FALSE,resolved_at=NOW() WHERE alert_key=$1", ['markup:' + call.id]);
+          }
           const changedRate = usage.some(
             (x) =>
               (x.kind === "sip-trunking" &&
@@ -225,7 +251,7 @@ async function reconcile() {
               prefix,
               "warning",
               "Provider CDR rate is higher than the configured cost. Update this country before new calls.",
-              { session_id: call.id, rate_update_required: true },
+              { ...rateAdvice, rate_update_required: true },
               c,
             );
         } catch (e) {
@@ -267,12 +293,24 @@ async function reconcile() {
 async function sync() {
   if (promise) return promise;
   promise = (async () => {
-    const key = process.env.TELNYX_API_KEY;
+    const lock = await db.getClient();
+    let locked = false;
+    try {
+      locked = (await lock.query("SELECT pg_try_advisory_lock(191912, 41) AS locked")).rows[0].locked;
+      if (!locked) return { in_progress: true };
+      const config = await guard.settings(lock);
+      const retryAt = new Date(config.monitor_retry_after || 0).getTime();
+      if (retryAt > Date.now()) return { deferred: true, retry_at: config.monitor_retry_after };
+      // Manual refresh and other PM2 workers reuse a recently completed scan.
+      if (!config.monitor_error && Date.now() - new Date(config.last_monitor_sync || 0).getTime() < 120000)
+        return { cached: true, verified: config.monitor_verified };
+      const key = process.env.TELNYX_API_KEY;
     if (!key) throw Error("Calling API key is not configured");
     if (!connections().size)
       throw Error("Calling connection IDs are not configured");
     const records = [],
       signal = AbortSignal.timeout(110000);
+    let accepted = 0;
     let verifiedSip = 0,
       verifiedWeb = 0;
     for (const kind of ["sip-trunking", "webrtc"]) {
@@ -285,33 +323,19 @@ async function sync() {
           "page[size]": 100,
         }))
           u.searchParams.set(k, v);
-        const response = await fetch(u, {
-          headers: { Authorization: "Bearer " + key },
-          signal,
-          redirect: "error",
-        });
-        if (!response.ok)
-          throw Error(
-            "Calling reporting API failed (HTTP " + response.status + ")",
-          );
-        const text = await response.text();
-        if (text.length > 8 * 1024 * 1024)
-          throw Error("Provider response too large");
-        const data = JSON.parse(text);
-        if (!Array.isArray(data.data))
-          throw Error("Unverified Calling report schema");
+        const data = await reports.page(u, key, signal);
+        const batch = [];
         for (const row of data.data) {
-          if (
-            !connections().has(m.field(row, "connection_id", "Connection Id"))
-          )
-            continue;
-          if (["false", "0"].includes(m.field(row, "completed").toLowerCase()))
-            continue;
+          if (!connections().has(m.field(row, "connection_id", "Connection Id"))) continue;
+          if (["false", "0"].includes(m.field(row, "completed").toLowerCase())) continue;
           const r = m.cdr(row, kind);
+          batch.push(r);
           records.push(r);
           if (kind === "webrtc") verifiedWeb++;
           else verifiedSip++;
         }
+        // Commit each validated page; a later rate limit must not discard it.
+        if (batch.length) accepted += await guard.transaction(c => store(batch, c));
         const pages = Number(data.meta?.total_pages);
         if (!Number.isSafeInteger(pages) || pages < 0)
           throw Error("Unverified report pagination");
@@ -322,14 +346,7 @@ async function sync() {
           );
       }
     }
-    // Keep one monitor across all PM2 processes. No Fax connections are imported.
-    const accepted = await guard.transaction(async (c) => {
-      await c.query(
-        "SELECT id FROM voice_guard_settings WHERE id=1 FOR UPDATE",
-      );
-      return store(records, c);
-    });
-    const verified =
+    const verified = config.monitor_verified || (
       verifiedSip > 0 &&
       verifiedWeb > 0 &&
       records.some(
@@ -342,22 +359,18 @@ async function sync() {
               w.to === r.to &&
               w.from === r.from,
           ),
-      );
+      ));
     await db.query(
-      "UPDATE voice_guard_settings SET last_monitor_sync=NOW(),monitor_error=NULL,monitor_verified=$1 WHERE id=1",
+      "UPDATE voice_guard_settings SET last_monitor_sync=NOW(),monitor_error=NULL,monitor_retry_after=NULL,monitor_verified=$1 WHERE id=1",
       [verified],
     );
     const matched = await reconcile();
-    if (!matched)
-      await db.query(
-        "UPDATE voice_guard_settings SET monitor_verified=FALSE WHERE id=1",
-      );
     await flagMissingReports();
     await guard.health();
     await db.query(
       "UPDATE voice_guard_alerts SET active=FALSE,resolved_at=NOW() WHERE alert_key='monitor' AND severity='warning'",
     );
-    if (!verified || !matched)
+    if (!verified)
       await guard.alert(
         "monitor",
         "",
@@ -368,11 +381,16 @@ async function sync() {
       );
     return {
       accepted,
-      verified: verified && matched > 0,
+      verified: Boolean(verified),
       matched_calls: matched,
       sip_records: verifiedSip,
       webrtc_records: verifiedWeb,
     };
+    } finally {
+      try {
+        if (locked) await lock.query("SELECT pg_advisory_unlock(191912, 41)");
+      } finally { lock.release(); }
+    }
   })()
     .catch(async (e) => {
       const message = String(e.message || "Calling cost sync failed").slice(
@@ -380,15 +398,18 @@ async function sync() {
         300,
       );
       await db.query(
-        "UPDATE voice_guard_settings SET monitor_error=$1 WHERE id=1",
-        [message],
+        "UPDATE voice_guard_settings SET monitor_error=$1,monitor_retry_after=$2 WHERE id=1",
+        [message, new Date(Math.max(Date.now() + 60000, e.retryAt || 0)).toISOString()],
       );
+      // Already committed pages can expose a real loss even while the provider is throttling.
+      try { await reconcile(); await flagMissingReports(); }
+      catch (auditError) { console.error('Calling partial report audit:', auditError.message); }
       await guard.alert(
         "monitor",
         "",
         "",
         "warning",
-        "Calling cost monitor needs attention. New guarded calls remain paused.",
+        "Calling cost reports are delayed. Retry is scheduled; call readiness depends on the last verified sync.",
         { message },
       );
       throw e;
@@ -525,7 +546,9 @@ async function flagMissingReports() {
   const rows = (
     await db.query(`SELECT s.id,s.meta->'calling_rate_guard'->>'country_code' AS country,
  s.meta->'calling_rate_guard'->>'prefix' AS prefix FROM call_sessions s
- WHERE s.meta->>'calling_guard_admitted'='true' AND s.ended_at<NOW()-INTERVAL '15 minutes'
+ WHERE s.meta->>'calling_guard_admitted'='true'
+ AND (s.answered_at IS NOT NULL OR s.tx_id IS NOT NULL)
+ AND s.ended_at<NOW()-INTERVAL '15 minutes'
  AND s.ended_at>NOW()-INTERVAL '7 days' AND NOT EXISTS(
  SELECT 1 FROM voice_guard_actuals a WHERE a.session_id=s.id AND a.cost_status='sip_and_webrtc') LIMIT 100`)
   ).rows;
@@ -541,6 +564,10 @@ async function flagMissingReports() {
   await db.query(`UPDATE voice_guard_alerts a SET active=FALSE,resolved_at=NOW()
  WHERE a.alert_key LIKE 'missing:%' AND EXISTS(SELECT 1 FROM voice_guard_actuals x
  WHERE a.details->>'session_id'=x.session_id::text AND x.cost_status='sip_and_webrtc')`);
+  await db.query(`UPDATE voice_guard_alerts a SET active=FALSE,resolved_at=NOW()
+ WHERE a.alert_key LIKE 'missing:%' AND EXISTS(SELECT 1 FROM call_sessions s
+ WHERE a.details->>'session_id'=s.id::text AND s.ended_at IS NOT NULL AND s.answered_at IS NULL
+ AND s.tx_id IS NULL AND COALESCE(s.charged_amount_usd,0)=0)`);
 }
 module.exports.stopProviderCall = stopProviderCall;
 
