@@ -27,4 +27,14 @@ function connectedSeconds({rawPayload = {}, answeredAt, endedAt}) {
   return Math.max(0, Math.ceil((Date.parse(end) - Date.parse(start)) / 1000));
 }
 
-module.exports = {connectedSeconds, eventTimes};
+function statusTiming(call, now = new Date()) {
+  const answeredAt = iso(call.answered_at), endedAt = iso(call.ended_at);
+  const finalized = !!endedAt;
+  const stored = call.duration_sec;
+  const seconds = finalized && stored != null && Number.isFinite(Number(stored))
+    ? Math.max(0, Math.floor(Number(stored)))
+    : connectedSeconds({answeredAt, endedAt: finalized ? endedAt : now});
+  return {server_time: iso(now), answered_at: answeredAt, ended_at: endedAt,
+    elapsed_seconds: answeredAt ? seconds : 0, finalized};
+}
+module.exports = {connectedSeconds, eventTimes, statusTiming};

@@ -113,11 +113,9 @@ test('call router uses Rate Management resolver and never falls back after denia
  let hits=0;const router=load('modules/calls/provider-router.service.js',{'./provider-router.repository':{},'../calling-guard/guard.service':{tryResolve:async n=>{hits++;return {ok:false,reason:'country_loss_blocked',number:n}}}});
  const r=await router.resolveDestination('+393196616068');assert.equal(hits,1);assert.equal(r.reason,'country_loss_blocked');
 });
-test('reporting reset contains no financial DELETE/TRUNCATE or UPDATE',()=>{
- const s=fs.readFileSync(path.join(root,'modules/calling-guard/reporting-period.js'),'utf8');
- assert.doesNotMatch(s,/\b(DELETE|TRUNCATE)\b/i);
- assert.doesNotMatch(s,/UPDATE\s+(users|wallets|wallet_transactions|call_sessions)\b/i);
- assert.match(s,/UPDATE voice_guard_settings SET reporting_started_at/);
+test('retired report-reset endpoint rejects before reading or writing any database',async()=>{
+ const reset=load('modules/calling-guard/reporting-period.js',{});
+ await assert.rejects(reset.start(1,'START_NEW_CALLING_PERIOD'),e=>e.statusCode===410);
 });
 test('new session stores the exact guard quote and passes through admission',async()=>{
  const guardSnapshot={version:'deck-v2',prefix:'39319',pricing_mode:'auto_markup',markup_percent:40,sdk_microusd:'2000'};
@@ -210,3 +208,13 @@ test('report monitor accepts only explicit additional numeric voice connection I
  const invalid=load('modules/calling-guard/cost-monitor.js',mocks,'',{TELNYX_CALLING_REPORT_CONNECTION_IDS:'*'});
  assert.throws(()=>invalid.reportingConnections(),/explicit numeric/);
 });
+
+for(const sec of [58,59,60,61]) {
+ test(`provider ${sec}s controls billing at the minute boundary, independently of a delayed phone timer`,async()=>{
+  const f=fixture({seconds:sec});
+  const r=await f.service.billCompletedCallByProvider({sessionId:1,rawPayload:{}});
+  assert.equal(r.duration_sec,sec);
+  assert.equal(r.billable_seconds,sec<=60?60:120);
+  assert.equal(r.charged_amount_microusd,sec<=60?352940:705880);
+ });
+}

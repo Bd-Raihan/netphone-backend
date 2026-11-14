@@ -10,6 +10,7 @@ const reportSql = `WITH report AS (
  COALESCE(cs.charged_minutes,0) AS minutes,
  COALESCE(cs.sell_rate_usd_per_min,0) AS pm_rate,
  ledger.net / 1000000::numeric AS total_charge,
+ cs.provider_cost_usd AS estimated_provider_cost,
  CASE WHEN ledger.entries>0 THEN 'Posted entries matched' ELSE 'No posted wallet entry' END AS wallet_status,
  a.provider_microusd / 1000000::numeric AS provider_cost,
  CASE WHEN a.cost_status='sip_and_webrtc' THEN (ledger.net-a.provider_microusd)/1000000::numeric END AS net_profit,
@@ -28,13 +29,14 @@ const reportSql = `WITH report AS (
   AND (w.idempotency_key='call_charge:'||cs.id::text OR w.meta->>'session_id'=cs.id::text)
  ) ledger ON TRUE
  WHERE (cs.status='charged' OR a.session_id IS NOT NULL OR ledger.entries>0)
- AND cs.started_at >= COALESCE((SELECT reporting_started_at FROM voice_guard_settings WHERE id=1),'-infinity'::timestamptz)
 )`;
 const summarySql = `COUNT(*)::int AS total_calls,
  COALESCE(SUM(minutes),0) AS total_minutes,
  COALESCE(SUM(total_charge),0) AS total_charge,
  COALESCE(SUM(total_charge) FILTER(WHERE cost_status='Verified'),0) AS verified_wallet_net,
  COALESCE(SUM(total_charge) FILTER(WHERE cost_status<>'Verified'),0) AS pending_wallet_net,
+ SUM(estimated_provider_cost) FILTER(WHERE cost_status<>'Verified') AS pending_estimated_provider_cost,
+ SUM(total_charge-estimated_provider_cost) FILTER(WHERE cost_status<>'Verified') AS pending_estimated_profit,
  COALESCE(SUM(provider_cost) FILTER(WHERE cost_status='Verified'),0) AS total_provider_cost,
  COALESCE(SUM(net_profit),0) AS total_net_profit,
  COUNT(*) FILTER(WHERE cost_status='Verified')::int AS verified_calls,
@@ -45,7 +47,7 @@ const summarySql = `COUNT(*)::int AS total_calls,
  COUNT(DISTINCT country_name)::int AS destination_groups`;
 async function getProfitSummary({todayOnly=false}={}) {
  const result=await db.query(reportSql+` SELECT ${summarySql} FROM report ${todayOnly ? 'WHERE called_at >= CURRENT_DATE' : ''}`);
- return {...result.rows[0],report_basis:'Posted wallet charges less refunds; profit only for matched SIP + WebRTC costs. Pending calls are excluded from verified cost/profit. Today uses database server date.'};
+ return {...result.rows[0],report_basis:'Posted wallet charges less refunds; profit only for matched SIP + WebRTC costs. Pending calls use CSV estimates shown separately; they are excluded from verified cost/profit. Today uses database server date.'};
 }
 async function getCallWiseProfitDetails() {
  return (await db.query(reportSql+` SELECT * FROM report ORDER BY called_at DESC,call_id DESC`)).rows;

@@ -27,7 +27,7 @@ const {
 } = require("./telnyx.service");
 
 const db = require("../../config/db");
-const { eventTimes } = require("./provider-duration");
+const { eventTimes, statusTiming } = require("./provider-duration");
 const walletService = require("../wallet/wallet.service");
 
 const {
@@ -1374,6 +1374,10 @@ async function telnyxStatusCallback(req, res) {
       });
     }
 
+    if (billingResult?.ok === true) {
+      try { require('../calling-guard/cost-monitor').scheduleSync(); }
+      catch (e) { console.error('Cost refresh scheduling:', e.message); }
+    }
     console.log(
       "💰 TELNYX HANGUP BILLING RESULT =>",
       {
@@ -1596,6 +1600,7 @@ async function getCallStatus(req, res) {
     return res.status(200).json({
       ok: true,
       call: rows[0],
+      timing: statusTiming(rows[0]),
       wallet: await walletService.getWalletByUserId(userId),
     });
   } catch (error) {

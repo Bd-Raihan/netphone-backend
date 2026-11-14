@@ -7,6 +7,7 @@ let promise = null,
   timer = null,
   watchTimer = null,
   watchBusy = false;
+let fastTimer = null, localTimer = null, localBusy = false;
 const connections = () => {
   const extra = String(process.env.TELNYX_CALLING_REPORT_CONNECTION_IDS || '')
     .split(',').map(x => x.trim()).filter(Boolean);
@@ -84,7 +85,7 @@ async function reconcile() {
   const calls = (
     await db.query(`SELECT s.*,COALESCE(s.meta->'calling_rate_guard'->>'country_code',r.country_code,'') AS guard_country
  FROM call_sessions s LEFT JOIN voice_routes r ON r.id=s.route_id WHERE s.provider='telnyx' AND s.ended_at IS NOT NULL
- AND s.ended_at<NOW()-INTERVAL '5 minutes' AND s.ended_at>NOW()-INTERVAL '7 days' AND EXISTS(SELECT 1 FROM voice_guard_usage u WHERE
+ AND s.ended_at<=NOW() AND s.ended_at>NOW()-INTERVAL '7 days' AND EXISTS(SELECT 1 FROM voice_guard_usage u WHERE
  u.session_uuid::text=NULLIF(s.meta->>'telnyx_call_session_id','') OR u.leg_id=NULLIF(s.meta->>'telnyx_call_leg_id',''))
  ORDER BY s.ended_at DESC LIMIT 1000`)
   ).rows;
@@ -303,7 +304,7 @@ async function sync() {
       const retryAt = new Date(config.monitor_retry_after || 0).getTime();
       if (retryAt > Date.now()) return { deferred: true, retry_at: config.monitor_retry_after };
       // Manual refresh and other PM2 workers reuse a recently completed scan.
-      if (!config.monitor_error && Date.now() - new Date(config.last_monitor_sync || 0).getTime() < 120000)
+      if (!config.monitor_error && Date.now() - new Date(config.last_monitor_sync || 0).getTime() < 15000)
         return { cached: true, verified: config.monitor_verified };
       const key = process.env.TELNYX_API_KEY;
     if (!key) throw Error("Calling API key is not configured");
@@ -420,6 +421,30 @@ async function sync() {
     });
   return promise;
 }
+function scheduleSync() {
+  if (fastTimer) return;
+  fastTimer = setTimeout(() => {
+    fastTimer = null;
+    void sync().catch(e => console.error('Calling fast refresh:', e.message));
+  }, 1000);
+  fastTimer.unref?.();
+}
+async function refreshPending() {
+  if (localBusy) return;
+  localBusy = true;
+  try {
+    const pending = (await db.query(`SELECT 1 FROM call_sessions s
+      LEFT JOIN voice_guard_actuals a ON a.session_id=s.id
+      WHERE s.ended_at IS NOT NULL AND s.ended_at>NOW()-INTERVAL '7 days'
+      AND s.meta->>'calling_guard_admitted'='true'
+      AND (s.tx_id IS NOT NULL OR s.status='charged')
+      AND a.cost_status IS DISTINCT FROM 'sip_and_webrtc' LIMIT 1`)).rows;
+    if (!pending.length) return;
+    // Already imported provider records can be matched without an API request.
+    await reconcile();
+    scheduleSync();
+  } finally { localBusy = false; }
+}
 function start() {
   if (timer) return;
   watchTimer = setInterval(() => {
@@ -431,17 +456,25 @@ function start() {
   const run = () => {
     void sync().catch((e) => console.error("Calling cost monitor:", e.message));
   };
-  timer = setInterval(run, 5 * 60000);
+  localTimer = setInterval(() => {
+    void refreshPending().catch(e => console.error('Calling pending refresh:', e.message));
+  }, 5000);
+  localTimer.unref?.();
+  timer = setInterval(run, 60000);
   timer.unref?.();
   setTimeout(run, 10000).unref?.();
 }
 function stop() {
+  if (fastTimer) clearTimeout(fastTimer);
+  if (localTimer) clearInterval(localTimer);
+  fastTimer = null;
+  localTimer = null;
   if (timer) clearInterval(timer);
   if (watchTimer) clearInterval(watchTimer);
   timer = null;
   watchTimer = null;
 }
-module.exports = { start, stop, sync, reconcile, store, costResult };
+module.exports = { start, stop, sync, reconcile, store, costResult, scheduleSync, refreshPending };
 
 async function watchActiveCalls() {
   if (watchBusy) return;
@@ -519,6 +552,7 @@ async function watchActiveCalls() {
     }
   } finally {
     watchBusy = false;
+let fastTimer = null, localTimer = null, localBusy = false;
   }
 }
 module.exports.watchActiveCalls = watchActiveCalls;

@@ -759,7 +759,7 @@ async function health() {
     report_notices: alerts.filter(require('./pricing-review').isReportNotice),
     actuals: (
       await db.query(
-        "SELECT a.* FROM voice_guard_actuals a JOIN call_sessions cs ON cs.id=a.session_id WHERE cs.started_at >= COALESCE((SELECT reporting_started_at FROM voice_guard_settings WHERE id=1),'-infinity'::timestamptz) ORDER BY a.updated_at DESC LIMIT 50",
+        "SELECT a.* FROM voice_guard_actuals a JOIN call_sessions cs ON cs.id=a.session_id ORDER BY a.updated_at DESC LIMIT 50",
       )
     ).rows,
   };
